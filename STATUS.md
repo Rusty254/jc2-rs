@@ -28,7 +28,7 @@ Master e368688: 507/507 tests, clippy `-D warnings` clean. Accepted today:
   branches yet (JC2-132).
 - JC2-124 / JC2-134 phase 1 native display chain: no HDR/tonemap on the world camera, clamp 0..1,
   night/day post blocks (saturation clamp, tint), sqrt (gamma 2.0) encode, exposure identity
-  `lux_per_unit = pi/e0` replacing the policy scale. Auto-exposure (A = 1 for now) is JC2-137.
+  `lux_per_unit = pi/e0` replacing the policy scale. Auto-exposure (JC2-137): a GPU luminance chain 64 -> 16 -> 4 -> 1 adapts `A` (one frame late, inferred tap geometry and dt, see brief section 10).
 
 Open parity research (board, tags `research` + `parity-gap`): JC2-101..110, 112..117, 119..121,
 125..139 (124 done). GitHub `Rusty254/jc2-rs` (private) receives only the filtered `public` snapshot.

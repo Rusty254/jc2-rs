@@ -277,3 +277,25 @@ Steps 1 to 4 of section 8 are implemented; step 5 (auto-exposure `A`, phase 2) i
 * `sky_light.rs`: `lux_per_unit() = pi / e0`, `ambient_per_unit() = 1 / e0`, `e0 = exp2(-ev100) / 1.2` verified in Bevy 0.19.1
   (`bevy_camera::Exposure::exposure`; `pbr_functions.wgsl`: `view.exposure * (direct + indirect)`; `Fd_Burley` ends in `1 / PI`;
   ambient `colour * brightness`): 3,135.6 lux and 998.1 per unit at ev100 9.7 (`e0` = 1.0019e-3).
+
+## 10. Implementation status (JC2-137, phase 2 auto-exposure, on branch)
+
+Step 5 of section 8 is implemented. Code: `auto_exposure.rs` (pure maths and CPU reference with unit tests against the probe
+table), `auto_exposure.wgsl` (the same arithmetic as four compute dispatches), `post_effects_render.rs` (render-graph node, replaces
+Bevy's `FullscreenMaterialPlugin` because the draw needs the exposure buffer), `post_effects.rs/.wgsl` (`PostPass` gains the meter
+vector `(S8, S9, S10, dt)`; the composite multiplies by `applied + S7 - 1`).
+
+* **Design:** GPU only, no readback. Per view one storage buffer holds the 64x64, 16x16, 4x4 luminance maps and the state
+  (`applied`, `latest`, `inited`). Each frame one node runs the compute pass on the pre-post scene (`post_process_write().source`, the 8-bit
+  sRGB main texture) and then the composite. The composite uses `applied` = the value metered in the previous frame: **one frame of
+  latency** (the native pass runs after the composite; a possible second native frame from the ring texture, Gap 7, is not modelled).
+* **Native (brief 1.3, shader disassembly):** luminance weights, floors 0.01, `T`, rate 1.74878, dt clamp 0.01..0.5, A clamp 0..4,
+  NaN rules, first frame `A = T`, `x`/`y`/`key` from the hour blocks (night 0 / 0.08, day 0.3 / 0.10, Arctic day y 0.04, same blend).
+* **Inferred (Gaps 3, 5, 7):** tap geometry (offsets -0.5 / +1.5 source texels, bilinear, final stage `0.5 uv + 0.25`), 64x64 map from the
+  full frame, `dt` = real frame delta (`Time<Real>`), the latency, bilinear filtering of the float maps (done by hand on buffers).
+  **Non-native choice:** on frame 0 the frame itself already uses `A = T` (the native texture content is unknown).
+* **Materials:** `A` is applied after the 0..1 clamp (section 4), so the material `exposure` uniforms (`view.exposure`, the camera
+  identity) are unchanged and take no `A`.
+* **Capture check** (`_extract/jc2-137/`, start base tile 29,18, 1280x720, converged after 40 s): noon (Arctic, y 0.04) measured
+  `A` = 1.065 (median of after^2 / before^2) against 1.063 from the CPU meter on the phase-1 capture; 22:00 measured 1.733 against 1.757
+  (the proxy uses display values after saturation and tint, so about 1.5 % off is expected).

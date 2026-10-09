@@ -626,8 +626,11 @@ mod tests {
         if std::env::var("JC2_TEST_DIR").is_err() {
             return;
         }
+        // Registry locations reached by tile 31,14 would compete for the one record that
+        // begins per frame (in hash order), so only this test's record may be pending.
         let mut app = world::tests::tile_app(|app| {
             app.add_plugins(LocationsPlugin);
+            without_registry_streaming(app);
         })
         .unwrap();
         let owner = LocationOwner::Mission(crate::missions::MissionOwner(9));

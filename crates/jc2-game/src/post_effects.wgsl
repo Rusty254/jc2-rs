@@ -6,7 +6,7 @@
 //   lum = dot(C, (0.2125, 0.7154, 0.0721))
 //   k   = clamp(lum * slope + offset, lo, hi)     (S16, S15, min(S14, S17), max(S14, S17))
 //   C   = lum + k * (C - lum)
-//   C  *= (A + S7 - 1) * tint                     (A = 1 in phase 1, tint = S11..S13)
+//   C  *= (A + S7 - 1) * tint                     (A = the auto-exposure of auto_exposure.wgsl, tint = S11..S13)
 //   out = sqrt(C)                                 (gamma 2.0, not the sRGB curve)
 //
 // The bound texture is an sRGB view, so `scene` is linear. The target is an sRGB view too, so
@@ -14,7 +14,8 @@
 // (what the native UNORM swap chain holds) the shader returns the sRGB *decode* of it, and the
 // hardware encode gives `sqrt(C)` back (single encode, no double encoding).
 // Not implemented (listed as gaps in post_effects.rs): blur mix, overlay (S2, S3), depth of
-// field (S5, S25), heat haze, auto-exposure `A`.
+// field (S5, S25), heat haze. `A` (JC2-137) is the value metered in the previous frame by
+// auto_exposure.wgsl (post_effects_render.rs runs that compute pass right before this one).
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
@@ -22,12 +23,21 @@
 @group(0) @binding(1) var texture_sampler: sampler;
 
 struct PostPass {
-    // rgb = tint (S11, S12, S13), w = A + S7 - 1
+    // rgb = tint (S11, S12, S13), w = S7 - 1
     tint: vec4<f32>,
     // x = offset (S15), y = slope (S16), z = lower clamp, w = upper clamp
     saturation: vec4<f32>,
+    // x = S8, y = S9, z = S10, w = dt: read by the auto-exposure compute pass only
+    meter: vec4<f32>,
 }
 @group(0) @binding(2) var<uniform> post: PostPass;
+
+// the adapted auto-exposure of this frame (the first four floats of the buffer
+// auto_exposure.wgsl writes: applied, latest, inited, pad)
+struct Exposure {
+    applied: f32,
+}
+@group(1) @binding(0) var<storage, read> exposure: Exposure;
 
 fn srgb_decode(v: vec3<f32>) -> vec3<f32> {
     let lo = v / 12.92;
@@ -42,7 +52,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let lum = dot(c, vec3<f32>(0.2125, 0.7154, 0.0721));
     let k = clamp(lum * post.saturation.y + post.saturation.x, post.saturation.z, post.saturation.w);
     c = vec3<f32>(lum) + k * (c - vec3<f32>(lum));
-    c = c * (post.tint.w * post.tint.rgb);
+    c = c * ((exposure.applied + post.tint.w) * post.tint.rgb);
     let v = clamp(sqrt(max(c, vec3<f32>(0.0))), vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(srgb_decode(v), src.a);
 }
