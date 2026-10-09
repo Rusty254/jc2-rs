@@ -32,6 +32,10 @@ pub struct Weapon {
     pub force: f32,
     /// `weapon_accuracy`.
     pub accuracy: f32,
+    /// Native settings+2ec; aim_type1 bypasses weapon_accuracy for the player bound.
+    pub aim_type: i32,
+    /// `max_bullet_spread`, degrees in the file; independent of character accuracy.
+    pub max_bullet_spread_degrees: f32,
     /// `#e56e25f4`: 10 for bullets, 4 rockets, 61 grenades, 246 vehicle rockets — the
     /// projectile kind (assumed).
     pub projectile: i32,
@@ -141,6 +145,8 @@ impl Weapon {
             pellets: num(n, 0x58b8_bb06).unwrap_or(1.0).max(1.0) as u32,
             force: num(n, 0x84ec_c4af).unwrap_or(1.0),
             accuracy: n.float("weapon_accuracy").unwrap_or(1.0),
+            aim_type: n.int("aim_type").unwrap_or(0),
+            max_bullet_spread_degrees: n.float("max_bullet_spread").unwrap_or(0.0),
             projectile: num(n, 0xe56e_25f4).unwrap_or(10.0) as i32,
             reload_time: n.float("reloadtime").unwrap_or(1.0),
             ammo_type: num(n, AMMO_TYPE).unwrap_or(0.0) as i32,
@@ -248,6 +254,44 @@ pub fn throwables(data: &[u8]) -> crate::Result<Vec<Throwable>> {
     Ok(out)
 }
 
+/// Native CWeaponSettings inputs retained under their evidenced raw hashes.
+pub const AIM_SPREAD: u32 = 0x6a1f_b54c;
+pub const ACCURACY_LOSS: u32 = 0x52aa_95ac;
+pub const PLAYER_RECOVERY: u32 = 0x4f5a_b59d;
+pub const PLAYER_SETTINGS: u32 = 0xa0f5_dc0e;
+
+fn hashed_float(n: &Node, hash: u32) -> Option<f32> {
+    n.values
+        .iter()
+        .find(|(k, _)| k.hash() == hash)
+        .and_then(|(_, v)| match v {
+            Variant::Float(f) => Some(*f),
+            _ => None,
+        })
+}
+
+fn hashed_level(n: &Node, hash: u32, level: usize) -> Option<f32> {
+    n.children
+        .iter()
+        .find(|(k, _)| k.hash() == hash)
+        .and_then(|(_, n)| n.float(&format!("level_{level}")))
+}
+
+/// CPlayer configuration consumed by 00788450, within the exact player root.
+/// Default0.5 is native fallback; retail player.bin overrides it to5.0.
+pub fn player_accuracy_recovery(data: &[u8]) -> crate::Result<f32> {
+    let file = PropertyFile::parse_any(data)?;
+    let node = file
+        .nodes
+        .iter()
+        .flat_map(|n| &n.children)
+        .find(|(k, _)| k.hash() == PLAYER_SETTINGS)
+        .map(|(_, n)| n);
+    Ok(node
+        .and_then(|n| hashed_float(n, PLAYER_RECOVERY))
+        .unwrap_or(0.5))
+}
+
 /// One upgrade level of a weapon in `settings\weapon_upgrades.bin` (every key named by
 /// hashing: `firerate`, `damage`, `damage_max`, `impulse`, `magazinesize`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -260,6 +304,10 @@ pub struct Upgrade {
     /// `magazinesize`: rounds in a magazine (Beretta 12, SMG 30, Assault 20, rockets 3;
     /// 1000 on vehicle guns, 0 on some launchers).
     pub magazine: u32,
+    /// Raw #6a1fb54c; native settings loader converts these degrees to radians.
+    pub aim_spread_degrees: f32,
+    /// Raw #52aa95ac; dimensionless accuracy loss once per fired round.
+    pub accuracy_loss: f32,
 }
 
 /// `settings\weapon_upgrades.bin`: under the root, one node per weapon keyed by the hash
@@ -292,6 +340,8 @@ impl Upgrades {
                             damage_max: lv(w, "damage_max", i),
                             impulse: lv(w, "impulse", i),
                             magazine: lv(w, "magazinesize", i).max(0.0) as u32,
+                            aim_spread_degrees: hashed_level(w, AIM_SPREAD, i).unwrap_or(0.0),
+                            accuracy_loss: hashed_level(w, ACCURACY_LOSS, i).unwrap_or(0.0),
                         })
                         .collect();
                     by_name.insert(k.hash(), levels);
@@ -430,5 +480,57 @@ mod tests {
         let a = super::ammunition(&a).unwrap();
         assert_eq!(a.len(), 20);
         assert_eq!((a[0], a[1], a[2], a[7], a[8]), (0, 15, 7, 4, 9));
+    }
+    #[test]
+    fn authored_accuracy_retail_units_and_player_scope() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let upgrades =
+            super::Upgrades::parse(&fs.read_inflated("weapon_upgrades.bin").unwrap()).unwrap();
+        for (name, angles, loss) in [
+            ("Beretta Handgun", [2.2, 1.96, 1.72, 1.48, 1.24, 1.0], 0.07),
+            ("Assault", [2.5, 2.3, 2.1, 1.9, 1.7, 1.5], 0.07),
+            ("RocketLauncher", [0.0; 6], 0.0),
+        ] {
+            for (level, angle) in angles.into_iter().enumerate() {
+                let up = upgrades.get(name, level).unwrap();
+                assert!(
+                    (up.aim_spread_degrees - angle).abs() < 1e-6,
+                    "{name}/{level}"
+                );
+                assert!((up.accuracy_loss - loss).abs() < 1e-6);
+            }
+        }
+        let weapons = super::parse(&fs.read_inflated("weapons.bin").unwrap()).unwrap();
+        let shotgun = weapons
+            .iter()
+            .find(|w| w.name == "Shotgun (pump action)")
+            .unwrap();
+        assert_eq!(shotgun.max_bullet_spread_degrees, 1.0);
+        let launcher = weapons.iter().find(|w| w.name == "RocketLauncher").unwrap();
+        assert_eq!(
+            (launcher.aim_type, launcher.max_bullet_spread_degrees),
+            (1, 0.0)
+        );
+        assert_eq!(
+            super::player_accuracy_recovery(&fs.read_inflated("player.bin").unwrap()).unwrap(),
+            5.0
+        );
+        // A recovery-like property outside the native player root cannot override it.
+        let bogus = crate::property::PropertyFile {
+            nodes: vec![crate::property::Node {
+                values: vec![(
+                    crate::property::Key::Hash(super::PLAYER_RECOVERY),
+                    crate::property::Variant::Float(999.0),
+                )],
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            super::player_accuracy_recovery(&bogus.to_bytes()).unwrap(),
+            0.5
+        );
     }
 }

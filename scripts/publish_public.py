@@ -6,7 +6,7 @@ GitHub repo only ever receives commits made by this script on the orphan `public
 
   python scripts/publish_public.py            # export master -> commit on `public`
   python scripts/publish_public.py --check    # export to a temp dir and report, no commit
-  git push origin public:main                 # publish (after reviewing the commit)
+  git push github public:main                 # publish (after reviewing the commit)
 
 Excluded entirely: research/analysis/** (extracts of the executable), research/tools/**
 except our own generic tools, research/ghidra/**, notes/task-board*.json. In every other

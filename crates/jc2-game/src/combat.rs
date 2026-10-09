@@ -16,6 +16,9 @@
 //! the assault rifle and the rocket launcher (`6`–`9` the guns picked up since); `R`
 //! reloads; `G` throws a grenade.
 
+mod accuracy;
+use accuracy::{PlayerAccuracy, ShotRandom};
+
 use crate::Game;
 use crate::ammo::WeaponState;
 use crate::character::{HEIGHT, Hero};
@@ -182,6 +185,9 @@ pub struct Arsenal {
     cooldown: f32,
     grenade_cooldown: f32,
     rng: u32,
+    player_accuracy: PlayerAccuracy,
+    accuracy_recovery: f32,
+    shot_random: ShotRandom,
     tracer_mesh: Handle<Mesh>,
     tracer_hot: Handle<StandardMaterial>,
     tracer_enemy: Handle<StandardMaterial>,
@@ -441,6 +447,8 @@ fn fallback_weapon(name: &str) -> Weapon {
         pellets: 1,
         force: 1.0,
         accuracy: 1.0,
+        aim_type: 0,
+        max_bullet_spread_degrees: 0.0,
         projectile: 10,
         reload_time: 1.0,
         ammo_type: 1,
@@ -581,6 +589,9 @@ fn setup_arsenal(
         unlit: true,
         ..default()
     };
+    info!(
+        "accuracy: regular player recovery/loss and two-stage scatter; native AI, assisted-target and weapon-modifier overrides are not implemented by this path; grapple/parachute/stunt riding retain existing scatter"
+    );
     commands.insert_resource(Arsenal {
         guns,
         current: 0,
@@ -599,6 +610,15 @@ fn setup_arsenal(
         cooldown: 0.0,
         grenade_cooldown: 0.0,
         rng: 0x9e37_79b9,
+        player_accuracy: PlayerAccuracy::default(),
+        accuracy_recovery: game
+            .fs
+            .read_inflated("player.bin")
+            .ok()
+            .and_then(|d| jc2_formats::weapons::player_accuracy_recovery(&d).ok())
+            .filter(|rate| rate.is_finite() && *rate >= 0.0)
+            .unwrap_or(0.5),
+        shot_random: ShotRandom::default(),
         tracer_mesh: meshes.add(Cylinder::new(1.0, 1.0)),
         tracer_hot: materials.add(unlit(Color::srgb(1.0, 0.85, 0.4))),
         tracer_enemy: materials.add(unlit(Color::srgb(1.0, 0.45, 0.3))),
@@ -1089,6 +1109,14 @@ fn muzzle(tf: &Transform, h: &Hero) -> Vec3 {
     tf.translation + Quat::from_rotation_y(h.facing) * Vec3::new(0.3, 0.5, -0.5)
 }
 
+type FireHero = (
+    Entity,
+    &'static Hero,
+    &'static Transform,
+    Option<&'static mut Arms>,
+    Option<&'static OnStunt>,
+);
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fire(
     mut commands: Commands,
@@ -1098,7 +1126,7 @@ pub(crate) fn fire(
     arsenal: Option<ResMut<Arsenal>>,
     fx: Option<Res<Fx>>,
     spatial: SpatialQuery,
-    mut heroes: Query<(Entity, &Hero, &Transform, Option<&mut Arms>), Without<Dead>>,
+    mut heroes: Query<FireHero, Without<Dead>>,
     cams: Query<&Transform, (With<FlyCamera>, Without<Hero>)>,
     guns: Query<(Entity, &GunModel, &GlobalTransform)>,
     colliders: Query<&ColliderOf>,
@@ -1115,12 +1143,24 @@ pub(crate) fn fire(
     } else {
         buttons.just_pressed(MouseButton::Left)
     };
+    let Ok((hero, h, tf, arms, stunt)) = heroes.single_mut() else {
+        return;
+    };
+    let regular_handheld = h.in_vehicle.is_none()
+        && h.grapple.is_none()
+        && !h.parachute
+        && !h.swimming
+        && h.stunt.is_none()
+        && stunt.is_none();
+    let maximum = accuracy::regular_player_maximum(&a.gun().weapon);
+    let recovery = a.accuracy_recovery;
+    if regular_handheld {
+        a.player_accuracy
+            .update(hero, time.delta_secs(), recovery, maximum);
+    }
     if *mode != CameraMode::Hero || !trigger || a.cooldown > 0.0 {
         return;
     }
-    let Ok((hero, h, tf, arms)) = heroes.single_mut() else {
-        return;
-    };
     // hanging from the hook (as in the original) or under the chute one hand is free:
     // one-handed guns only; reeling needs the hand
     let one_hand_free = h.grapple.is_some() || h.parachute;
@@ -1141,6 +1181,20 @@ pub(crate) fn fire(
     a.shots += 1;
     let w = a.gun().weapon.clone();
     let damage = a.gun().damage;
+    let upgrade = a.upgrades.get(&w.name, a.gun().level);
+    let angle = upgrade.map_or(0.0, |u| u.aim_spread_degrees.to_radians())
+        * (1.0 - a.player_accuracy.value);
+    let shot_aim = if regular_handheld {
+        a.shot_random.aim_direction(cam.forward().as_vec3(), angle)
+    } else {
+        cam.forward().as_vec3()
+    };
+    // Native006ec6e0 decrements after aim sampling, once before the pellet loop.
+    if regular_handheld {
+        a.player_accuracy
+            .fired(upgrade.map_or(0.0, |u| u.accuracy_loss), maximum);
+    }
+    let aim_frame = accuracy::aim_frame(shot_aim);
     let gun_origin = gun_muzzle(&a, &guns);
     let (muzzle, barrel) = gun_origin
         .map(|(at, dir, _, _)| (at, dir))
@@ -1169,11 +1223,25 @@ pub(crate) fn fire(
     if w.projectile == ROCKET || w.projectile == LOBBED {
         // aim the round from the muzzle at what the crosshair is on
         let aim = spatial
-            .cast_ray(cam.translation, cam.forward(), reach, true, &filter)
-            .map_or(cam.translation + cam.forward() * reach, |h| {
-                cam.translation + cam.forward() * h.distance
+            .cast_ray(
+                cam.translation,
+                Dir3::new_unchecked(shot_aim),
+                reach,
+                true,
+                &filter,
+            )
+            .map_or(cam.translation + shot_aim * reach, |h| {
+                cam.translation + shot_aim * h.distance
             });
-        let dir = (aim - muzzle).normalize_or(cam.forward().as_vec3());
+        let base = (aim - muzzle).normalize_or(cam.forward().as_vec3());
+        let dir = if regular_handheld {
+            a.shot_random.pellet_direction(
+                accuracy::aim_frame(base),
+                w.max_bullet_spread_degrees.to_radians(),
+            )
+        } else {
+            base
+        };
         let Some(fx) = fx else { return };
         commands.spawn((
             Mesh3d(fx.rocket.clone()),
@@ -1197,10 +1265,17 @@ pub(crate) fn fire(
         return;
     }
     for _ in 0..w.pellets {
-        // a little scatter, less for a steadier gun; buckshot spreads wide
-        let spread = if w.pellets > 1 { 0.08 } else { 0.012 } * (2.0 - w.accuracy.clamp(0.0, 1.0));
-        let jitter = Vec3::new(a.rand() - 0.5, a.rand() - 0.5, a.rand() - 0.5) * spread;
-        let Ok(dir) = Dir3::new(cam.forward().as_vec3() + jitter) else {
+        let direction = if regular_handheld {
+            a.shot_random
+                .pellet_direction(aim_frame, w.max_bullet_spread_degrees.to_radians())
+        } else {
+            // Preserve existing special-state approximation until native modifier ownership is proven.
+            let spread =
+                if w.pellets > 1 { 0.08 } else { 0.012 } * (2.0 - w.accuracy.clamp(0.0, 1.0));
+            cam.forward().as_vec3()
+                + Vec3::new(a.rand() - 0.5, a.rand() - 0.5, a.rand() - 0.5) * spread
+        };
+        let Ok(dir) = Dir3::new(direction) else {
             continue;
         };
         // from the camera, through what is in front of Rico
@@ -1758,6 +1833,151 @@ mod tests {
     use super::*;
 
     mod downed;
+
+    #[test]
+    fn authored_accuracy_actual_fire_decrements_once_per_round_not_pellet() {
+        let Some((mut app, _, spawn)) = crate::fleet::testing::app(
+            &["weapons.bin", "weapon_upgrades.bin", "player.bin"],
+            |app| {
+                app.init_resource::<ButtonInput<MouseButton>>()
+                    .init_resource::<StructureHits>()
+                    .add_plugins(ExplosionPlugin)
+                    .add_systems(Startup, setup_arsenal)
+                    .add_systems(Update, fire);
+            },
+        ) else {
+            return;
+        };
+        let hero = app
+            .world_mut()
+            .spawn((Hero::default(), Transform::from_translation(spawn)))
+            .id();
+        app.world_mut().spawn((
+            Transform::from_translation(spawn + Vec3::Y * 1.0),
+            FlyCamera {
+                yaw: 0.0,
+                pitch: 0.0,
+                speed: 1.0,
+            },
+        ));
+        app.world_mut().insert_resource(CameraMode::Hero);
+        app.update();
+        // Isolate the shot boundary, so frame recovery cannot hide duplicate decrements.
+        app.world_mut().resource_mut::<Arsenal>().accuracy_recovery = 0.0;
+        for gun in [0, 2, 3] {
+            // pistol, multi-pellet shotgun, automatic rifle
+            let mut a = app.world_mut().resource_mut::<Arsenal>();
+            a.current = gun;
+            a.cooldown = 0.0;
+            a.player_accuracy.value = 0.8;
+            let w = a.gun().weapon.clone();
+            let loss = a.upgrades.get(&w.name, 0).unwrap().accuracy_loss;
+            let before = a.shots;
+            let mut tracers = app.world_mut().query_filtered::<Entity, With<Tracer>>();
+            let count = tracers.iter(app.world()).count();
+            let mut input = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
+            input.release(MouseButton::Left);
+            input.clear();
+            input.press(MouseButton::Left);
+            app.update();
+            let a = app.world().resource::<Arsenal>();
+            assert_eq!(a.shots, before + 1);
+            assert!((a.player_accuracy.value - (0.8 - loss).max(0.0)).abs() < 1e-6);
+            assert_eq!(
+                tracers.iter(app.world()).count() - count,
+                w.pellets as usize + 1 // One muzzle-flash root also carries Tracer lifetime.
+            );
+            if gun == 3 {
+                // Held automatic input has no just_pressed edge, but still spends one round.
+                app.world_mut().resource_mut::<Arsenal>().cooldown = 0.0;
+                app.world_mut()
+                    .resource_mut::<ButtonInput<MouseButton>>()
+                    .clear();
+                app.update();
+                let a = app.world().resource::<Arsenal>();
+                assert_eq!(a.shots, before + 2);
+                assert!((a.player_accuracy.value - (0.8 - 2.0 * loss)).abs() < 1e-6);
+            }
+            // A rejected dry shot cannot change accuracy or the shot counter.
+            let a = app.world().resource::<Arsenal>();
+            let before_dry = a.shots;
+            let value = a.player_accuracy.value;
+            let mut a = app.world_mut().resource_mut::<Arsenal>();
+            a.cooldown = 0.0;
+            a.guns[gun].ammo.magazine = 0;
+            let mut input = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
+            input.release(MouseButton::Left);
+            input.clear();
+            input.press(MouseButton::Left);
+            app.update();
+            let a = app.world().resource::<Arsenal>();
+            assert_eq!(a.shots, before_dry);
+            assert_eq!(a.player_accuracy.value, value);
+        }
+        app.world_mut().despawn(hero);
+        let replacement = app
+            .world_mut()
+            .spawn((Hero::default(), Transform::from_translation(spawn)))
+            .id();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        app.update();
+        assert_eq!(app.world().resource::<Arsenal>().player_accuracy.value, 0.0);
+        // Original special controller policies are unproven: do not apply ordinary loss.
+        for on_roof in [false, true] {
+            app.world_mut()
+                .get_mut::<Hero>(replacement)
+                .unwrap()
+                .parachute = !on_roof;
+            if on_roof {
+                app.world_mut().entity_mut(replacement).insert(OnStunt {
+                    vehicle: hero,
+                    local: Vec3::ZERO,
+                    kind: jc2_formats::vehicle::StuntKind::Roof,
+                    wire: None,
+                });
+            }
+            let mut a = app.world_mut().resource_mut::<Arsenal>();
+            a.current = 0;
+            a.cooldown = 0.0;
+            a.guns[0].ammo.magazine = 1;
+            a.player_accuracy.value = 0.37;
+            let before = a.shots;
+            let mut input = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
+            input.release(MouseButton::Left);
+            input.clear();
+            input.press(MouseButton::Left);
+            app.update();
+            let a = app.world().resource::<Arsenal>();
+            assert_eq!(a.shots, before + 1);
+            assert_eq!(a.player_accuracy.value, 0.37);
+        }
+        // A roof launcher reaches the projectile branch: preserve both direction and RNG.
+        let mut a = app.world_mut().resource_mut::<Arsenal>();
+        a.current = 4;
+        a.cooldown = 0.0;
+        a.guns[4].ammo.magazine = 1;
+        a.player_accuracy.value = 0.37;
+        let before = a.shots;
+        let random = a.shot_random.clone();
+        let weapon = a.gun().weapon.clone();
+        let mut input = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
+        input.release(MouseButton::Left);
+        input.clear();
+        input.press(MouseButton::Left);
+        app.update();
+        let a = app.world().resource::<Arsenal>();
+        assert_eq!(a.shots, before + 1);
+        assert_eq!(a.player_accuracy.value, 0.37);
+        assert_eq!(a.shot_random, random);
+        let mut projectiles = app.world_mut().query::<&Projectile>();
+        let projectile = projectiles.single(app.world()).unwrap();
+        let expected = Vec3::new(-0.3, 0.5, -(weapon.range + 0.5)).normalize();
+        assert!(projectile.velocity.normalize().distance(expected) < 1e-5);
+        assert!((projectile.velocity.length() - weapon.velocity).abs() < 1e-4);
+        assert_eq!(projectile.owner, replacement);
+    }
 
     #[test]
     fn hits_hurt_and_kill() {

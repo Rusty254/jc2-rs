@@ -61,14 +61,14 @@ comments addressed to `claude/orchestrator`.
 
 ## Public GitHub mirror (from 9 October 2026)
 
-`origin` is the PUBLIC repo https://github.com/Rusty254/jc2-rs. It must never receive research
+`github` (remote name; not `origin`) is the private GitHub repo https://github.com/Rusty254/jc2-rs. It must never receive research
 derived from JustCause2.exe (research/analysis, probes, decompiler excerpts). Therefore:
-- **Never push `master`, worktree branches or any other branch to `origin`.** Their history
+- **Never push `master`, worktree branches or any other branch to `github`.** Their history
   contains executable-derived research.
 - Only `claude/orchestrator` publishes, and only the orphan `public` branch:
   `python scripts/publish_public.py` (exports master, drops research/analysis, research/tools
   probes and research/ghidra, strips decompiler excerpts, refuses if any remain), review the
-  commit, then `git push origin public:main`.
+  commit, then `git push github public:main`.
 - In committed documents cite native addresses and describe behaviour in prose; keep raw
   decompiler output out of code blocks where possible (the publisher strips it anyway).
 
