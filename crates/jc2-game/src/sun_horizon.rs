@@ -31,6 +31,7 @@
 //! `terrain_splat.wgsl`).
 
 use crate::atmosphere::AtmosphereState;
+use crate::haze::HazeFog;
 use crate::sky::Sun;
 use crate::sky_light::SkyLighting;
 use bevy::asset::RenderAssetUsages;
@@ -63,6 +64,14 @@ pub struct SunHorizon {
     /// native hemisphere ambient `lerp(cb0[11], cb0[10], N.y / 2 + 1/2)` that Bevy's uniform
     /// `AmbientLight` (the mean of the two) lacks, added as `tilt * N.y`. Zero = uniform.
     pub tilt: Vec4,
+    /// Haze fog (JC2-155, `haze.rs`): vertex `cb0[12]` = `(p0/(p1-p0), p1, 1/(p1-p0), camY)`.
+    /// All three fog vectors zero = no fog. Rides in this buffer because every custom-WGSL
+    /// material already binds it (no extra binding per material).
+    pub fog_a: Vec4,
+    /// Vertex `cb0[13]` = `(p3/p4, sat((camY-p3)/p4), 1/p4, p2)`.
+    pub fog_b: Vec4,
+    /// Pixel `cb0[13]` = the fog colour (native scene units) and `p2`.
+    pub fog_colour: Vec4,
 }
 
 impl SunHorizon {
@@ -90,6 +99,7 @@ impl SunHorizon {
             cb0: Vec4::new(a, b, c, 1.0),
             sun: sun_dir.extend(floor),
             tilt: Vec4::ZERO,
+            ..Self::default()
         }
     }
 
@@ -217,6 +227,7 @@ pub fn update_horizon(
     horizon: Option<Res<HorizonShadow>>,
     atmosphere: Option<Res<AtmosphereState>>,
     lighting: Option<Res<SkyLighting>>,
+    haze: Option<Res<HazeFog>>,
     sun: Query<&Transform, With<Sun>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut last: Local<Option<SunHorizon>>,
@@ -235,6 +246,11 @@ pub fn update_horizon(
     now.sun = light_dir.extend(now.sun.w);
     if let Some(l) = &lighting {
         now.tilt = l.bevy().ambient_tilt.extend(0.0);
+    }
+    if let Some(h) = &haze {
+        now.fog_a = h.c12;
+        now.fog_b = h.c13;
+        now.fog_colour = h.gpu_colour();
     }
     if *last == Some(now) {
         return;

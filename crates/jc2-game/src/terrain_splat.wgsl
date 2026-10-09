@@ -19,6 +19,7 @@
     pbr_functions::alpha_discard,
     mesh_view_bindings::view,
 }
+#import jc2::haze_fog::haze_fog
 #import jc2::sun_horizon::{ao_uv, sun_factor, is_sun, ambient_tilt}
 
 #ifdef PREPASS_PIPELINE
@@ -49,6 +50,10 @@ struct SunHorizon {
     sun: vec4<f32>,
     // xyz: (sky - ground) / 2 ambient, see ambient_tilt in sun_horizon.wgsl
     tilt: vec4<f32>,
+    // haze fog (haze.rs, haze_fog.wgsl): cb0[12], cb0[13], fog colour; all zero = no fog
+    fog_a: vec4<f32>,
+    fog_b: vec4<f32>,
+    fog_colour: vec4<f32>,
 }
 
 struct SplatParams {
@@ -393,6 +398,11 @@ fn fragment(
         pbr_input.material.specular_transmission, pbr_input.material.diffuse_transmission);
     out.color = vec4<f32>(
         out.color.rgb + ambient_tilt(diffuse, pbr_input.N, horizon.tilt, pbr_input.diffuse_occlusion, view.exposure),
+        out.color.a);
+    // the native atmospheric fog (haze_fog.wgsl); Bevy's own fog is off for this material
+    let haze_clip = view.clip_from_view * (view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0));
+    out.color = vec4<f32>(
+        haze_fog(out.color.rgb, haze_clip, in.world_position.y, horizon.fog_a, horizon.fog_b, horizon.fog_colour),
         out.color.a);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
 #endif

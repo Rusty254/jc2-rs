@@ -23,7 +23,10 @@ pub const CHUNK_CELLS: usize = 16;
 pub const CHUNK_SIZE: f32 = CHUNK_CELLS as f32 * GLOBAL_CELL;
 /// Chunks per world edge (32).
 pub const CHUNKS: i32 = (32768.0 / CHUNK_SIZE) as i32;
-/// Draw distance (m); the fog's visibility is 12 km.
+/// Draw distance (m): the extent of the project's far-terrain mesh (**non-native**; the exe's
+/// far plane is unresolved, `haze-fog-next.md` Gap 2). The native fog end `p1` is 12 km by day
+/// (9 km at night, `haze.rs`), but the fog never reaches the full colour on its own: the horizon
+/// band that hides the edge (Gap 1) is not drawn.
 pub const FAR: f32 = 14_000.0;
 /// Beyond this, chunks use every other sample (128 m).
 pub const FINE: f32 = 5_000.0;

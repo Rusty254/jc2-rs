@@ -448,6 +448,10 @@ const ZONE_PICTURE_SETS: usize = 16;
 /// sky ambient (`cb0[10]`, up-facing), row 5 the ground ambient (`cb0[11]`, down-facing).
 pub const ZONE_ROWS: usize = 6;
 pub const ROW_SUN: usize = 0;
+/// Row 2: the haze (fog) colour toward the sun, haze preset P1 (`FUN_00a55cd0`, JC2-116).
+pub const ROW_HAZE_TOWARD_SUN: usize = 2;
+/// Row 3: the haze (fog) colour away from the sun, haze preset P2 (`FUN_00a55cd0`, JC2-116).
+pub const ROW_HAZE_AWAY: usize = 3;
 pub const ROW_SKY_AMBIENT: usize = 4;
 pub const ROW_GROUND_AMBIENT: usize = 5;
 /// The game zone type `Default` of `terrain\gamezone.bin` (id 7); its gradient set is 7.
@@ -581,6 +585,7 @@ const LE_SET_RAIN: u32 = 0x49c4_c7d7; // 0x00f12258 -> Z+0x1ad8: 10
 const LE_SET_SNOW: u32 = 0xa4b4_4b37; // 0x00f1225c -> Z+0x1adc: 11
 const LE_GAIN: u32 = 0x9c93_19fc; // 0x00f121ec -> Z+0x147e0: 2.2 (constructor default 1.7)
 const LE_SMOOTHING: u32 = 0xa08d_04c3; // root value -> Z+0x1ac0: 1.0 (the smoothing rate, 1/s)
+const LE_HAZE_BLOCK: u32 = 0x19a8_fc4a; // the haze section, read by FUN_00a4d1b0 (JC2-116)
 /// Zone-type count of `gradient_for_zone_NN` (zone type N -> gradient set).
 pub const ZONE_TYPES: usize = 8;
 /// Entries of `game_zones` (`max_gradient_0..9`).
@@ -612,6 +617,120 @@ pub struct LandscapeEffects {
     /// The altitude thresholds 30 / 300 / 1000 m and the underwater depth 120 m (same gap).
     pub altitude: [f32; 3],
     pub underwater_depth: f32,
+    /// The haze (distance fog) windows and parameter groups (section `19a8fc4a`).
+    pub haze: HazeSettings,
+}
+
+/// Haze parameter group indices into [`HazeSettings::groups`] (the probe's `GROUPS` order).
+pub const HAZE_DAY: usize = 0;
+pub const HAZE_NIGHT: usize = 1;
+pub const HAZE_RAIN_DAY: usize = 2;
+pub const HAZE_RAIN_NIGHT: usize = 3;
+pub const HAZE_SNOW_DAY: usize = 4;
+pub const HAZE_SNOW_NIGHT: usize = 5;
+const HAZE_GROUP_NAMES: [&str; 6] = [
+    "day_params",
+    "night_params",
+    "rain_day_params",
+    "rain_night_params",
+    "snow_day_params",
+    "snow_night_params",
+];
+/// Hash keys of the four hour windows (`DAT_00f0eafc..08`, byte-checked by the probe).
+const HAZE_WINDOW_KEYS: [u32; 4] = [0x2201_37a5, 0x88d3_6ba1, 0xf56f_fcb7, 0xf10e_7ec1];
+/// Hash keys of `p0..p4` (`DAT_00f0eb0c..1c`): start, end, density, p3, p4.
+const HAZE_PARAM_KEYS: [u32; 5] = [
+    0x6f52_6f85,
+    0x5328_08b7,
+    0x7b42_5f7a,
+    0xd509_0a62,
+    0xe842_2ea1,
+];
+
+/// The haze (distance fog) numbers of `settings\landscape_effects.bin` section `19a8fc4a`
+/// (`FUN_00a4d1b0`; research `haze-fog-next.md` sections 2 and 3, JC2-116/155).
+///
+/// * `windows` (file order `220137a5`, `88d36ba1`, `f56ffcb7`, `f10e7ec1`; retail 5.5, 18.5,
+///   20, 4): the hour the day starts, the day ends (dusk starts), the night starts, and the
+///   night ends (dawn starts).
+/// * `groups[g]` = `[p0, p1, p2, p3, p4]` for the six groups [`HAZE_DAY`] .. [`HAZE_SNOW_NIGHT`]:
+///   fog start (m), fog end (m), density (1/m), height base and height range. The names p0..p4
+///   come from their use in the shaders; the file has hashes only.
+///
+/// [`Default`] is the exe constructor's state (`FUN_00a3f8b0`: windows 8, 17, 19, 5 and
+/// `(0, 32000, 0, 0, 100)` in every group), i.e. what stands before the file is read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HazeSettings {
+    pub windows: [f32; 4],
+    pub groups: [[f32; 5]; 6],
+}
+
+impl Default for HazeSettings {
+    fn default() -> Self {
+        Self {
+            windows: [8.0, 17.0, 19.0, 5.0],
+            groups: [[0.0, 32_000.0, 0.0, 0.0, 100.0]; 6],
+        }
+    }
+}
+
+impl HazeSettings {
+    fn from_block(block: &Node) -> Option<Self> {
+        let mut windows = [0.0; 4];
+        for (slot, key) in windows.iter_mut().zip(HAZE_WINDOW_KEYS) {
+            *slot = num(block, key)?;
+        }
+        let mut groups = [[0.0; 5]; 6];
+        for (g, name) in groups.iter_mut().zip(HAZE_GROUP_NAMES) {
+            let node = block.child(name)?;
+            for (slot, key) in g.iter_mut().zip(HAZE_PARAM_KEYS) {
+                *slot = num(node, key)?;
+            }
+        }
+        Some(Self { windows, groups })
+    }
+
+    /// The day factor `t` (0 night .. 1 day) of `FUN_00a432d0`: 0 at or before the dawn
+    /// window start and at or after the night start, a linear ramp over dawn and over dusk,
+    /// 1 between day start and day end. Windows `[w5e, w5f, w60, w61]` = `[day starts,
+    /// day ends, night starts, night ends]`.
+    pub fn day_factor(&self, hour: f32) -> f32 {
+        let [day_starts, day_ends, night_starts, night_ends] = self.windows;
+        let sat = |x: f32| x.clamp(0.0, 1.0);
+        if hour <= night_ends || hour >= night_starts {
+            0.0
+        } else if hour < day_starts {
+            sat((hour - night_ends) / (day_starts - night_ends))
+        } else if hour <= day_ends {
+            1.0
+        } else {
+            1.0 - sat((hour - day_ends) / (night_starts - day_ends))
+        }
+    }
+
+    /// The five numbers `p0..p4` the fog layer stores (`FUN_00a432d0`, layer 0): the night
+    /// group lerped to the day group by [`Self::day_factor`], then toward the rain groups
+    /// (same lerp) by `w_rain` when it is positive, then toward the snow groups by `w_snow`.
+    pub fn params(&self, hour: f32, w_rain: f32, w_snow: f32) -> [f32; 5] {
+        let t = self.day_factor(hour);
+        let mix = |night: usize, day: usize| -> [f32; 5] {
+            std::array::from_fn(|i| {
+                let (n, d) = (self.groups[night][i], self.groups[day][i]);
+                n + (d - n) * t
+            })
+        };
+        let mut p = mix(HAZE_NIGHT, HAZE_DAY);
+        for (w, night, day) in [
+            (w_rain, HAZE_RAIN_NIGHT, HAZE_RAIN_DAY),
+            (w_snow, HAZE_SNOW_NIGHT, HAZE_SNOW_DAY),
+        ] {
+            if w > 0.0 {
+                let q = mix(night, day);
+                p = std::array::from_fn(|i| p[i] + (q[i] - p[i]) * w);
+            }
+        }
+        p
+    }
 }
 
 impl LandscapeEffects {
@@ -677,6 +796,9 @@ impl LandscapeEffects {
                 get(block, LE_ALTITUDE_C, "altitude 1000")?,
             ],
             underwater_depth: get(block, LE_UNDERWATER_DEPTH, "underwater depth")?,
+            haze: child_by_hash(root, LE_HAZE_BLOCK)
+                .and_then(HazeSettings::from_block)
+                .ok_or_else(|| missing("haze section #19a8fc4a"))?,
         })
     }
 
@@ -1503,6 +1625,32 @@ mod tests {
         );
         assert_eq!(le.altitude, [30.0, 300.0, 1000.0]);
         assert_eq!(le.underwater_depth, 120.0);
+        // the haze section (haze_fog_probe.py WIN_EXPECT / PARAMS_EXPECT)
+        assert_eq!(le.haze.windows, [5.5, 18.5, 20.0, 4.0]);
+        assert_eq!(
+            le.haze.groups[HAZE_DAY],
+            [200.0, 12_000.0, 0.001, -1806.0, 3006.0]
+        );
+        assert_eq!(
+            le.haze.groups[HAZE_NIGHT],
+            [300.0, 9_000.0, 0.007, -1800.0, 4000.0]
+        );
+        assert_eq!(
+            le.haze.groups[HAZE_RAIN_DAY],
+            [-50.0, 4_869.0, 0.005, -200.0, 800.0]
+        );
+        assert_eq!(
+            le.haze.groups[HAZE_RAIN_NIGHT],
+            [0.0, 1_500.0, 0.007, -200.0, 800.0]
+        );
+        assert_eq!(
+            le.haze.groups[HAZE_SNOW_DAY],
+            [0.0, 3_000.0, 0.01, -1806.0, 6000.0]
+        );
+        assert_eq!(
+            le.haze.groups[HAZE_SNOW_NIGHT],
+            [0.0, 3_000.0, 0.01, -1800.0, 6000.0]
+        );
         // wv = intensity / 3
         assert_eq!(le.variant_weight(7, 3.0), 1.0);
         assert_eq!(le.variant_weight(7, 0.0), 0.0);

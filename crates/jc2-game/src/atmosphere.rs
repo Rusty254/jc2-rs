@@ -7,7 +7,7 @@
 //! | value | native consumer | here |
 //! |---|---|---|
 //! | `cloud_lit` / `cloud_shaded` (`C`, `D`) | cloud card colours (`FUN_00a53a80`) | the cumulus cards' tint (`clouds.rs`, lit colour) |
-//! | `haze_a/b/e/f` (`A`, `B`, `E`, `F`) | haze `FUN_00a432d0` -> `cb0[13]`/`cb0[14]` | **stored only**: the static presets that combine with them are unknown (gap G2), and `cb0[14]` is read by FastTer in one branch only |
+//! | `haze_a/b/e/f` (`A`, `B`, `E`, `F`) | haze `FUN_00a432d0` -> `cb0[13]`/`cb0[14]` | `A`/`B` variants 1/2 only in the rain/snow fog colour (`haze.rs`, weights 0 until JC2-156); variant 0 is never read natively. `E`/`F` are the **water** colour `cb0[14]` (JC2-116), **stored only**, not fog |
 //! | `point_light_scale` (`S`) | `FUN_0091dcc0`: point-light colour `* S * CRenderEngine+0x830` | muzzle-flash and explosion lights, whose base strength is in native colour units at 1 m (`native_units::point_lumens`, policy value; `+0x830` is constant 1.0 as far as a displacement sweep shows, `night-light-next.md` section 6) |
 //! | `facade_night` (`S0`) | pixel `cb2[0].x` of the merged/facade render blocks (inferred: a "lights on" factor) | **stored only**: this crate has no facade/merged-block material |
 //!

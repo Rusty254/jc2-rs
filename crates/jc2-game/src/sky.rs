@@ -10,9 +10,12 @@
 //!   midnight, up from about 5:40 to 18:20. The moon is the same orbit twelve hours on.
 //! * The sky colour is the game's `skygradient_dif.dds` read at the hour (its horizon
 //!   rows), kept relative to noon so that the midday look stays the one the world
-//!   already had, and dimmed by the sun's elevation. It is the clear colour and the
-//!   fog colour. The fog distance and the sky's dimming are mine (the data files only
-//!   carry the sky colours): see `weather.md`. The sun and ambient light are native tables.
+//!   already had, and dimmed by the sun's elevation. It is the clear colour only (since
+//!   JC2-155 it is no longer the fog colour). The sky's dimming is mine (the data files
+//!   only carry the sky colours): see `weather.md`. The sun and ambient light are native tables.
+//! * **Fog is native since JC2-155** (`haze.rs`): colour, distances, density and height term
+//!   come from the haze section of `landscape_effects.bin` and the zone gradient rows 2/3;
+//!   [`crate::haze::update_haze_fog`] runs in this plugin's chain.
 //! * Two unlit discs mark the sun and the moon far away.
 //! * **One** directional light (the [`Sun`] entity), as in the exe (`FUN_00a58a00`): when the
 //!   sun is below the horizon its direction is negated, so the same light now comes from the
@@ -22,20 +25,16 @@
 //!   (`sky_light.rs`, JC2-122; the zone set is a labelled stand-in there). Only the scale from
 //!   native colour units to Bevy lux (`sky_light::lux_per_unit`) is the exposure identity `pi / e0`. There is no
 //!   separate Moon or sky-fill light (the exe has none).
-//! * Still **non-native** policy here: the sky/fog colour, the fog distances, the fog's
-//!   sun-scatter colour, the discs, and the sun colour / moon strength the cloud tint reads
-//!   ([`SkyState::sun_colour`], [`SkyState::moon_lux`]; `clouds.rs`).
+//! * Still **non-native** policy here: the sky (clear) colour, the discs, and the sun colour /
+//!   moon strength the cloud tint reads ([`SkyState::sun_colour`], [`SkyState::moon_lux`];
+//!   `clouds.rs`).
 //! * **Units (JC2-139).** The world camera shows `sqrt(clamp01(scene) * A * tint)`, so the
-//!   clear colour and the fog colour (a scene colour: Bevy mixes fog into the already exposed
-//!   pixel) are written in native scene units. The project's sky/fog colours are *authored as
-//!   display values* (`NOON_SKY` is what the player should see at `A = 1`) and converted by
-//!   `c = d^2` (`native_units::display_native`), the inverse of the chain's `sqrt`: **policy
-//!   colours in native units**, no native value. The haze colours `cb0[13]`/`cb0[14]` come from
-//!   the haze object's static presets plus tables `A`/`B`/`E`/`F` (`atmosphere.rs`); the
-//!   presets are unresolved (brief `light-tables-next.md` G2), so the tables alone are not a
-//!   fog colour (noon `E` = (0.008, 0.130, 0.130) is a dark teal, not the horizon haze) and
-//!   stay unused. The fog *coefficients* of `FogFalloff::from_visibility_colors` are unit-free
-//!   rates, not scene colours, and are unchanged.
+//!   clear colour is written in native scene units. The project's sky colour is *authored as a
+//!   display value* (`NOON_SKY` is what the player should see at `A = 1`) and converted by
+//!   `c = d^2` (`native_units::display_native`), the inverse of the chain's `sqrt`: a **policy
+//!   colour in native units**, no native value. The fog colour (JC2-155) is a native scene
+//!   colour, rows 2/3 of the zone gradient, and is used as is. Tables `E`/`F` of
+//!   `gradients.bmp` are the water colour (`cb0[14]`), not the haze, and stay unused here.
 
 use crate::Game;
 use crate::atmosphere::{
@@ -46,27 +45,21 @@ use crate::sky_light::{
     SkyLighting, ZoneGradientData, load_zone_gradients, update_sky_lighting, update_zone_inputs,
 };
 use bevy::light::CascadeShadowConfigBuilder;
-use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
 use jc2_formats::weather::{Atmosphere, elevation_degrees, moon_direction, sun_direction};
 
 /// The sky's colour at noon (what the world used before it had a clock): clear colour
-/// and fog.
+/// (the fog colour is native, `haze.rs`).
 const NOON_SKY: Vec3 = Vec3::new(0.58, 0.72, 0.90);
 /// Moonless midnight sky.
 const NIGHT_SKY: Vec3 = Vec3::new(0.010, 0.016, 0.040);
-/// **Non-native, cloud tint and fog scatter only (not the light):** the sun's colour when
+/// **Non-native, cloud tint only (not the light):** the sun's colour when
 /// high / when on the horizon.
 const SUN_HIGH: Vec3 = Vec3::new(1.0, 0.97, 0.92);
 const SUN_LOW: Vec3 = Vec3::new(1.0, 0.52, 0.25);
 /// **Non-native, cloud tint only:** the moon's relative strength ([`SkyState::moon_lux`]).
 const MOON_LUX: f32 = 2400.0;
-/// Fog visibility (m) by day and night, and the day's extinction and inscattering colours.
-const FOG_VISIBILITY_DAY: f32 = 12_000.0;
-const FOG_VISIBILITY_NIGHT: f32 = 7_000.0;
-const FOG_EXTINCTION: Vec3 = Vec3::new(0.35, 0.45, 0.55);
-const FOG_INSCATTER: Vec3 = Vec3::new(0.75, 0.82, 0.90);
-/// Where on the sky table (0 zenith, 1 horizon) the fog and clear colour are read.
+/// Where on the sky table (0 zenith, 1 horizon) the clear colour is read.
 const HORIZON_V: f32 = 0.95;
 /// Distance of the sun and moon discs from the camera (inside the 30 km far plane).
 const DISC_DISTANCE: f32 = 25_000.0;
@@ -139,8 +132,8 @@ pub struct SkyState {
     pub sun_dir: Vec3,
     pub moon_dir: Vec3,
     pub sun_elevation: f32,
-    /// **Non-native** project colour of the low or high sun: read by the cloud tint and the
-    /// fog's sun scatter, not by the light (`sky_light.rs` sets that).
+    /// **Non-native** project colour of the low or high sun: read by the cloud tint, not by the
+    /// light (`sky_light.rs` sets that).
     pub sun_colour: Vec3,
     /// The single directional light: towards the sun by day, the negated vector (the moon's
     /// side) once the sun is below the horizon (native flip). Its colour and illuminance are
@@ -148,11 +141,8 @@ pub struct SkyState {
     pub light_dir: Vec3,
     /// **Non-native** moon strength (0..[`MOON_LUX`]) for the cloud tint only.
     pub moon_lux: f32,
-    /// Clear colour and fog colour (sRGB).
+    /// Clear colour (sRGB display value; **non-native**, the fog colour is `haze.rs`'s).
     pub sky: Vec3,
-    pub fog_visibility: f32,
-    pub fog_extinction: Vec3,
-    pub fog_inscatter: Vec3,
     /// 0 at night, 1 by day: how much sky there is.
     pub daylight: f32,
 }
@@ -202,23 +192,13 @@ impl SkyState {
             light_dir,
             moon_lux: MOON_LUX * (1.0 - smoothstep(-6.0, 6.0, e)) * smoothstep(-2.0, 12.0, moon_e),
             sky,
-            fog_visibility: FOG_VISIBILITY_NIGHT
-                + (FOG_VISIBILITY_DAY - FOG_VISIBILITY_NIGHT) * sky_w,
-            fog_extinction: FOG_EXTINCTION * ratio.clamp(Vec3::splat(0.6), Vec3::ONE),
-            fog_inscatter: FOG_INSCATTER * (sky / NOON_SKY),
             daylight: sky_w,
         }
     }
 }
 
-/// A fog **coefficient** colour (`FogFalloff::from_visibility_colors`): a unit-free
-/// per-channel transmittance/in-scatter rate, not a scene colour, so it stays as authored.
-fn coefficient(v: Vec3) -> Color {
-    Color::srgb(v.x, v.y, v.z)
-}
-
-/// A scene colour (clear colour, fog colour at infinity) from a project colour authored as a
-/// display value: native units `d^2` (`native_units.rs`). **Policy colour, native unit.**
+/// A scene colour (the clear colour) from a project colour authored as a display value:
+/// native units `d^2` (`native_units.rs`). **Policy colour, native unit.**
 fn colour(v: Vec3) -> Color {
     crate::native_units::native_colour(v, 1.0)
 }
@@ -240,6 +220,7 @@ impl Plugin for SkyPlugin {
             .init_resource::<AtmosphereState>()
             .init_resource::<ZoneGradientData>()
             .init_resource::<SkyLighting>()
+            .init_resource::<crate::haze::HazeFog>()
             .init_resource::<ClearColor>()
             .add_systems(
                 Startup,
@@ -259,6 +240,7 @@ impl Plugin for SkyPlugin {
                     update_atmosphere,
                     update_zone_inputs,
                     update_sky_lighting,
+                    crate::haze::update_haze_fog,
                     scale_point_lights,
                     apply_sky,
                     follow_camera,
@@ -389,7 +371,7 @@ fn apply_sky(
     lighting: Res<SkyLighting>,
     mut clear: ResMut<ClearColor>,
     mut sun: Query<(&mut DirectionalLight, &mut Transform), With<Sun>>,
-    mut cams: Query<(&mut AmbientLight, &mut DistanceFog), With<Camera3d>>,
+    mut cams: Query<&mut AmbientLight, With<Camera3d>>,
 ) {
     let st = SkyState::at(time.hours, data.0.as_ref());
     // native colour of the one light and the ambient (sky_light.rs); units are the exposure identity
@@ -401,21 +383,10 @@ fn apply_sky(
     }
     // policy colours (`st.sky`, authored as display values) in native scene units
     clear.0 = colour(st.sky);
-    for (mut amb, mut fog) in &mut cams {
+    // the fog is `haze.rs`'s (native colour and numbers, JC2-155)
+    for mut amb in &mut cams {
         amb.color = lights.ambient_color;
         amb.brightness = lights.ambient_brightness;
-        fog.color = colour(st.sky);
-        fog.directional_light_color = Color::srgba(
-            st.sun_colour.x,
-            st.sun_colour.y * 0.98,
-            st.sun_colour.z * 0.92,
-            0.5 * smoothstep(-3.0, 12.0, st.sun_elevation),
-        );
-        fog.falloff = FogFalloff::from_visibility_colors(
-            st.fog_visibility,
-            coefficient(st.fog_extinction),
-            coefficient(st.fog_inscatter),
-        );
     }
 }
 
@@ -484,6 +455,7 @@ fn clock_text(time: Res<TimeOfDay>, mut text: Query<&mut Text, With<ClockText>>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::pbr::DistanceFog;
     use bevy::time::TimeUpdateStrategy;
     use jc2_formats::GameFs;
     use std::time::Duration;

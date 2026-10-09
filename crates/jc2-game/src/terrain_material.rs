@@ -246,6 +246,7 @@ impl Plugin for TerrainMaterialPlugin {
         let shader: Handle<Shader> = load_embedded_asset!(app, "terrain_splat.wgsl");
         bevy::asset::embedded_asset!(app, "sun_horizon.wgsl");
         let horizon: Handle<Shader> = load_embedded_asset!(app, "sun_horizon.wgsl");
+        crate::haze::ensure_shader(app);
         app.insert_resource(TerrainShader(shader));
         app.insert_resource(SunHorizonShader(horizon));
         app.add_plugins(MaterialPlugin::<TerrainSplatMaterial>::default());
@@ -408,6 +409,8 @@ impl SplatContext {
                 perceptual_roughness: 1.0,
                 metallic: 0.0,
                 reflectance: 0.1,
+                // the native fog is applied in `terrain_splat.wgsl` (`haze_fog.wgsl`)
+                fog_enabled: false,
                 ..default()
             },
             extension: TerrainSplat {
@@ -828,12 +831,16 @@ fn alpha_discard(m: Mat, c: vec4<f32>) -> vec4<f32> { return c; }
 fn apply_pbr_lighting(p: PbrInput) -> vec4<f32> { return p.material.base_color; }
 fn main_pass_post_lighting_processing(p: PbrInput, c: vec4<f32>) -> vec4<f32> { return c; }
 "#;
-        // the shared module, minus its import path
-        let shared: String = include_str!("sun_horizon.wgsl")
-            .lines()
-            .filter(|l| !l.starts_with("#define_import_path"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // the shared modules, minus their import paths
+        let shared: String = [
+            include_str!("sun_horizon.wgsl"),
+            include_str!("haze_fog.wgsl"),
+        ]
+        .iter()
+        .flat_map(|m| m.lines())
+        .filter(|l| !l.starts_with("#define_import_path"))
+        .collect::<Vec<_>>()
+        .join("\n");
         let full = format!("{stubs}\n{shared}\n{body}");
         let module = naga::front::wgsl::parse_str(&full).unwrap_or_else(|e| {
             panic!("{}", e.emit_to_string(&full));

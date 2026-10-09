@@ -203,6 +203,8 @@ pub fn source_material(mut base: StandardMaterial, alpha_test: bool) -> Standard
     base.perceptual_roughness = 1.0;
     base.metallic = 0.0;
     base.reflectance = 0.0;
+    // the native fog is applied in `general_main.wgsl` (`haze_fog.wgsl`), not Bevy's
+    base.fog_enabled = false;
     base.opaque_render_method = bevy::material::OpaqueRendererMethod::Forward;
     // Masked routing runs the fragment shader in the depth / shadow passes too, with the
     // same strictly-below reference as the main pass (render flag 0x100).
@@ -238,6 +240,7 @@ impl Plugin for GeneralMaterialPlugin {
             let horizon: Handle<Shader> = load_embedded_asset!(app, "sun_horizon.wgsl");
             app.insert_resource(SunHorizonShader(horizon));
         }
+        crate::haze::ensure_shader(app);
         app.insert_resource(GeneralShader(shader))
             .add_plugins(MaterialPlugin::<GeneralMaterial>::default())
             .add_systems(Startup, make_fallback)
@@ -256,6 +259,7 @@ fn make_fallback(
             cb0: Vec4::new(0.0, 0.0, 1.0, 1.0),
             sun: Vec4::ZERO,
             tilt: Vec4::ZERO,
+            ..default()
         })),
     });
 }
@@ -529,11 +533,15 @@ fn alpha_discard(m: Mat, c: vec4<f32>) -> vec4<f32> { return c; }
 fn apply_pbr_lighting(p: PbrInput) -> vec4<f32> { return p.material.base_color; }
 fn main_pass_post_lighting_processing(p: PbrInput, c: vec4<f32>) -> vec4<f32> { return c; }
 "#;
-        let shared: String = include_str!("sun_horizon.wgsl")
-            .lines()
-            .filter(|l| !l.starts_with("#define_import_path"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let shared: String = [
+            include_str!("sun_horizon.wgsl"),
+            include_str!("haze_fog.wgsl"),
+        ]
+        .iter()
+        .flat_map(|m| m.lines())
+        .filter(|l| !l.starts_with("#define_import_path"))
+        .collect::<Vec<_>>()
+        .join("\n");
         let full = format!("{stubs}\n{shared}\n{body}");
         let module = naga::front::wgsl::parse_str(&full).unwrap_or_else(|e| {
             panic!("{}", e.emit_to_string(&full));

@@ -22,7 +22,6 @@ use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::mesh::{Indices, PrimitiveTopology};
-use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
 use jc2_formats::areaset::AreaSets;
 use jc2_formats::collision::{CollisionInstances, parse_pfx};
@@ -1190,17 +1189,9 @@ pub(crate) fn setup(
             brightness: 140.0,
             ..default()
         },
-        // haze: hides the edge of the loaded region and gives depth to the ridges
-        DistanceFog {
-            color: SKY,
-            directional_light_color: Color::srgba(1.0, 0.95, 0.85, 0.5),
-            directional_light_exponent: 30.0,
-            falloff: FogFalloff::from_visibility_colors(
-                12_000.0,
-                Color::srgb(0.35, 0.45, 0.55),
-                Color::srgb(0.75, 0.82, 0.90),
-            ),
-        },
+        // the native haze (`haze.rs`) rewrites this every frame; it only fogs the meshes that stay
+        // `StandardMaterial` (labelled approximation). Starts with no fog.
+        crate::haze::HazeFog::default().distance_fog(),
     ));
     commands.insert_resource(ClearColor(SKY));
     // the sun/moon light and the ambient are `sky.rs`'s (`sky_light.rs`): they follow the time of day

@@ -28,8 +28,9 @@
 //!   unrelated ring slot; and with no world streamer at all (the viewers) the fields keep the
 //!   stand-in `Default` set 7 / intensity 3.
 //!   Not implemented: the height (set 8), underwater (set 9), rain (10) and snow (11) branches
-//!   of the gradient blend, so the camera's altitude does not change the light, and the cloud
-//!   rows 2/3.
+//!   of the gradient blend, so the camera's altitude does not change the light. Rows 2 and 3
+//!   (raw, no gain, the same smoothing) are exposed as [`LightState::haze_toward_sun`] /
+//!   [`LightState::haze_away`]: the haze presets P1/P2, the fog colour (`haze.rs`, JC2-155).
 //! * Without the files every value is the exe initialiser's 1.0 (`FUN_00a58640`), the state
 //!   before the first gradient update.
 //!
@@ -64,8 +65,8 @@ use bevy::camera::Exposure;
 use bevy::prelude::*;
 use jc2_formats::terrain::{GAMEZONE_RESET_BYTE, GameZoneCell, zone_cell};
 use jc2_formats::weather::{
-    GameZoneGradients, LandscapeEffects, ROW_GROUND_AMBIENT, ROW_SKY_AMBIENT, ROW_SUN,
-    ZONE_TYPE_DEFAULT, sun_colour_transform,
+    GameZoneGradients, LandscapeEffects, ROW_GROUND_AMBIENT, ROW_HAZE_AWAY, ROW_HAZE_TOWARD_SUN,
+    ROW_SKY_AMBIENT, ROW_SUN, ZONE_TYPE_DEFAULT, sun_colour_transform,
 };
 
 /// The exposure `e0` of the game camera: Bevy's default [`Exposure::BLENDER`], written
@@ -97,6 +98,9 @@ const CONSTRUCTOR: LightState = LightState {
     sun: Vec3::ONE,
     sky_ambient: Vec3::ONE,
     ground_ambient: Vec3::ONE,
+    // the haze presets' constructor colour (1, 1, 1, 1) (`FUN_00a3f8b0`)
+    haze_toward_sun: Vec3::ONE,
+    haze_away: Vec3::ONE,
 };
 
 /// The tables and the file's constants, when the files could be read.
@@ -115,6 +119,10 @@ struct Rows {
     sun: Vec3,
     sky: Vec3,
     ground: Vec3,
+    /// Rows 2 and 3, which `FUN_00a55cd0` copies into the haze presets P1 / P2 (JC2-116):
+    /// smoothed with the rest of the state, no gain.
+    haze_toward_sun: Vec3,
+    haze_away: Vec3,
 }
 
 impl Rows {
@@ -123,6 +131,8 @@ impl Rows {
             sun: self.sun.lerp(to.sun, f),
             sky: self.sky.lerp(to.sky, f),
             ground: self.ground.lerp(to.ground, f),
+            haze_toward_sun: self.haze_toward_sun.lerp(to.haze_toward_sun, f),
+            haze_away: self.haze_away.lerp(to.haze_away, f),
         }
     }
 }
@@ -136,6 +146,10 @@ pub struct LightState {
     pub sky_ambient: Vec3,
     /// `cb0[11]`: the ambient of a down-facing surface.
     pub ground_ambient: Vec3,
+    /// Gradient row 2, raw: the fog colour toward the sun (haze preset P1, `cloud+0x9c`).
+    pub haze_toward_sun: Vec3,
+    /// Gradient row 3, raw: the fog colour away from the sun (haze preset P2, `cloud+0xc0`).
+    pub haze_away: Vec3,
 }
 
 impl LightState {
@@ -201,6 +215,8 @@ fn target_rows(g: &ZoneGradients, set: usize, intensity: f32, hour: f32) -> Rows
         sun: v3(r[ROW_SUN]),
         sky: v3(r[ROW_SKY_AMBIENT]),
         ground: v3(r[ROW_GROUND_AMBIENT]),
+        haze_toward_sun: v3(r[ROW_HAZE_TOWARD_SUN]),
+        haze_away: v3(r[ROW_HAZE_AWAY]),
     }
 }
 
@@ -209,6 +225,8 @@ fn state_of(g: &ZoneGradients, rows: Rows) -> LightState {
         sun: v3(sun_colour_transform(rows.sun.to_array(), g.effects.gain)),
         sky_ambient: rows.sky,
         ground_ambient: rows.ground,
+        haze_toward_sun: rows.haze_toward_sun,
+        haze_away: rows.haze_away,
     }
 }
 
@@ -377,6 +395,7 @@ pub(crate) fn synthetic() -> ZoneGradients {
             set_snow: 11,
             altitude: [30.0, 300.0, 1000.0],
             underwater_depth: 120.0,
+            haze: jc2_formats::weather::HazeSettings::default(),
         },
     }
 }
@@ -581,6 +600,8 @@ mod tests {
             sun: Vec3::new(5.667, 5.051, 3.697),
             sky_ambient: Vec3::new(0.0, 0.017, 0.041),
             ground_ambient: Vec3::new(0.73, 0.554, 0.263),
+            haze_toward_sun: Vec3::ZERO,
+            haze_away: Vec3::ZERO,
         };
         let b = s.to_bevy();
         let c = b.sun_color.to_linear();
@@ -603,6 +624,8 @@ mod tests {
             sun: Vec3::ZERO,
             sky_ambient: Vec3::ZERO,
             ground_ambient: Vec3::ZERO,
+            haze_toward_sun: Vec3::ZERO,
+            haze_away: Vec3::ZERO,
         }
         .to_bevy();
         assert_eq!((z.sun_illuminance, z.ambient_brightness), (0.0, 0.0));

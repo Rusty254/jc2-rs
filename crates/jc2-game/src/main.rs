@@ -54,6 +54,7 @@ mod gameplay_camera;
 mod general_material;
 mod grapple;
 mod grass;
+mod haze;
 mod heat;
 mod heli;
 mod horizon;

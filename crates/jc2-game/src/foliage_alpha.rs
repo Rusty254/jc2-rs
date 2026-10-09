@@ -7,6 +7,7 @@ use bevy::ecs::world::DeferredWorld;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use jc2_formats::foliage::FoliageAlpha;
 use std::collections::{HashMap, HashSet};
@@ -40,12 +41,17 @@ impl From<FoliageAlpha> for FoliageParams {
 pub struct FoliageExtension {
     #[uniform(100)]
     params: FoliageParams,
+    /// The shared per-frame constants (`sun_horizon::SunHorizon`); foliage reads only the haze
+    /// fog fields (JC2-155). Filled by [`bind_haze`], like the General material's.
+    #[storage(101, read_only)]
+    sun_horizon: Handle<ShaderBuffer>,
     pub state: FoliageAlpha,
 }
 impl FoliageExtension {
     pub fn new(state: FoliageAlpha) -> Self {
         Self {
             params: state.into(),
+            sun_horizon: Handle::default(),
             state,
         }
     }
@@ -67,6 +73,8 @@ pub fn source_material(mut base: StandardMaterial, state: FoliageAlpha) -> Folia
     // Masked routing invokes a fragment shader in main/depth/shadow. Our shared
     // discard replaces StandardMaterial cutoff; no alpha-to-coverage is used.
     base.alpha_mode = AlphaMode::Mask(0.0);
+    // the native fog is applied in `foliage_main.wgsl` (`haze_fog.wgsl`), not Bevy's
+    base.fog_enabled = false;
     base.opaque_render_method = bevy::material::OpaqueRendererMethod::Forward;
     FoliageMaterial {
         base,
@@ -161,11 +169,51 @@ impl Plugin for FoliageMaterialPlugin {
             load_embedded_asset!(app, "foliage_main.wgsl"),
             load_embedded_asset!(app, "foliage_prepass.wgsl"),
         ];
+        crate::haze::ensure_shader(app);
         app.insert_resource(FoliageShaders(shaders)).add_plugins((
             MaterialPlugin::<FoliageMaterial>::default(),
             FoliageInstancePlugin,
         ));
-        app.add_systems(PostUpdate, push_fade.before(AssetEventSystems));
+        app.add_systems(Startup, make_haze_fallback)
+            .add_systems(PostUpdate, (push_fade, bind_haze).before(AssetEventSystems));
+    }
+}
+
+/// The constants bound when there is no terrain horizon (model viewer, fixtures): all zero, i.e.
+/// no fog.
+#[derive(Resource)]
+struct HazeFallback(Handle<ShaderBuffer>);
+
+fn make_haze_fallback(mut commands: Commands, buffers: Option<ResMut<Assets<ShaderBuffer>>>) {
+    if let Some(mut buffers) = buffers {
+        commands.insert_resource(HazeFallback(
+            buffers.add(ShaderBuffer::from(crate::sun_horizon::SunHorizon::default())),
+        ));
+    }
+}
+
+/// Point every foliage material at the shared `SunHorizon` buffer (whose fog fields
+/// `sun_horizon::update_horizon` writes every frame): the terrain's when there is one and it is
+/// enabled, otherwise the all-zero fallback. Writes only materials that differ.
+fn bind_haze(
+    horizon: Option<Res<crate::sun_horizon::HorizonShadow>>,
+    fallback: Option<Res<HazeFallback>>,
+    mut materials: ResMut<Assets<FoliageMaterial>>,
+) {
+    let Some(fallback) = fallback else { return };
+    let buffer = match &horizon {
+        Some(h) if h.enabled => h.params.clone(),
+        _ => fallback.0.clone(),
+    };
+    let stale: Vec<_> = materials
+        .iter()
+        .filter(|(_, m)| m.extension.sun_horizon.id() != buffer.id())
+        .map(|(id, _)| id)
+        .collect();
+    for id in stale {
+        if let Some(mut m) = materials.get_mut(id) {
+            m.extension.sun_horizon = buffer.clone();
+        }
     }
 }
 
@@ -228,9 +276,11 @@ fn sync_instances(
             continue;
         }
         let fade = source.extension.params.fade;
+        let horizon = source.extension.sun_horizon.clone();
         let mut private = source;
         private.extension = FoliageExtension::new(instance.state);
         private.extension.params.fade = fade;
+        private.extension.sun_horizon = horizon;
         if let Some(private_handle) = owned.materials.get_mut(&entity)
             && let Some(mut existing) = materials.get_mut(&private_handle.handle)
         {
@@ -571,7 +621,9 @@ mod tests {
             assert!(shader.contains(
                 "#import jc2::foliage_alpha::{foliage_should_discard, foliage_distance_fade}"
             ));
-            assert!(shader.contains("foliage_distance_fade(in.world_position.xyz, in.instance_index)"));
+            assert!(
+                shader.contains("foliage_distance_fade(in.world_position.xyz, in.instance_index)")
+            );
             assert!(!shader.contains("prepass_alpha_discard("));
             assert!(!shader.contains("= alpha_discard("));
         }

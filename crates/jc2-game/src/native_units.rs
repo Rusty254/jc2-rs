@@ -14,11 +14,13 @@
 //! | ambient | `AmbientLight::brightness` | `1 / e0` per unit | `sky_light::ambient_per_unit` (native) |
 //! | point light | lumens, inverse square | `4 pi * pi / e0` per unit of colour **at 1 m** | [`point_lumens_per_unit`] |
 //! | emissive of a **lit** material | `emissive` (times `e0` unless its alpha is 0) | `1 / e0` per unit | [`emissive_per_unit`] |
-//! | unlit colour, fog colour, clear colour | the value is written to the scene target as is | 1 | [`native_colour`] |
+//! | unlit colour, clear colour | the value is written to the scene target as is | 1 | [`native_colour`] |
+//! | fog colour | native since JC2-155: rows 2/3 of the zone gradient, mixed into the scene colour as is | 1 | `haze.rs` (no policy fog colour or distances remain) |
 //!
 //! `unlit` materials show `base_color` only: Bevy ignores `emissive` on them (the lit branch of
 //! `pbr_fragment.wgsl` / `pbr.wgsl`), and the exposure never touches them. Fog is mixed into
-//! the already exposed colour, so a fog colour is a scene colour as well.
+//! the already exposed colour, so a fog colour is a scene colour as well (the native haze colour
+//! is used unconverted).
 //!
 //! **What is native here and what is policy.** The identities are native (they follow from the
 //! chain and Bevy 0.19.1's formulas, tested below against a CPU copy of Bevy's maths). The
