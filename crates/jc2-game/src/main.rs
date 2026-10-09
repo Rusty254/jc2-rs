@@ -86,6 +86,7 @@ mod stunts;
 mod sun_horizon;
 mod terrain_material;
 mod traffic;
+mod veg_fade;
 mod vegdata;
 mod vehicle;
 mod viewer;
@@ -568,6 +569,7 @@ fn main() {
                 world::WorldPlugin,
                 locations::LocationsPlugin,
                 horizon::HorizonPlugin,
+                veg_fade::VegetationFadePlugin,
             ))
             .insert_resource(scenery::SceneryConfig {
                 vegetation: !cli.no_vegetation,
@@ -586,7 +588,6 @@ fn main() {
             if !cli.no_impostors {
                 app.insert_resource(impostors::ImpostorConfig {
                     radius: cli.impostor_radius.clamp(1, 12),
-                    ..default()
                 })
                 .add_plugins(impostors::ImpostorPlugin);
             }

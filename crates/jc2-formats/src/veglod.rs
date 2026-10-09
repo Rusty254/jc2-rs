@@ -123,6 +123,132 @@ pub fn instance_byte(filled: &[bool; LOD_SLOTS], lod: u8, k: u8) -> Option<u8> {
     Some(if f - 1.0 < 0.0 { (f * 255.0) as u8 } else { 255 })
 }
 
+// ---------------------------------------------------------------------------------------
+// Vegetation fade distances (JC2-126 / JC2-140): `research/formats/tree-impostors-next.md`,
+// reproduced by `research/tools/tree_impostors_probe.py`.
+//
+// The per-frame vegetation manager (`00a92ca0`) writes eight floats into the render engine;
+// the pass setup of the tree impostor render blocks (`00a83740` Top, `00a843a0` Trunk) turns
+// them and the camera FOV into the vertex-shader constants `cb1[1]`, and the foliage vertex
+// shaders (VegetationFoliage / BillboardFoliage) reuse the Top pair for their distance fade.
+// ---------------------------------------------------------------------------------------
+
+/// The eight render-engine distances (`DAT_01191ab4` +4..+0x20, copied to the render context
+/// +0xd1c..+0xd38 by `0095a190`). Field names are the context offsets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EngineTable {
+    pub d1c: f32,
+    pub d20: f32,
+    pub d24: f32,
+    pub d28: f32,
+    pub d2c: f32,
+    pub d30: f32,
+    pub d34: f32,
+    pub d38: f32,
+}
+
+/// The table for the graphics setting `/lodfactor` 0..=3 (`00a92ca0`; level `DAT_0108b924`
+/// set by `00a7b730`, default 0). Values above 3 behave as 3 (the manager tests `< 2`, `< 3`).
+pub fn engine_table(lodfactor: u32) -> EngineTable {
+    let (d2c, d34) = match lodfactor {
+        0 | 1 => (55.0, 60.0),
+        2 => (119.0, 124.0),
+        _ => (183.0, 188.0),
+    };
+    EngineTable {
+        d1c: 450.0,
+        d20: 350.0,
+        d24: 480.0,
+        d28: 120.0,
+        d2c,
+        d30: 55.0,
+        d34,
+        d38: 60.0,
+    }
+}
+
+/// FOV factor `f = max(fov^2, 0.38)` (`00a83740` / `00a843a0`, `ctx+0xca8` = camera `+0x618`,
+/// the FOV in radians, vertical axis, JC2-141). There is no upper cap on `f`.
+pub fn fov_factor(fov_rad: f32) -> f32 {
+    (fov_rad * fov_rad).max(0.38)
+}
+
+/// `cb1[1]` of TreeImpostorTop (`00a83740`): `(d2c/(d30 f), 1/d30, d1c/(d20 f), 1/d20)`.
+pub fn top_constants(t: &EngineTable, f: f32) -> [f32; 4] {
+    [
+        t.d2c / (t.d30 * f),
+        1.0 / t.d30,
+        t.d1c / (t.d20 * f),
+        1.0 / t.d20,
+    ]
+}
+
+/// `cb1[1]` of TreeImpostorTrunk (`00a843a0`); with `a = d38 f`:
+/// `((a * 0.33333334 + d34) / a, 3 / (2 d38), d24 / (d28 f), 1 / d28)`.
+pub fn trunk_constants(t: &EngineTable, f: f32) -> [f32; 4] {
+    let a = t.d38 * f;
+    [
+        (a * 0.333_333_34 + t.d34) / a,
+        3.0 / (t.d38 * 2.0),
+        t.d24 / (t.d28 * f),
+        1.0 / t.d28,
+    ]
+}
+
+/// `(x, y)` of the foliage shaders' `1 - sat(dist * y - x)`: the Top pair (`cb1[1].xy`).
+pub fn foliage_constants(t: &EngineTable, f: f32) -> [f32; 2] {
+    let c = top_constants(t, f);
+    [c[0], c[1]]
+}
+
+/// Largest distance at which the foliage fade can still be non-zero for any FOV: `f` never
+/// drops below 0.38, so the fade is gone at `d2c / 0.38 + d30` (199.7 m for
+/// lodfactor 0) however the camera zooms. Used for a CPU-side cull that changes nothing
+/// visible (a bound derived from the native constants, not a native distance).
+pub fn foliage_fade_end_max(t: &EngineTable) -> f32 {
+    t.d2c / 0.38 + t.d30
+}
+
+fn sat(x: f32) -> f32 {
+    x.clamp(0.0, 1.0)
+}
+
+/// Clip threshold of the impostor vertex shaders (`lt r1.x, r0.w, l(0.996078)`).
+pub const CARD_CLIP: f32 = 0.996_078;
+
+/// Alpha of a tree impostor card from the vertex shaders (TreeImpostorTop / Trunk):
+/// `min(1 - sat(cheb * w - z), sat(euclid * y - x)) * 3 + 0.99`; the card is clipped when it is
+/// below [`CARD_CLIP`]. Returns `(alpha, visible)`.
+pub fn card_alpha(c: &[f32; 4], cheb: f32, euclid: f32) -> (f32, bool) {
+    let far = 1.0 - sat(cheb * c[3] - c[2]);
+    let near = sat(euclid * c[1] - c[0]);
+    let a = far.min(near) * 3.0 + 0.99;
+    (a, a >= CARD_CLIP)
+}
+
+/// Foliage model fade (VegetationFoliage / BillboardFoliage VS): `1 - sat(dist * y - x)`,
+/// multiplied into the instance fade `cb2[16].x`; 0 clips the vertex.
+pub fn foliage_fade(c: &[f32; 2], dist: f32) -> f32 {
+    1.0 - sat(dist * c[1] - c[0])
+}
+
+/// Chebyshev distance of a card centre from the camera (both impostor shaders):
+/// `max(|dy| / 16, |dx|, |dz|)`.
+pub fn card_chebyshev(d: [f32; 3]) -> f32 {
+    (d[1].abs() * 0.0625).max(d[0].abs()).max(d[2].abs())
+}
+
+/// Euclid distance of a Top card (`sqrt(dx^2 + dy^2 + dz^2)`).
+pub fn top_euclid(d: [f32; 3]) -> f32 {
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+}
+
+/// Euclid distance of a Trunk card (`sqrt(dx^2 + dz^2 + (dy/4)^2)`).
+pub fn trunk_euclid(d: [f32; 3]) -> f32 {
+    let y = d[1] * 0.25;
+    (d[0] * d[0] + d[2] * d[2] + y * y).sqrt()
+}
+
 /// Distance (m) at which the level reaches `level_index` (1..=5) for a model scale `s` at
 /// zoom factor 1: `{10, 25, 50, 100, 500} * s`. Level 5 is where the model is culled.
 pub fn distance_at_level(level_index: usize, model_scale: f32) -> f32 {
@@ -356,5 +482,142 @@ mod tests {
         assert_eq!(lod, 1);
         assert!((225..=235).contains(&k), "{k}");
         assert_eq!(select(o, 26.0 * 26.0, 2), Selection::Culled);
+    }
+
+    fn bisect(pred: impl Fn(f32) -> bool, mut lo: f32, mut hi: f32) -> f32 {
+        for _ in 0..60 {
+            let mid = (lo + hi) / 2.0;
+            if pred(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+
+    /// Fixtures of `tree_impostors_probe.py`: (foliage full, foliage gone, Top in, Top gone,
+    /// Trunk in, Trunk gone).
+    fn ranges(lod: u32, f: f32) -> [f32; 6] {
+        let t = engine_table(lod);
+        let (tc, rc, fc) = (
+            top_constants(&t, f),
+            trunk_constants(&t, f),
+            foliage_constants(&t, f),
+        );
+        [
+            bisect(|d| foliage_fade(&fc, d) < 1.0, 0.0, 4000.0),
+            bisect(|d| foliage_fade(&fc, d) <= 0.0, 0.0, 4000.0),
+            bisect(|e| card_alpha(&tc, 0.0, e).1, 0.0, 4000.0),
+            bisect(|c| !card_alpha(&tc, c, 4000.0).1, 0.0, 4000.0),
+            bisect(|e| card_alpha(&rc, 0.0, e).1, 0.0, 4000.0),
+            bisect(|c| !card_alpha(&rc, c, 4000.0).1, 0.0, 4000.0),
+        ]
+    }
+
+    fn near(got: f32, want: f32, tol: f32) {
+        assert!((got - want).abs() <= tol, "{got} vs {want}");
+    }
+
+    #[test]
+    fn engine_table_by_lodfactor() {
+        let t0 = engine_table(0);
+        assert_eq!(
+            [t0.d1c, t0.d20, t0.d24, t0.d28, t0.d2c, t0.d30, t0.d34, t0.d38],
+            [450.0, 350.0, 480.0, 120.0, 55.0, 55.0, 60.0, 60.0]
+        );
+        assert_eq!(engine_table(1), t0);
+        assert_eq!((engine_table(2).d2c, engine_table(2).d34), (119.0, 124.0));
+        assert_eq!((engine_table(3).d2c, engine_table(3).d34), (183.0, 188.0));
+    }
+
+    #[test]
+    fn fov_factor_is_squared_fov_floored() {
+        assert_eq!(fov_factor(1.0), 1.0);
+        assert_eq!(fov_factor(0.5), 0.38);
+        near(fov_factor(1.570_796_4), 2.4674, 1e-3);
+    }
+
+    #[test]
+    fn fade_ranges_lodfactor_zero_f_one() {
+        let [fi, fo, ti, to, ri, ro] = ranges(0, 1.0);
+        near(fi, 55.0, 0.01);
+        near(fo, 110.0, 0.01);
+        near(ti, 55.11, 0.05);
+        near(to, 799.3, 0.5);
+        near(ri, 53.4, 0.1);
+        near(ro, 599.8, 0.5);
+    }
+
+    #[test]
+    fn fade_ranges_other_lodfactors_and_narrow_fov() {
+        let [fi, fo, ti, ..] = ranges(2, 1.0);
+        near(fi, 119.0, 0.02);
+        near(fo, 174.0, 0.02);
+        near(ti, 119.1, 0.1);
+        let [fi, fo, ti, _, ri, _] = ranges(3, 1.0);
+        near(fi, 183.0, 0.02);
+        near(fo, 238.0, 0.02);
+        near(ti, 183.1, 0.1);
+        near(ri, 138.8, 0.1);
+        // f = 0.38: the start distances stretch by 1/f, the widths do not
+        let [fi, fo, ti, to, ri, ro] = ranges(0, 0.38);
+        near(fi, 55.0 / 0.38, 0.02);
+        near(fo, 55.0 / 0.38 + 55.0, 0.02);
+        near(ti, 144.9, 0.1);
+        near(to, 1533.5, 0.5);
+        near(ri, 118.7, 0.1);
+        near(ro, 1382.9, 0.5);
+    }
+
+    /// Native on-foot camera (JC2-141): 40 degrees vertical, `f32(40 * 0.017453292)`; the FOV
+    /// factor has no upper cap, so `f = 0.48738784` and the start distances stretch by 1/f.
+    #[test]
+    fn fade_ranges_at_the_native_on_foot_fov() {
+        let fov = 40.0_f32 * 0.017_453_292;
+        assert_eq!(fov, 0.698_131_7);
+        let f = fov_factor(fov);
+        near(f, 0.487_387_84, 1e-7);
+        let [fi, fo, ti, to, ri, ro] = ranges(0, f);
+        near(fi, 112.84, 0.05);
+        near(fo, 167.84, 0.05);
+        near(ti, 55.0 / f + 0.11, 0.05);
+        near(to, 450.0 / f + 349.29, 0.1);
+        near(ri, 95.5, 0.1);
+        near(ro, 480.0 / f + 119.76, 0.1);
+        // no cap: a 90 degree FOV shrinks the distances
+        let f90 = fov_factor(std::f32::consts::FRAC_PI_2);
+        near(f90, 2.467_401, 1e-5);
+        near(ranges(0, f90)[0], 55.0 / f90, 0.02);
+    }
+
+    #[test]
+    fn foliage_is_gone_by_the_maximum_for_every_fov() {
+        let t = engine_table(0);
+        let max = foliage_fade_end_max(&t);
+        near(max, 199.7, 0.05);
+        for fov in [0.05_f32, 0.3, 0.6164, 0.698_131_7, 1.0, 1.4, 2.0] {
+            let fc = foliage_constants(&t, fov_factor(fov));
+            assert_eq!(foliage_fade(&fc, max + 0.1), 0.0, "{fov}");
+        }
+    }
+
+    #[test]
+    fn card_distances_follow_the_shader() {
+        // height counts 1/16 for the Chebyshev test, the trunk's Euclid divides height by 4
+        assert_eq!(card_chebyshev([3.0, -160.0, 4.0]), 10.0);
+        assert_eq!(card_chebyshev([30.0, -160.0, 4.0]), 30.0);
+        assert_eq!(top_euclid([3.0, 4.0, 12.0]), 13.0);
+        assert_eq!(trunk_euclid([3.0, 16.0, 0.0]), 5.0);
+        // a Top card is clipped before its fade-in and solid in between
+        let c = top_constants(&engine_table(0), 1.0);
+        assert!(!card_alpha(&c, 0.0, 40.0).1);
+        assert_eq!(card_alpha(&c, 0.0, 200.0).0, 3.99);
+        assert!(!card_alpha(&c, 900.0, 900.0).1);
+        // foliage: full inside 55 m, half at 82.5 m, gone at 110 m
+        let fc = foliage_constants(&engine_table(0), 1.0);
+        assert_eq!(foliage_fade(&fc, 50.0), 1.0);
+        near(foliage_fade(&fc, 82.5), 0.5, 1e-4);
+        assert_eq!(foliage_fade(&fc, 120.0), 0.0);
     }
 }

@@ -85,7 +85,7 @@ the camera FOV `f = max(fov^2, 0.38)` (`ctx+0xca8` is camera +0x618, the FOV in 
   vertex (JC2-024/025). So foliage-material meshes (leaf and needle models, billboard foliage) fade
   out over exactly the range in which Top cards fade in; General/Bark meshes are not touched.
 
-Resulting distances (probe fixtures, f32 arithmetic; `f = 1` for any FOV >= 1 rad, `f = 0.38` for
+Resulting distances (probe fixtures, f32 arithmetic; `f = 1` for a FOV of exactly 1 rad - there is no upper cap on `f`, see `camera-fov-next.md` - and `f = 0.38` for
 FOV <= 0.6164 rad):
 
 | lodfactor | f | foliage full -> gone | Top card visible from | Top card gone (Chebyshev) | Trunk card visible from | Trunk card gone (Chebyshev) |
@@ -106,7 +106,7 @@ model instance**, uploaded with that instance's other constants, never part of t
 
 ## Inferred
 
-1. **Handover.** Both are drawn: a foliage mesh fades out 55 -> 110 m (lodfactor 0, f = 1) while the
+1. **Handover.** Both are drawn: a foliage mesh fades out 55 -> 110 m (lodfactor 0, f = 1, i.e. a FOV of 1 rad; at the native 40 degree on-foot FOV f = 0.487 and it is 112.8 -> 167.8 m, JC2-141) while the
    cards fade in over the same interval, then the card is hard-clipped beyond 800 m (crowns) or
    600 m (trunks) Chebyshev. Cards are not culled by the model's slot/2000 m rule. The project
    `TREE_RANGE` 520..580, `BUSH_RANGE` 380..440 and the impostor 450..600 fade do not exist
@@ -174,3 +174,20 @@ model instance**, uploaded with that instance's other constants, never part of t
    `--impostor-radius` tile window must reach 800/f m (Gap 3).
 6. Receipts: headless unit tests for the formulas; captures at 40/80/120/300/700 m with lodfactor 0
    (Gap 8) before the old constants are removed.
+
+## Runtime delivered (JC2-140, branch `worktree-agent-a4047ee4a78aa42d4`)
+
+* `jc2_formats::veglod`: `engine_table`, `fov_factor` (no upper cap, JC2-141), `top_constants`, `trunk_constants`,
+  `foliage_constants`, `card_alpha`, `foliage_fade`, card distance helpers; unit tests carry the fixture table above plus the
+  native 40 degree on-foot case (f 0.48738784: foliage 112.8 -> 167.8 m).
+* `jc2-game/src/veg_fade.rs`: `VegetationFade` resource (three `Vec4`s) recomputed from the camera's actual vertical
+  `Projection` FOV; `lodfactor` fixed at 0 (setting not exposed). The project camera is still Bevy's 45 degrees (f 0.617:
+  foliage 89 -> 144 m) until the camera-FOV runtime lands, so the distances are native-formula but not native-FOV.
+* Foliage: the constants sit in the shared `FoliageParams` uniform (updated only on change, no per-plant clones); the shared
+  `foliage_alpha.wgsl` multiplies `1 - sat(dist*y - x)` into the instance fraction and clips at 0, in the main and prepass
+  fragment shaders (per fragment, not per vertex). Orthographic views (directional shadow cascades) skip the fade (Gap 2).
+* Cards: per-card fade and clip in the vertex shader of `impostor.wgsl` (Top, Trunk constants), pixel alpha
+  `tex.a * alpha - 0.996078` then the provisional `Mask(0.4)`; `FADE_FROM/FADE_TO` and the card `VisibilityRange` are gone.
+* `TREE_RANGE` / `BUSH_RANGE` no longer apply to foliage-material meshes; the other meshes keep them (Gap 6 census open).
+  Foliage meshes are hidden on the CPU only beyond `foliage_fade_end_max` + 50 m (199.7 m + slack: the fade is 0 at any FOV
+  there), a lossless project bound that keeps the vertex work of far plants down.

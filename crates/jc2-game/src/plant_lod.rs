@@ -8,8 +8,9 @@
 //! instance by `scenery.rs` and never touched here).
 //!
 //! Project policy, not native: [`MAX_SWAPS_PER_FRAME`] bounds the work after a camera jump,
-//! and the far presence range (`scenery::TREE_RANGE` / `BUSH_RANGE`) still decides when the
-//! model hands over to the impostor cards or disappears.
+//! and for the meshes that do not use the foliage material the far presence range
+//! (`scenery::TREE_RANGE` / `BUSH_RANGE`) still decides when they disappear. Foliage-material
+//! meshes have no such range: they fade out over the native 55..110 m (`veg_fade.rs`, JC2-140).
 
 use crate::rbm_loader::RbmAsset;
 use bevy::prelude::*;
@@ -84,12 +85,12 @@ fn update_plant_lods(
                         b.material_component(),
                         Transform::IDENTITY,
                     ));
-                    if let Some((from, to)) = vis_range {
-                        child.insert(bevy::camera::visibility::VisibilityRange {
-                            start_margin: 0.0..0.0,
-                            end_margin: from..to,
-                            use_aabb: false,
-                        });
+                    // foliage-material meshes fade out natively (`veg_fade.rs`, JC2-140): no
+                    // hand-over range, only a lossless cull; the others keep the project range
+                    if let Some(range) =
+                        crate::veg_fade::plant_visibility_range(b.foliage.is_some(), vis_range)
+                    {
+                        child.insert(range);
                     }
                 }
             });

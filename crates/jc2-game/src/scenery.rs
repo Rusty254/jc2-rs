@@ -47,12 +47,14 @@ pub struct SceneryConfig {
     /// Place the `.cgd` static geometry.
     pub static_geometry: bool,
     /// Hide the plant models beyond [`TREE_RANGE`] / [`BUSH_RANGE`] (the distant trees
-    /// are `impostors.rs`'s billboards then).
+    /// are `impostors.rs`'s billboards then). Meshes with the foliage material are exempt:
+    /// they fade out natively over 55..110 m (`veg_fade.rs`, JC2-140).
     pub far_lod: bool,
 }
 
-/// Where a tree with an impostor stops being drawn as a model: fully drawn up to the
-/// first number, gone at the second (`VisibilityRange` fades it in between).
+/// Where a tree with an impostor stops being drawn as a model (project policy, not native;
+/// only for the meshes that do not use the foliage material): fully drawn up to the first
+/// number, gone at the second (`VisibilityRange` fades it in between).
 pub const TREE_RANGE: (f32, f32) = (520.0, 580.0);
 /// The same for bushes, rocks and trees without an impostor.
 pub const BUSH_RANGE: (f32, f32) = (380.0, 440.0);

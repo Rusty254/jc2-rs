@@ -1447,12 +1447,12 @@ pub(crate) fn spawn_models(
                     if p.mesh_colliders && b.triangles > 0 {
                         child.insert(static_mesh_collider());
                     }
-                    if let Some((from, to)) = p.vis_range {
-                        child.insert(bevy::camera::visibility::VisibilityRange {
-                            start_margin: 0.0..0.0,
-                            end_margin: from..to,
-                            use_aabb: false,
-                        });
+                    // foliage-material meshes fade out natively (`veg_fade.rs`, JC2-140): no
+                    // hand-over range, only a lossless cull; the others keep the project range
+                    if let Some(range) =
+                        crate::veg_fade::plant_visibility_range(b.foliage.is_some(), p.vis_range)
+                    {
+                        child.insert(range);
                     }
                     tris += b.triangles;
                 }

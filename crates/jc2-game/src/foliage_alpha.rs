@@ -19,6 +19,10 @@ pub struct FoliageParams {
     instance_fraction: f32,
     reference: f32,
     reserved: f32,
+    /// Native distance fade (`veg_fade::VegetationFade::foliage`): `x`, `y` of
+    /// `1 - sat(dist * y - x)`, `z` = 1 when active. Shared by every foliage material and
+    /// updated by [`push_fade`] when the camera FOV changes; not part of the instance state.
+    fade: Vec4,
 }
 impl From<FoliageAlpha> for FoliageParams {
     fn from(alpha: FoliageAlpha) -> Self {
@@ -27,6 +31,7 @@ impl From<FoliageAlpha> for FoliageParams {
             instance_fraction: alpha.fraction(),
             reference: alpha.reference(),
             reserved: 0.0,
+            fade: Vec4::ZERO,
         }
     }
 }
@@ -160,6 +165,29 @@ impl Plugin for FoliageMaterialPlugin {
             MaterialPlugin::<FoliageMaterial>::default(),
             FoliageInstancePlugin,
         ));
+        app.add_systems(PostUpdate, push_fade.before(AssetEventSystems));
+    }
+}
+
+/// Copy the shared native distance fade (`veg_fade::VegetationFade`) into every foliage
+/// material that does not have it yet. The constants change only with the camera FOV, so this
+/// is a compare per material per frame and a write only after a change or for a new material;
+/// no per-plant material is created. Without the resource (model viewer, fixtures) the fade
+/// stays inactive.
+fn push_fade(
+    fade: Option<Res<crate::veg_fade::VegetationFade>>,
+    mut materials: ResMut<Assets<FoliageMaterial>>,
+) {
+    let want = fade.map_or(Vec4::ZERO, |f| f.foliage);
+    let stale: Vec<_> = materials
+        .iter()
+        .filter(|(_, m)| m.extension.params.fade != want)
+        .map(|(id, _)| id)
+        .collect();
+    for id in stale {
+        if let Some(mut m) = materials.get_mut(id) {
+            m.extension.params.fade = want;
+        }
     }
 }
 
@@ -199,8 +227,10 @@ fn sync_instances(
             }
             continue;
         }
+        let fade = source.extension.params.fade;
         let mut private = source;
         private.extension = FoliageExtension::new(instance.state);
+        private.extension.params.fade = fade;
         if let Some(private_handle) = owned.materials.get_mut(&entity)
             && let Some(mut existing) = materials.get_mut(&private_handle.handle)
         {
@@ -515,10 +545,17 @@ mod tests {
     fn shared_discard_wgsl_validates_and_both_passes_import_the_same_contract() {
         let source = include_str!("foliage_alpha.wgsl")
             .lines()
-            .filter(|line| !line.starts_with("#define_import_path"))
+            .filter(|line| !line.starts_with("#define_import_path") && !line.starts_with("#import"))
             .collect::<Vec<_>>()
             .join("\n")
+            .replace("mesh_functions::", "")
             .replace("#{MATERIAL_BIND_GROUP}", "2");
+        // stand-ins for the Bevy view and mesh bindings the real module imports
+        let source = format!(
+            "struct View {{ clip_from_view: mat4x4<f32>, world_position: vec3<f32> }}\n\
+             @group(0) @binding(0) var<uniform> view: View;\n\
+             fn get_world_from_local(i: u32) -> mat4x4<f32> {{ return mat4x4<f32>(); }}\n{source}"
+        );
         let module = naga::front::wgsl::parse_str(&source)
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
         naga::valid::Validator::new(
@@ -531,7 +568,10 @@ mod tests {
             include_str!("foliage_main.wgsl"),
             include_str!("foliage_prepass.wgsl"),
         ] {
-            assert!(shader.contains("#import jc2::foliage_alpha::foliage_should_discard"));
+            assert!(shader.contains(
+                "#import jc2::foliage_alpha::{foliage_should_discard, foliage_distance_fade}"
+            ));
+            assert!(shader.contains("foliage_distance_fade(in.world_position.xyz, in.instance_index)"));
             assert!(!shader.contains("prepass_alpha_discard("));
             assert!(!shader.contains("= alpha_discard("));
         }

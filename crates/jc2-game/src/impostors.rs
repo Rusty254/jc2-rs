@@ -1,7 +1,7 @@
 //! Tree impostors: the forests out to the horizon.
 //!
-//! The tiles around the camera grow their trees as models (`scenery.rs`), which are
-//! hidden again beyond [`scenery::TREE_RANGE`] (~550 m). Past that, and over every tile
+//! The tiles around the camera grow their trees as models (`scenery.rs`), whose foliage
+//! fades out over 55..110 m (native, `veg_fade.rs`). Beyond that, and over every tile
 //! within `--impostor-radius` tiles that is not streamed in at all, each tree is two
 //! cards cut out of the game's atlases (`jc2_formats::impostors`): a crown from
 //! `TopAtlas_DIF.dds` and a trunk from `TrunkAtlas_DIF.dds`, centred where
@@ -12,21 +12,21 @@
 //!   model it replaces stands.
 //! * A tile is built on a worker thread (read, parse, grow, mesh: tens of ms) and
 //!   arrives as one mesh pair per 128 m patch (crowns, trunks), so a patch is two draw
-//!   calls and its distance fade (`VisibilityRange`, from [`FADE_FROM`] to
-//!   [`FADE_TO`], crossfading with the models) is one entity's.
+//!   calls. The native per-card fade (JC2-140: crown in from ~55 m and clipped past ~799 m,
+//!   trunk in from ~53 m and clipped past ~600 m Chebyshev at FOV factor 1, both stretching
+//!   with the camera FOV) runs per card in the vertex shader from
+//!   [`crate::veg_fade::VegetationFade`].
 //! * `impostor.wgsl` builds the cards: the trunk turns to face the camera, the crown
 //!   tips over onto the ground as the camera climbs above the tree.
 //!
 //! `--no-impostors` leaves them out (and keeps every plant model in view out to the end
 //! of the loaded tiles), `--impostor-radius N` is how many tiles around the camera get
-//! them (default 5, 2.7 km).
+//! them (default 5, 2.7 km; the native clip is 800 / f m, f = FOV factor).
 
 use crate::Game;
-use crate::scenery::TREE_RANGE;
 use crate::vegdata::VegData;
 use bevy::asset::{AssetPath, RenderAssetUsages, embedded_path, load_embedded_asset};
 use bevy::camera::primitives::{Aabb, MeshAabb};
-use bevy::camera::visibility::VisibilityRange;
 use bevy::image::{ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
@@ -44,10 +44,6 @@ use std::collections::HashMap;
 
 /// Impostor patch edge (m): a tile is 4 × 4 of them.
 pub const PATCH: f32 = 128.0;
-/// The impostors fade in over this distance range (the models' range is
-/// [`TREE_RANGE`]; the patches are judged by their middle, so the window is wider).
-pub const FADE_FROM: f32 = TREE_RANGE.0 - 70.0;
-pub const FADE_TO: f32 = TREE_RANGE.1 + 20.0;
 /// Tiles built at once.
 const IN_FLIGHT: usize = 2;
 
@@ -55,21 +51,11 @@ const IN_FLIGHT: usize = 2;
 pub struct ImpostorConfig {
     /// Tiles (Chebyshev) around the camera's tile that get impostors.
     pub radius: u32,
-    /// Distances (m) over which the impostors fade in. `JC2_IMPOSTOR_FADE=from,to`
-    /// overrides them (to inspect the cards close up).
-    pub fade: (f32, f32),
 }
 
 impl Default for ImpostorConfig {
     fn default() -> Self {
-        let fade = std::env::var("JC2_IMPOSTOR_FADE")
-            .ok()
-            .and_then(|v| {
-                let (a, b) = v.split_once(',')?;
-                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-            })
-            .unwrap_or((FADE_FROM, FADE_TO));
-        Self { radius: 5, fade }
+        Self { radius: 5 }
     }
 }
 
@@ -87,6 +73,8 @@ pub struct ImpostorExt {
 pub struct ImpostorParams {
     /// x: 0 for trunks, 1 for crowns
     pub mode: Vec4,
+    /// The native `cb1[1]` of this card kind (`VegetationFade::top` / `trunk`); zero = no fade.
+    pub fade: Vec4,
 }
 
 impl MaterialExtension for ImpostorExt {
@@ -140,6 +128,7 @@ pub struct ImpostorPlugin;
 impl Plugin for ImpostorPlugin {
     fn build(&self, app: &mut App) {
         crate::vegdata::ensure(app);
+        app.init_resource::<crate::veg_fade::VegetationFade>();
         if !app.world().contains_resource::<ImpostorConfig>() {
             app.insert_resource(ImpostorConfig::default());
         }
@@ -148,7 +137,29 @@ impl Plugin for ImpostorPlugin {
         app.insert_resource(ImpostorShader(shader))
             .add_plugins(MaterialPlugin::<ImpostorMaterial>::default())
             .add_systems(Startup, setup)
-            .add_systems(Update, stream_impostors);
+            .add_systems(Update, (stream_impostors, push_fade));
+    }
+}
+
+/// Keep the two card materials on the current native fade constants (they change only with
+/// the camera FOV): crowns take the Top vector, trunks the Trunk vector.
+fn push_fade(
+    fade: Res<crate::veg_fade::VegetationFade>,
+    state: Option<Res<Impostors>>,
+    mut materials: ResMut<Assets<ImpostorMaterial>>,
+) {
+    let Some(st) = state else { return };
+    for (handle, want) in [
+        (&st.crown_material, fade.top),
+        (&st.trunk_material, fade.trunk),
+    ] {
+        if materials
+            .get(handle)
+            .is_some_and(|m| m.extension.params.fade != want)
+            && let Some(mut m) = materials.get_mut(handle)
+        {
+            m.extension.params.fade = want;
+        }
     }
 }
 
@@ -236,6 +247,7 @@ fn setup(
             extension: ImpostorExt {
                 params: ImpostorParams {
                     mode: Vec4::new(mode, 0.0, 0.0, 0.0),
+                    fade: Vec4::ZERO,
                 },
             },
         })
@@ -428,11 +440,6 @@ fn stream_impostors(
                     Mesh3d(meshes.add(mesh)),
                     MeshMaterial3d(mat.clone()),
                     Transform::from_translation(origin),
-                    VisibilityRange {
-                        start_margin: cfg.fade.0..cfg.fade.1,
-                        end_margin: 40_000.0..40_001.0,
-                        use_aabb: true,
-                    },
                     ImpostorPatch,
                     Name::new(format!("tree impostors {},{}", p.origin.x, p.origin.y)),
                 ));

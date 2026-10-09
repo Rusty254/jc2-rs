@@ -1,4 +1,4 @@
-#import jc2::foliage_alpha::foliage_should_discard
+#import jc2::foliage_alpha::{foliage_should_discard, foliage_distance_fade}
 #import bevy_pbr::{
     prepass_io::{VertexOutput, FragmentOutput},
     pbr_bindings,
@@ -33,7 +33,8 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef VISIBILITY_RANGE_DITHER
     pbr_functions::visibility_range_dither(in.position, in.visibility_range_dither);
 #endif
-    if foliage_should_discard(ordinary_alpha(in)) { discard; }
+    let fade = foliage_distance_fade(in.world_position.xyz, in.instance_index);
+    if foliage_should_discard(ordinary_alpha(in), fade) { discard; }
     var out: FragmentOutput;
 #ifdef UNCLIPPED_DEPTH_ORTHO_EMULATION
     out.frag_depth = in.unclipped_depth;
@@ -57,6 +58,7 @@ fn fragment(in: VertexOutput) {
 #ifdef VISIBILITY_RANGE_DITHER
     pbr_functions::visibility_range_dither(in.position, in.visibility_range_dither);
 #endif
-    if foliage_should_discard(ordinary_alpha(in)) { discard; }
+    let fade = foliage_distance_fade(in.world_position.xyz, in.instance_index);
+    if foliage_should_discard(ordinary_alpha(in), fade) { discard; }
 }
 #endif
