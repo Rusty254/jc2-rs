@@ -144,10 +144,13 @@ models are hidden beyond ~550 m (bushes ~400 m) and the cards take over, out to
 `--impostor-radius 5` tiles (`--no-impostors` keeps every model in view). The sky has a gradient
 dome, stars, a textured moon, cumulus and cirrus clouds (`--no-clouds`, `--cloud-cover 0.8`,
 `--no-stars`). Debug aids for screenshots: `JC2_START_OFFSET=dx,dz` moves the start from the
-tile's middle, `JC2_CAM_PITCH` / `JC2_CAM_YAW` (degrees) aim the free camera (`--no-hero`),
+tile's middle, `JC2_CAM_PITCH` / `JC2_CAM_YAW` (degrees) aim the free camera (`--no-hero`) and
+`JC2_CAM_HEIGHT` (metres above the tile middle's ground, default 160) raises it,
 `JC2_NO_DISPLACE=1` draws the terrain without its displacement atlas, `JC2_IMPOSTOR_FADE=0,1`
 shows the impostors at any distance; the smoke runs (`--exit-after`) print a frame-time summary.
-Tile indices run 0..64 in x and z; `31,14` is a mountain village, the overview
+Tile indices run 0..64 in x and z; `31,14` is the mountain base Lembah Genting Tinggi,
+`29,18` the start base Kem Gunung Dataran Tinggi (the registry location
+`keymissions\km01\km01.base`, not a tile container), the overview
 map (`jc2tool terrain .. --pgm map.pgm`) shows where the land is.
 Rico: right-drag (or `Tab` to grab the cursor) looks around, `WASD` walks, `Shift`
 sprints, `Space` jumps — in the air it opens and closes the parachute (`W`/`S` dive or

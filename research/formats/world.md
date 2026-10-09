@@ -12,7 +12,7 @@ Every terrain tile that has content owns two zlib-wrapped SARC containers:
 | File | What is inside |
 |---|---|
 | `locations\wc\XX\XXxZZ.nlz` (821 of them, "near") | the tile's models (`.rbm`, `.lod`, textures), collision shapes (`.pfx`), `XXxZZ.nl.blo` placements, `XXxZZ.nl.cgd` static geometry (below), `XXxZZ.pfs` (PFX-wrapped Havok packfile: static collision for the tile), `XXxZZ.pfi` (`"PFI\0"`, u32 1, u32 2, u32 count, then per instance a 4×3 matrix, a translation, a hash and the `.pfx` path), `XXxZZ.obc` (u32 1, u32 count, then per box 19 floats: half extents, then a 4 × 4 row-vector matrix with the centre in the last row — 8 occluder boxes around the village's big buildings in `31x14`), `.aiteam` blackboards |
-| `locations\wc\XX\XXxZZ.flz` (814, "far") | low-detail models and a `.fl.blo` whose objects are stripped stubs (no transforms) |
+| `locations\wc\XX\XXxZZ.flz` (814, "far") | low-detail models, a `.fl.blo` whose objects are stripped stubs (no transforms), and a `XXxZZ.fl.cgd`: the location's large structures (`31x14`: 81 instances, the `gb223` building kit, the shaft cover `go098-a`, the six `.pfi` rocks), whose descriptors and full meshes sit in the `.nlz` (`location-static-geometry-next.md`) |
 
 Container members are keyed by bare file name; references inside the placement file
 use full engine paths (`structures\general_structures\props\gp001\gp001-b.lod`) and
@@ -66,7 +66,8 @@ the Bevy matrix's columns (`coords::mat_to_bevy`, `coordinates.md`).
   112 objects placed, 50 863 triangles, 277 collision shapes (167 from the `.pfi`, 110
   from the objects' own `collision` entries), nothing unresolved — then
   moves the camera three tiles away and checks the tile and its entities are gone.
-  `scenery::tests::dresses_a_tile_headless` adds the 100 static-geometry instances and
+  `scenery::tests::dresses_a_tile_headless` adds the 100 + 81 static-geometry instances
+  (`.nl.cgd` + `.fl.cgd`) and
   the 652 trees + 3100 bushes/rocks with their 3752 colliders, all resolved and spawned.
 
 ## Streaming (in jc2-game)
@@ -126,7 +127,9 @@ char  [strings]        NUL-separated bare .lod names
 ```
 
 `jc2-game` (`scenery.rs`) places them through the tile's pending list like the
-placements; the collision is already there from the `.pfi`.
+placements; the collision is already there from the `.pfi`. The far container's
+`XXxZZ.fl.cgd` (same format) is placed with it: it carries the big structures that
+neither the `.blo` nor the near `.cgd` names (JC2-111, `location-static-geometry-next.md`).
 
 ## Vegetation
 
@@ -198,9 +201,9 @@ game (no way to dump its instances here): that our bicubic-vs-bilinear height an
 central-difference normal pass exactly the same candidates at the slope/coverage
 margins; that the "+8 ≠ 0" test on a type in the generator is "model loaded" (it is not
 set by the type loader). The six hand-placed `arctic_g0?_rocksm-whole_col.pfx`
-instances in `31x14.pfi` (identity rotation, village ground level) have no visual in
-the `.blo`, the `.cgd` or the generator's output — either stale collision or an
-instance list not found yet.
+instances in `31x14.pfi` (identity rotation, village ground level) are drawn by the far
+container's `31x14.fl.cgd` (3 × `arctic_g01_rocksm-whole`, 3 × `arctic_g02_rocksm-whole`;
+JC2-111).
 
 ### Grass
 
@@ -363,6 +366,5 @@ debris as dynamic bodies with their masses; units with an explosion emitter blow
 * Grass's LOD shaders and ground tint, leaf particles,
   the single-tree impostor kind (`TreeSingleImpostorTop`), the
   breakable-tree pieces (`stump`, `trunks`), the sway animation.
-* The six `.pfi` rock shapes of `31x14` without a visual (above).
 * The trigger objects themselves (what turns `destroyed` into `switch`, counts, timers),
   `CDamageableObject`, fading the debris, the fire stage, `CConstraint` hinges.

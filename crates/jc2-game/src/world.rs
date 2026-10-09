@@ -397,6 +397,17 @@ impl Container {
     }
 }
 
+/// The far (`.flz`) companion of a near location container (`.nlz`): the exe opens
+/// every world location as a near and a far `CLocation` (`FUN_00830560`, suffix `.nl` /
+/// `.fl` by `FUN_005f4780`), and the far one's `.fl.cgd` carries the location's large
+/// static structures (research/formats/location-static-geometry-next.md).
+pub(crate) fn far_companion(near: &str) -> Option<String> {
+    let lower = near.to_ascii_lowercase();
+    lower
+        .ends_with(".nlz")
+        .then(|| format!("{}.flz", &near[..near.len() - 4]))
+}
+
 /// Resolves the `filename` references of location files to `(container, model)`:
 /// the tile's own container, then `general.blz`, then the tile's area set, then the
 /// other area sets (see `jc2_formats::areaset`). Containers open lazily and stay open.
@@ -442,26 +453,37 @@ impl ModelIndex {
         }
     }
 
-    pub(crate) fn container(&mut self, game: &Game, name: &str) -> Option<Arc<Container>> {
+    /// The cache key of a container name: full paths as they are, bare names through
+    /// the archive index when it names exactly one file (`None` when ambiguous).
+    fn key_of(&self, name: &str) -> Option<String> {
         let normalized = jc2_formats::location::canonical(name);
-        let key = if normalized.contains('/') {
-            normalized
-        } else {
-            match self.aliases.get(&normalized) {
-                Some(Some(path)) => path.clone(),
-                Some(None) => return None,
-                None => normalized,
-            }
-        };
+        if normalized.contains('/') {
+            return Some(normalized);
+        }
+        match self.aliases.get(&normalized) {
+            Some(Some(path)) => Some(path.clone()),
+            Some(None) => None,
+            None => Some(normalized),
+        }
+    }
+
+    pub(crate) fn container(&mut self, game: &Game, name: &str) -> Option<Arc<Container>> {
+        let key = self.key_of(name)?;
         self.open
             .entry(key.clone())
             .or_insert_with(|| Container::open(game, &key))
             .clone()
     }
 
-    /// Drop a tile's own container from the cache (shared ones stay).
+    /// Drop a location's own container, and its far companion, from the cache (shared
+    /// ones stay).
     pub(crate) fn forget(&mut self, name: &str) {
-        self.open.remove(&jc2_formats::location::canonical(name));
+        for n in std::iter::once(name.to_string()).chain(far_companion(name)) {
+            if let Some(key) = self.key_of(&n) {
+                self.open.remove(&key);
+            }
+            self.open.remove(&jc2_formats::location::canonical(&n));
+        }
     }
 
     /// Shared containers to search for tile `(x, z)`, most likely first.
@@ -1091,9 +1113,14 @@ pub(crate) fn setup(
 
     // camera: south of the start tile's middle and above it, looking north (−z, yaw 0),
     // so the map's north is up the screen and east (+x) to the right
+    // JC2_CAM_HEIGHT (metres above the tile middle's ground, default 160) for aerial shots
+    let height = std::env::var("JC2_CAM_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(160.0);
     let eye = bevy_xyz(
         cx0 + TILE_SIZE / 2.0,
-        ground + 160.0,
+        ground + height,
         cz0 + TILE_SIZE / 2.0 + 200.0,
     );
     // JC2_CAM_PITCH / JC2_CAM_YAW (degrees) aim the free camera's start (smoke shots of the sky)

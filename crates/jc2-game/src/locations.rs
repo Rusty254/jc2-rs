@@ -12,6 +12,9 @@ use std::collections::{HashMap, HashSet};
 #[allow(dead_code)]
 pub enum LocationOwner {
     Tile((u32, u32)),
+    /// A loaded terrain tile reaching a non-city registry location: geometry only
+    /// (its actors, scripts and events are not activated here; JC2-111).
+    Scenery((u32, u32)),
     ExtraTile((u32, u32)),
     Mission(crate::missions::MissionOwner),
     Giver(u64),
@@ -196,7 +199,7 @@ fn reconcile(
     }
     for r in locations.records.values_mut() {
         r.owners.retain(|o| match o {
-            LocationOwner::Tile(k) => loaded.contains(k),
+            LocationOwner::Tile(k) | LocationOwner::Scenery(k) => loaded.contains(k),
             LocationOwner::ExtraTile(k) => extra_wanted.contains(&(*k, r.container.clone())),
             _ => true,
         });
@@ -206,16 +209,21 @@ fn reconcile(
         .map(|(k, n)| (LocationOwner::ExtraTile(k), n, k))
         .collect();
     for loc in &locations.registry.0 {
+        // `wc/` tiles are the terrain streamer's. Every other registry location is a
+        // native world location (`FUN_007c4840` registers all of them, enabled unless
+        // `conditions.bin` says otherwise): key-mission bases such as the start base
+        // `keymissions/km01/km01.base`, strongholds, general interests, roads...
         // City gameplay/settlement containers remain with the gameplay milestone.
-        if !loc.identity.starts_with("metropolis/")
-            || loc.identity.contains("gameplay")
-            || loc.identity.contains("settlement")
-        {
+        if loc.identity.starts_with("wc/") || !loc.enabled_at_start {
+            continue;
+        }
+        let city = loc.identity.starts_with("metropolis/");
+        if city && (loc.identity.contains("gameplay") || loc.identity.contains("settlement")) {
             continue;
         }
         for &key in &loaded {
             let (x, z) = jc2_formats::terrain::tile_origin(key.0, key.1);
-            if loc.intersects_xz(
+            if loc.near_intersects_xz(
                 [x, z],
                 [
                     x + jc2_formats::terrain::TILE_SIZE,
@@ -226,7 +234,12 @@ fn reconcile(
                 if st.loaded.values().any(|t| t.containers.contains(&name)) {
                     continue;
                 }
-                wanted.push((LocationOwner::Tile(key), name, key));
+                let owner = if city {
+                    LocationOwner::Tile(key)
+                } else {
+                    LocationOwner::Scenery(key)
+                };
+                wanted.push((owner, name, key));
             }
         }
     }
@@ -277,6 +290,7 @@ fn reconcile(
                 continue;
             }
             if let Err(e) = parse_geometry(&mut st, &game, &record.container) {
+                warn!("location {identity}: {e}");
                 record.state = LocationState::Failed(e.to_string());
                 continue;
             }
@@ -313,6 +327,9 @@ fn reconcile(
                 }
                 Ok(_) => LocationState::Registering,
             };
+            if let LocationState::Failed(e) = &record.state {
+                warn!("location {identity}: {e}");
+            }
             st.location_tiles
                 .insert(identity.clone(), (record.anchor, tile));
         } else if record.state == LocationState::Registering
@@ -349,7 +366,7 @@ fn reconcile(
             && record
                 .owners
                 .iter()
-                .any(|o| !matches!(o, LocationOwner::Giver(_)));
+                .any(|o| !matches!(o, LocationOwner::Giver(_) | LocationOwner::Scenery(_)));
         let renew = enable
             && st
                 .location_tiles
@@ -413,6 +430,13 @@ mod tests {
         assert_eq!(
             locations.state("locations/city.nlz", second),
             Some(&LocationState::Unloading)
+        );
+    }
+    /// Leaves the registry empty, so only the test's explicit owners load locations.
+    pub(crate) fn without_registry_streaming(app: &mut App) {
+        app.add_systems(
+            Startup,
+            (|mut l: ResMut<Locations>| l.registry.0.clear()).after(load_registry),
         );
     }
     fn wait_ready(app: &mut App, name: &str, generation: u64) {
@@ -551,6 +575,52 @@ mod tests {
             models
         );
     }
+    /// JC2-111: the start base Kem Gunung Dataran Tinggi is the registry location
+    /// `keymissions/km01/km01.base`, reached by tile 29,18 (no `wc` container there).
+    #[test]
+    fn retail_start_base_streams_as_scenery_geometry() {
+        let mut app = match world::tests::tile_app_with((29, 18), Vec::new(), |_| {}) {
+            Some(app) => app,
+            None => return,
+        };
+        let name = "locations/keymissions/km01/km01.base.nlz";
+        let started = std::time::Instant::now();
+        let generation = loop {
+            app.update();
+            let locations = app.world().resource::<Locations>();
+            if let Some(r) = locations.records.get(name) {
+                assert!(r.owners.contains(&LocationOwner::Scenery((29, 18))));
+                break r.generation;
+            }
+            assert!(started.elapsed().as_secs() < 30, "start base not requested");
+        };
+        wait_ready(&mut app, name, generation);
+        let st = app.world().resource::<Streamer>();
+        let tile = &st.location_tiles[name].1;
+        assert_eq!(tile.objects_failed, 0);
+        assert_eq!(tile.unresolved, 0);
+        assert!(!tile.gameplay_enabled, "scenery owners enable no actors");
+        let statics = tile
+            .entities
+            .iter()
+            .filter(|e| {
+                app.world()
+                    .get::<Name>(**e)
+                    .is_some_and(|n| n.starts_with("static "))
+            })
+            .count();
+        eprintln!(
+            "km01.base: {} objects, {} CGD statics",
+            tile.objects_spawned, statics
+        );
+        // 280 near + 246 far CGD instances + the 469 visible model placements of the .blo
+        assert_eq!(tile.objects_spawned, 749 + 246);
+        assert_eq!(
+            statics,
+            280 + 246,
+            "every km01.base.nl.cgd and .fl.cgd instance"
+        );
+    }
     #[test]
     fn missing_location_fails_instead_of_acknowledging_loaded_terrain() {
         if std::env::var("JC2_TEST_DIR").is_err() {
@@ -581,7 +651,12 @@ mod tests {
         );
         app.world_mut().resource_mut::<Locations>().release(owner);
         app.update();
-        assert!(app.world().resource::<Locations>().records.is_empty());
+        assert!(
+            !app.world()
+                .resource::<Locations>()
+                .records
+                .contains_key("locations/absent.nlz")
+        );
     }
     #[test]
     fn late_legacy_extra_registration_loads_cgd_once() {
@@ -630,6 +705,8 @@ mod tests {
             return;
         }
         let mut app = world::tests::tile_app_with((2, 26), Vec::new(), |app| {
+            // explicit owners only: tile 2,26 would also hold f1s07.base as scenery
+            without_registry_streaming(app);
             app.init_resource::<ButtonInput<KeyCode>>()
                 .init_resource::<ButtonInput<MouseButton>>()
                 .init_resource::<crate::vehicle::CameraMode>()

@@ -9,11 +9,14 @@ Bare archive aliases resolve only when the index identifies one full path. Model
 container caches and asset paths now retain full identities; the asset reader
 splits nested paths after the archive filename rather than the first directory.
 
-`jc2-game::locations` loads metropolis geometry whose inclusive raw XZ bounds
-intersect a loaded terrain tile. One canonical container has a set of tile and
+`jc2-game::locations` loads metropolis geometry whose near box (the raw bounds inset by
+1000 m, the exe's near record: `location-static-geometry-next.md`) intersects a loaded
+terrain tile in XZ. Since JC2-111 every other non-`wc` registry location that starts
+enabled (`conditions.bin`) loads the same way as geometry only (`LocationOwner::Scenery`):
+the start base `keymissions/km01/km01.base`, strongholds, general interests, roads… One canonical container has a set of tile and
 explicit mission owners, one generation and one geometry record. One new location
 starts per update. Registration is independent of terrain loading, including
-already present tiles. Near-only geometry and inclusive raw-bounds intersection
+already present tiles. Near-only geometry (plus the far `.fl.cgd`) and inclusive near-box intersection
 are explicit approximations; vertical bounds are not mission gates. Gameplay and
 settlement containers are excluded from automatic city geometry streaming.
 

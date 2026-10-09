@@ -32,6 +32,8 @@ Hand-in (every task, research or runtime):
 2. Runtime work: run the full `cargo test --release --workspace` and
    `cargo clippy --release --workspace --all-targets` through the build lock with your own
    isolation number; both must pass. Research work: run your probe; it must exit 0.
+   Set `JC2_TEST_DIR` to the game folder (`..`) first: without it the retail-file tests skip
+   silently and report `ok` in 0.00s.
 3. Keep the task `in_progress`, add the `awaiting-review` tag (keep existing tags) and post a
    handoff comment: branch, commits, files changed, tests/probe results with counts, what is
    native-proven vs assumed vs unresolved, remaining gaps.

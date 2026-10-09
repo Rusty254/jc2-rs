@@ -460,11 +460,39 @@ pub(crate) fn place_container_statics(
             &jc2_formats::compress::maybe_inflate(bytes)?,
         )?);
     }
+    // The far companion's `.fl.cgd` (JC2-111): the location's large structures (the
+    // start base's key036 towers, the gb223 kit of 31,14...). Its models' descriptors and
+    // full-detail meshes are in the near container (the far one ships the low LODs only),
+    // so they resolve as the near ones do (near, then the shared sets), then far.
+    let far = world::far_companion(container).and_then(|n| st.index.container(game, &n));
+    let near_count = geometries.len();
+    if let Some(far) = &far {
+        for cgd in far
+            .sarc
+            .entries
+            .iter()
+            .filter(|e| e.name.to_ascii_lowercase().ends_with(".cgd"))
+        {
+            let bytes = far
+                .member(&cgd.name)
+                .ok_or_else(|| jc2_formats::Error::format("unreadable far CGD"))?;
+            geometries.push(CompiledGeometry::parse(
+                &jc2_formats::compress::maybe_inflate(bytes)?,
+            )?);
+        }
+    }
     let mut placed = 0;
-    for geometry in &geometries {
+    for (g, geometry) in geometries.iter().enumerate() {
         for inst in &geometry.instances {
             let model = geometry.model_of(inst);
-            let Some((home, rbm)) = st.index.resolve(game, &local, (x, z), model, cfg.lod) else {
+            let resolved = st
+                .index
+                .resolve(game, &local, (x, z), model, cfg.lod)
+                .or_else(|| {
+                    let far = far.as_ref().filter(|_| g >= near_count)?;
+                    st.index.resolve(game, far, (x, z), model, cfg.lod)
+                });
+            let Some((home, rbm)) = resolved else {
                 *st.unresolved.entry(model.to_string()).or_default() += 1;
                 tile.unresolved += 1;
                 continue;
@@ -569,11 +597,11 @@ mod tests {
         assert_eq!(sc.stats.tiles, 1);
         let t = s.loaded.get(&(31, 14)).expect("start tile loaded");
         assert!(t.pending.is_empty(), "{} still pending", t.pending.len());
-        // 652 trees and 3100 bushes/rocks on this tile (see jc2-formats' test), 100
+        // 652 trees and 3100 bushes/rocks on this tile (see jc2-formats' test), 100 + 81
         // static geometry instances
         assert_eq!(sc.stats.trees, 652);
         assert_eq!(sc.stats.bushes, 3100);
-        assert_eq!(sc.stats.statics, 100);
+        assert_eq!(sc.stats.statics, 100 + 81, "31x14.nl.cgd + 31x14.fl.cgd");
         assert!(sc.stats.unresolved.is_empty(), "{:?}", sc.stats.unresolved);
         assert_eq!(
             sc.stats.vegetation_colliders,
