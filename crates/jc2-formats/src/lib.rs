@@ -94,6 +94,7 @@ pub mod text;
 pub mod texture_policy;
 pub mod types;
 pub mod vegetation;
+pub mod veglod;
 pub mod vehicle;
 pub mod vfs;
 pub mod weapon_mounts;

@@ -167,6 +167,11 @@ Accepted JC2-025 research reproduces the original texture name/exception policy 
 resource/view binding with ten retail fixtures, plus one complete foliage model
 fade initialization/update/queue/draw chain. Its raw flags and five quantized fade
 fixtures inform JC2-024; original shader parity remains to be implemented and checked.
+JC2-086 (awaiting review) recovers the native per-asset model LOD: five `.lod` slots, a
+per-descriptor scale (default 10), distance breakpoints 10/25/50/100/500 m times scale, hard
+slot switching and a last-slot fade byte (`research/formats/vegetation-lod-native.md`,
+`vegetation_lod_probe.py`). `vegetation_lod == 0` (default) now swaps plant models by camera
+distance; impostor handover, native presence range and the fade rendering stay open Gaps.
 
 Live ownership, progress and review now use the shared Relay taskboard at
 `http://127.0.0.1:4310/api`. Read `AGENTS.md` and `TASKS.md` before taking work;

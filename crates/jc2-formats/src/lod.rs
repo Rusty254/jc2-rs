@@ -57,6 +57,17 @@ impl LodDescriptor {
             .or_else(|| self.levels.iter().rev().find_map(|l| l.as_deref()))
     }
 
+    /// The model's LOD scale: the sixth token, or the `TLodModel` default (10.0, `00a47ab0`).
+    /// Native consumer: `crate::veglod`.
+    pub fn lod_scale(&self) -> f32 {
+        self.trailing.unwrap_or(crate::veglod::DEFAULT_LOD_SCALE)
+    }
+
+    /// The five native slots (`-`, or fewer than five lines, leave a slot empty).
+    pub fn slots(&self) -> [Option<&str>; crate::veglod::LOD_SLOTS] {
+        std::array::from_fn(|i| self.levels.get(i).and_then(|l| l.as_deref()))
+    }
+
     pub fn looks_like_lod(text: &[u8]) -> bool {
         let s = String::from_utf8_lossy(text);
         let mut lines = s.lines().map(str::trim).filter(|l| !l.is_empty());
@@ -67,6 +78,28 @@ impl LodDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_slots_and_scale() {
+        let d = LodDescriptor::parse(
+            "a\\R_LOD1.rbm\r\na\\R_LOD2.rbm\r\na\\R_LOD2.rbm\r\n-\r\n-\r\n4\r\n",
+        );
+        assert_eq!(d.lod_scale(), 4.0);
+        assert_eq!(
+            d.slots(),
+            [
+                Some("R_LOD1.rbm"),
+                Some("R_LOD2.rbm"),
+                Some("R_LOD2.rbm"),
+                None,
+                None
+            ]
+        );
+        // no sixth token: the model default
+        let d = LodDescriptor::parse("a\\R_LOD1.rbm\r\n-\r\n");
+        assert_eq!(d.lod_scale(), 10.0);
+        assert_eq!(d.slots()[2], None);
+    }
 
     #[test]
     fn parses_vehicle_lod() {

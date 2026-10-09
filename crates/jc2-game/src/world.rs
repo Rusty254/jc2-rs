@@ -93,6 +93,8 @@ pub(crate) struct PendingModel {
     /// `scenery.rs` gives its plants one, the distant trees are impostors then.
     pub(crate) vis_range: Option<(f32, f32)>,
     pub(crate) mission_owner: Option<MissionOwner>,
+    /// Native LOD slots of a plant (`plant_lod.rs`); `handle` is then the set's far model.
+    pub(crate) lod: Option<std::sync::Arc<crate::plant_lod::PlantLodSet>>,
 }
 
 /// Part of a destructible unit of a tile: goes when the unit is destroyed.
@@ -889,6 +891,7 @@ pub(crate) fn place_objects(
             piece,
             vis_range: None,
             mission_owner: None,
+            lod: None,
         });
         tile.objects_total += 1;
     }
@@ -1410,6 +1413,13 @@ pub(crate) fn spawn_models(
             }
             if let Some(owner) = p.mission_owner {
                 entity.insert(owner);
+            }
+            if let Some(set) = &p.lod {
+                entity.insert(crate::plant_lod::PlantLod {
+                    set: set.clone(),
+                    shown: set.plan.far_model().unwrap_or(0),
+                    vis_range: p.vis_range,
+                });
             }
             if p.mesh_colliders {
                 entity.insert(RigidBody::Static);

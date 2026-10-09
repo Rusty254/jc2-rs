@@ -5,7 +5,7 @@
 //!                                                 milestone 2: model viewer for a container
 //!   jc2 [<game_dir>] --model lave.v046_buscoach.ee/v046-body_m_lod1.rbm
 //!   jc2 [<game_dir>] --world 31,14 [--radius 1] [--lod 1] [--no-models] [--no-physics] [--flat-terrain]
-//!                    [--no-vegetation] [--vegetation-lod 2] [--bush-density 1.0]
+//!                    [--no-vegetation] [--vegetation-lod 0] [--bush-density 1.0]
 //!                                                 milestone 3: a piece of Panau
 //!   jc2 [<game_dir>] --world 31,14 --drive lave.v014_jeep.ee
 //!                                                 milestone 4: a car to drive there
@@ -66,6 +66,7 @@ mod parachute;
 mod particle_fixture;
 mod physics;
 mod pickups;
+mod plant_lod;
 mod plane;
 mod poses;
 mod ragdoll;
@@ -196,8 +197,8 @@ struct Cli {
     /// World viewer: skip the procedural vegetation (trees, bushes, rocks)
     #[arg(long)]
     no_vegetation: bool,
-    /// World viewer: LOD level of the vegetation models (1 = full detail)
-    #[arg(long, default_value_t = 2)]
+    /// World viewer: LOD level of the vegetation models (0 = native distance selection, 1 = full detail)
+    #[arg(long, default_value_t = 0)]
     vegetation_lod: usize,
     /// World viewer: share of the bushes and rocks to grow, 0..1 (trees always grow)
     #[arg(long, default_value_t = 1.0)]
@@ -561,7 +562,7 @@ fn main() {
             ))
             .insert_resource(scenery::SceneryConfig {
                 vegetation: !cli.no_vegetation,
-                vegetation_lod: cli.vegetation_lod.max(1),
+                vegetation_lod: cli.vegetation_lod,
                 bush_density: cli.bush_density.clamp(0.0, 1.0),
                 far_lod: !cli.no_impostors,
                 ..default()

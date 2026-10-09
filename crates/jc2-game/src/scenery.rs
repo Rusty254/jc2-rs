@@ -17,6 +17,7 @@
 use crate::Game;
 use crate::coords::mat_to_bevy;
 use crate::physics::colliders_from_body;
+use crate::plant_lod::PlantLodSet;
 use crate::world::{self, Container, LoadedTile, PendingModel, Streamer, WorldConfig};
 use avian3d::prelude::RigidBody;
 use bevy::prelude::*;
@@ -26,6 +27,7 @@ use jc2_formats::lod::LodDescriptor;
 use jc2_formats::placement::bare_name;
 use jc2_formats::terrain::{TerrainTile, tile_container_name, tile_file_name};
 use jc2_formats::vegetation::{Fbm, Group, TileGround, Vegetation};
+use jc2_formats::veglod::SlotPlan;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -33,8 +35,9 @@ use std::sync::Arc;
 pub struct SceneryConfig {
     /// Grow the vegetation.
     pub vegetation: bool,
-    /// LOD level of the plant models (1 = full detail; 2 is a third of the triangles
-    /// and what the original shows beyond a few dozen metres).
+    /// 0 = the original's per-asset LOD selection from the camera distance
+    /// (`plant_lod.rs`); N >= 1 forces that single `.lod` level for every plant (1 = full
+    /// detail; 2 is a third of the triangles).
     pub vegetation_lod: usize,
     /// Give the trees and rocks that have one their collision shape (needs physics).
     pub vegetation_physics: bool,
@@ -58,7 +61,7 @@ impl Default for SceneryConfig {
     fn default() -> Self {
         Self {
             vegetation: true,
-            vegetation_lod: 2,
+            vegetation_lod: 0,
             vegetation_physics: true,
             bush_density: 1.0,
             static_geometry: true,
@@ -90,6 +93,9 @@ struct PlantModel {
     collision: Option<String>,
     align: bool,
     name: String,
+    /// Native slot plan and the `jc2://` path of each of its models (`vegetation_lod == 0`
+    /// and more than one distinct model); `path` is then the plan's far model.
+    lod: Option<(SlotPlan, Vec<String>)>,
 }
 
 #[derive(Resource)]
@@ -112,6 +118,7 @@ impl Plugin for SceneryPlugin {
             app.insert_resource(SceneryConfig::default());
         }
         crate::vegdata::ensure(app);
+        app.add_plugins(crate::plant_lod::PlantLodPlugin);
         app.add_systems(Startup, setup).add_systems(
             Update,
             dress_tiles
@@ -234,6 +241,8 @@ fn grow(
     let mut trees = 0;
     let mut bushes = 0;
     let mut colliders = 0;
+    // per plant type: the held model handles of its LOD slots, shared by the tile's instances
+    let mut lod_sets: HashMap<(u8, u16), Arc<PlantLodSet>> = HashMap::new();
     for inst in &instances {
         let Some(ty) = veg.type_of(inst) else {
             continue;
@@ -306,6 +315,25 @@ fn grow(
         let vis_range = scfg
             .far_lod
             .then_some(if has_impostor { TREE_RANGE } else { BUSH_RANGE });
+        let lod = plant.lod.as_ref().map(|(plan, paths)| {
+            lod_sets
+                .entry(key)
+                .or_insert_with(|| {
+                    // one reference per model for the tile's lifetime (`unload_tile`)
+                    let handles = paths
+                        .iter()
+                        .map(|p| {
+                            tile.models.push(p.clone());
+                            st.model_handle(assets, p)
+                        })
+                        .collect();
+                    Arc::new(PlantLodSet {
+                        plan: plan.clone(),
+                        handles,
+                    })
+                })
+                .clone()
+        });
         tile.pending.push(PendingModel {
             handle,
             transform,
@@ -314,6 +342,7 @@ fn grow(
             piece: None,
             vis_range,
             mission_owner: None,
+            lod,
         });
         tile.objects_total += 1;
         match inst.group {
@@ -339,8 +368,26 @@ fn resolve_plant(
     let c = st.index.container(game, container)?;
     let lod_text = c.member(&ty.model)?;
     let d = LodDescriptor::parse(&String::from_utf8_lossy(lod_text));
-    let rbm = d.model_for_level(lod)?.to_string();
-    c.member(&rbm)?;
+    // native: every slot of the descriptor, only the ones the container has
+    let mut lod_plan = None;
+    let rbm = if lod == 0 {
+        let slots = d.slots().map(|s| s.filter(|n| c.member(n).is_some()));
+        let plan = SlotPlan::new(d.lod_scale(), slots);
+        let far = plan.models.get(plan.far_model()?)?.clone();
+        if plan.switches() {
+            let paths = plan
+                .models
+                .iter()
+                .map(|m| format!("jc2://{}/{}", c.name, m))
+                .collect();
+            lod_plan = Some((plan, paths));
+        }
+        far
+    } else {
+        let rbm = d.model_for_level(lod)?.to_string();
+        c.member(&rbm)?;
+        rbm
+    };
     let stem = ty
         .model
         .rsplit_once('.')
@@ -354,6 +401,7 @@ fn resolve_plant(
         collision,
         align: ty.align_to_ground,
         name: format!("{} ({rbm})", ty.name),
+        lod: lod_plan,
     })
 }
 
@@ -509,6 +557,7 @@ pub(crate) fn place_container_statics(
                 piece: None,
                 vis_range: None,
                 mission_owner: None,
+                lod: None,
             });
             tile.objects_total += 1;
             placed += 1;
@@ -635,6 +684,69 @@ mod tests {
             }
         }
         assert_eq!(plants, 652 + 3100);
+
+        // Native LOD (JC2-086): plants whose descriptor has more than one model carry a
+        // slot plan and start on the far model; a camera 5 m from one switches it to the
+        // near model without adding an entity, a child set or a collider.
+        use crate::plant_lod::PlantLod;
+        let (target, target_pos) = {
+            let mut q = app.world_mut().query::<(Entity, &Transform, &PlantLod)>();
+            let n = q.iter(app.world()).count();
+            assert!(n > 0 && n < plants, "{n} of {plants} plants switch");
+            let (e, tf, lod) = q.iter(app.world()).next().unwrap();
+            assert_eq!(Some(lod.shown), lod.set.plan.far_model());
+            (e, tf.translation)
+        };
+        // (the world setup spawned the camera; move it)
+        let mut cams = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<Camera3d>>();
+        for mut tf in cams.iter_mut(app.world_mut()) {
+            tf.translation = target_pos + Vec3::new(0.0, 2.0, 5.0);
+        }
+        let started = std::time::Instant::now();
+        let near = loop {
+            app.update();
+            let lod = app.world().get::<PlantLod>(target).unwrap();
+            let want = lod
+                .set
+                .plan
+                .model_at(29.0)
+                .expect("a camera 5 m away selects a model");
+            if lod.shown == want {
+                break want;
+            }
+            if started.elapsed().as_secs() >= 60 {
+                let shown = lod.shown;
+                let state = app
+                    .world()
+                    .resource::<AssetServer>()
+                    .get_load_state(lod.set.handles[want].id());
+                let plant = app.world().get::<GlobalTransform>(target).map(|g| g.translation());
+                let cams: Vec<Vec3> = app
+                    .world_mut()
+                    .query_filtered::<&GlobalTransform, With<Camera3d>>()
+                    .iter(app.world())
+                    .map(|g| g.translation())
+                    .collect();
+                panic!(
+                    "near model never loaded: shown {shown} want {want} state {state:?} plant {plant:?} cameras {cams:?}"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        app.update();
+        let lod = app.world().get::<PlantLod>(target).unwrap();
+        assert_ne!(Some(near), lod.set.plan.far_model(), "near differs from far");
+        let blocks = app
+            .world()
+            .resource::<Assets<RbmAsset>>()
+            .get(&lod.set.handles[near])
+            .unwrap()
+            .blocks
+            .len();
+        let children = app.world().get::<Children>(target).unwrap().len();
+        assert_eq!(children, blocks, "the swap replaced the meshes, not added");
         eprintln!(
             "tile 31,14 dressed in {:.1?}: {trees} trees, {bushes} bushes/rocks, {statics} statics, {colliders} colliders",
             started.elapsed(),
