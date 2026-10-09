@@ -5,7 +5,7 @@
 //!                                                 milestone 2: model viewer for a container
 //!   jc2 [<game_dir>] --model lave.v046_buscoach.ee/v046-body_m_lod1.rbm
 //!   jc2 [<game_dir>] --world 31,14 [--radius 1] [--lod 1] [--no-models] [--no-physics] [--flat-terrain]
-//!                    [--no-vegetation] [--vegetation-lod 0] [--bush-density 1.0]
+//!                    [--no-vegetation] [--vegetation-lod 0] [--lodfactor 0] [--bush-density 1.0]
 //!                                                 milestone 3: a piece of Panau
 //!   jc2 [<game_dir>] --world 31,14 --drive lave.v014_jeep.ee
 //!                                                 milestone 4: a car to drive there
@@ -209,6 +209,10 @@ struct Cli {
     /// World viewer: LOD level of the vegetation models (0 = native distance selection, 1 = full detail)
     #[arg(long, default_value_t = 0)]
     vegetation_lod: usize,
+    /// World viewer: graphics setting `/lodfactor` 0-3 (native id 0x17, "Geometric detail",
+    /// default 0): vegetation fade distances and the model-LOD distance unit (1 / 1.5 / 2 / 3)
+    #[arg(long, value_name = "0..3", default_value_t = 0)]
+    lodfactor: u32,
     /// World viewer: share of the bushes and rocks to grow, 0..1 (trees always grow)
     #[arg(long, default_value_t = 1.0)]
     bush_density: f32,
@@ -572,9 +576,11 @@ fn main() {
                 horizon::HorizonPlugin,
                 veg_fade::VegetationFadePlugin,
             ))
+            .insert_resource(veg_fade::LodFactor::new(cli.lodfactor))
             .insert_resource(scenery::SceneryConfig {
                 vegetation: !cli.no_vegetation,
                 vegetation_lod: cli.vegetation_lod,
+                lodfactor: veg_fade::LodFactor::new(cli.lodfactor).0,
                 bush_density: cli.bush_density.clamp(0.0, 1.0),
                 far_lod: !cli.no_impostors,
                 ..default()

@@ -48,12 +48,14 @@ fn update_plant_lods(
     mut commands: Commands,
     cams: Query<&GlobalTransform, With<Camera3d>>,
     rbms: Res<Assets<RbmAsset>>,
+    lodfactor: Option<Res<crate::veg_fade::LodFactor>>,
     mut plants: Query<(Entity, &GlobalTransform, &mut PlantLod)>,
 ) {
     let Some(cam) = cams.iter().next() else {
         return;
     };
     let eye = cam.translation();
+    let lodfactor = lodfactor.map(|l| *l).unwrap_or_default();
     let mut swaps = 0;
     for (entity, tf, mut plant) in &mut plants {
         let d2 = eye.distance_squared(tf.translation());
@@ -88,7 +90,11 @@ fn update_plant_lods(
                     // foliage-material meshes fade out natively (`veg_fade.rs`, JC2-140): no
                     // hand-over range, only a lossless cull; the others keep the project range
                     if let Some(range) =
-                        crate::veg_fade::plant_visibility_range(b.foliage.is_some(), vis_range)
+                        crate::veg_fade::plant_visibility_range(
+                            b.foliage.is_some(),
+                            vis_range,
+                            lodfactor.0,
+                        )
                     {
                         child.insert(range);
                     }

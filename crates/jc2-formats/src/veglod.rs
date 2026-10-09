@@ -32,16 +32,31 @@ const C_1: f32 = f32::from_bits(989_440_308); // ~1/525
 const C_2: f32 = f32::from_bits(973_852_517); // ~1/1875
 const C_3: f32 = f32::from_bits(957_075_301); // ~1/7500
 const C_4: f32 = f32::from_bits(915_132_261); // ~1/240000
-/// `DAT_01089eb8` multiplies both factors of the owner scale (`00a4f4b0`).
-const DISTANCE_UNIT: f32 = 1.0;
+/// Model-LOD distance unit `DAT_01089eb8` per `/lodfactor` 0..=3 (set by `00612050`; JC2-126,
+/// `research/formats/tree-impostors-next.md` section 3). It multiplies both factors of the
+/// owner scale (`00a4f4b0`), so the lodfactor 0 case (unit 1.0, the default) is the
+/// JC2-086 breakpoint table.
+const DISTANCE_UNITS: [f32; 4] = [1.0, 1.5, 2.0, 3.0];
+
+/// The model-LOD distance unit for the graphics setting `/lodfactor`. Values above 3 are
+/// clamped (the setting is documented 0-3; what the exe does above that was not traced).
+pub fn distance_unit(lodfactor: u32) -> f32 {
+    DISTANCE_UNITS[lodfactor.min(3) as usize]
+}
 /// `2/255`, the last-slot fade slope printed by `00a89b90`.
 const FADE_SLOPE: f32 = 0.007843138;
 
 /// The owner's squared-distance multiplier (`owner+8`, written by `00a4f4b0`).
 ///
 /// `model_scale` is the descriptor scale (`-1.0` means "none", as in the original),
-/// `zoom` the camera factor at camera `+0x620` (1.0 at rest, clamped up to 1).
+/// `zoom` the camera factor at camera `+0x620` (1.0 at rest, clamped up to 1). The distance
+/// unit is the lodfactor 0 value 1.0; see [`owner_scale_with_unit`].
 pub fn owner_scale(model_scale: f32, zoom: f32) -> f32 {
+    owner_scale_with_unit(DISTANCE_UNITS[0], model_scale, zoom)
+}
+
+/// [`owner_scale`] for a model-LOD distance `unit` ([`distance_unit`], `DAT_01089eb8`).
+pub fn owner_scale_with_unit(unit: f32, model_scale: f32, zoom: f32) -> f32 {
     let mut f = zoom;
     if 0.0 <= 1.0 - f {
         f = 1.0;
@@ -49,7 +64,7 @@ pub fn owner_scale(model_scale: f32, zoom: f32) -> f32 {
     if model_scale != -1.0 {
         f *= model_scale;
     }
-    1.0 / (((DISTANCE_UNIT * f) * DISTANCE_UNIT) * f)
+    1.0 / (((unit * f) * unit) * f)
 }
 
 /// Continuous LOD level of a scaled squared distance (`00a89b90`).
@@ -270,6 +285,15 @@ pub struct SlotPlan {
 
 impl SlotPlan {
     pub fn new(model_scale: f32, slots: [Option<&str>; LOD_SLOTS]) -> Self {
+        Self::with_lodfactor(model_scale, slots, 0)
+    }
+
+    /// The plan under graphics setting `/lodfactor` (distance unit 1 / 1.5 / 2 / 3).
+    pub fn with_lodfactor(
+        model_scale: f32,
+        slots: [Option<&str>; LOD_SLOTS],
+        lodfactor: u32,
+    ) -> Self {
         let mut models: Vec<String> = Vec::new();
         let mut slot_model = [None; LOD_SLOTS];
         for (i, name) in slots.iter().enumerate() {
@@ -282,7 +306,7 @@ impl SlotPlan {
             }
         }
         Self {
-            multiplier: owner_scale(model_scale, 1.0),
+            multiplier: owner_scale_with_unit(distance_unit(lodfactor), model_scale, 1.0),
             filled: slot_model.map(|m| m.is_some()),
             slot_model,
             models,
@@ -619,5 +643,58 @@ mod tests {
         assert_eq!(foliage_fade(&fc, 50.0), 1.0);
         near(foliage_fade(&fc, 82.5), 0.5, 1e-4);
         assert_eq!(foliage_fade(&fc, 120.0), 0.0);
+    }
+
+    /// The FOV factor at every gameplay mode's FOV (JC2-141 section 6; JC2-148): degrees
+    /// converted as `f32(deg * 0.017453292)`; aim 20 / 15 deg and anything narrower floor at
+    /// 0.38; there is no upper cap (vehicle 50, free camera 45, wide 65 and 90 degrees).
+    #[test]
+    fn fov_factor_fixtures_per_mode() {
+        let rad = |deg: f32| deg * 0.017_453_292;
+        for (deg, want) in [
+            (40.0, 0.487_387_84),
+            (45.0, 0.616_850_3),
+            (50.0, 0.761_543_6),
+            (65.0, 1.287_008_6),
+            (90.0, 2.467_401),
+            (20.0, 0.38),
+            (15.0, 0.38),
+            (3.0, 0.38),
+        ] {
+            near(fov_factor(rad(deg)), want, 1e-6);
+        }
+        // start of the foliage fade = 55 / f metres at lodfactor 0
+        let t = engine_table(0);
+        let start = |deg: f32| {
+            let c = foliage_constants(&t, fov_factor(rad(deg)));
+            c[0] / c[1]
+        };
+        near(start(40.0), 112.84, 0.05);
+        near(start(50.0), 72.22, 0.05);
+        near(start(20.0), 55.0 / 0.38, 0.01);
+        near(start(90.0), 22.29, 0.05);
+    }
+
+    #[test]
+    fn model_lod_distance_unit_follows_lodfactor() {
+        assert_eq!(
+            [0, 1, 2, 3, 9].map(distance_unit),
+            [1.0, 1.5, 2.0, 3.0, 3.0]
+        );
+        assert_eq!(owner_scale(4.0, 1.0), 1.0 / 16.0);
+        assert_eq!(owner_scale_with_unit(1.5, 4.0, 1.0), 1.0 / 36.0);
+        let slots = [Some("a"), Some("b"), Some("b"), Some("b"), Some("b")];
+        let p0 = SlotPlan::with_lodfactor(4.0, slots, 0);
+        assert_eq!(p0, SlotPlan::new(4.0, slots));
+        // scale 4: the level reaches 1 (scaled d^2 = 100) at 10 m * 4 = 40 m; lodfactor 2 doubles it
+        let at = |p: &SlotPlan, d: f32| p.model_at(d * d);
+        assert_eq!(at(&p0, 39.0), Some(0));
+        assert_eq!(at(&p0, 41.0), Some(1));
+        let p2 = SlotPlan::with_lodfactor(4.0, slots, 2);
+        assert_eq!(at(&p2, 79.0), Some(0));
+        assert_eq!(at(&p2, 81.0), Some(1));
+        // the cull distance (level 5 = 500 m * scale) scales with the unit too
+        assert_eq!(select(p0.multiplier, 2001.0 * 2001.0, 5), Selection::Culled);
+        assert_ne!(select(p2.multiplier, 2001.0 * 2001.0, 5), Selection::Culled);
     }
 }

@@ -1368,8 +1368,10 @@ pub(crate) fn spawn_models(
     st: Option<ResMut<Streamer>>,
     mission: Option<Res<ActiveMission>>,
     launches: Option<Res<crate::missions::access::MissionLaunches>>,
+    lodfactor: Option<Res<crate::veg_fade::LodFactor>>,
 ) {
     let Some(mut st) = st else { return };
+    let lodfactor = lodfactor.map(|l| *l).unwrap_or_default();
     let Streamer {
         loaded,
         location_tiles,
@@ -1450,7 +1452,11 @@ pub(crate) fn spawn_models(
                     // foliage-material meshes fade out natively (`veg_fade.rs`, JC2-140): no
                     // hand-over range, only a lossless cull; the others keep the project range
                     if let Some(range) =
-                        crate::veg_fade::plant_visibility_range(b.foliage.is_some(), p.vis_range)
+                        crate::veg_fade::plant_visibility_range(
+                            b.foliage.is_some(),
+                            p.vis_range,
+                            lodfactor.0,
+                        )
                     {
                         child.insert(range);
                     }
@@ -1538,10 +1544,25 @@ fn hud(
     st: Option<Res<Streamer>>,
     cfg: Res<WorldConfig>,
     cams: Query<(&FlyCamera, &Transform)>,
+    lod: Option<Res<crate::terrain_material::TerrainLod>>,
+    fade: Option<Res<crate::veg_fade::VegetationFade>>,
     mut q: Query<&mut Text, With<Hud>>,
 ) {
     let (Some(st), Ok((cam, tf))) = (st, cams.single()) else {
         return;
+    };
+    // the realised camera FOV and what scales with it (JC2-148)
+    let fov_line = match (lod.as_deref(), fade.as_deref()) {
+        (Some(l), Some(f)) => format!(
+            "fov {:.1} deg   terrain LOD0 {:.1} m / LOD1 {:.1} m   foliage fade {:.0}..{:.0} m   lodfactor {}\n",
+            l.fov.to_degrees(),
+            l.lod0_radius(),
+            l.lod1_radius(),
+            f.foliage.x / f.foliage.y,
+            f.foliage.x / f.foliage.y + 1.0 / f.foliage.y,
+            f.lodfactor,
+        ),
+        _ => String::new(),
     };
     // engine coordinates
     let [ex, ey, ez] = to_engine(tf.translation);
@@ -1556,7 +1577,7 @@ fn hud(
             "jc2-rs world   start {},{} radius {} lod {}   {} tiles loaded ({} loaded, {} dropped so far, last took {:.0} ms)\n\
              {} terrain tris   {}/{} objects placed{}{}   {} model tris   {} collision shapes{}   {} refs unresolved\n\
              position {ex:.0} {ey:.0} {ez:.0}  (tile {tile})   {:.0} m above sea   speed {:.0} m/s\n\
-             right-drag look · WASD move · Space/C up/down · Shift fast · Alt slow · wheel speed · R reset · B ball",
+             {fov_line}right-drag look · WASD move · Space/C up/down · Shift fast · Alt slow · wheel speed · R reset · B ball",
             cfg.tile.0,
             cfg.tile.1,
             cfg.radius,

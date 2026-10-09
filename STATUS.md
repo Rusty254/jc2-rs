@@ -34,6 +34,12 @@ Master e368688: 507/507 tests, clippy `-D warnings` clean. Accepted today:
   identity (point lights, unlit/fog/clear colours); values without native evidence stay labelled policy
   (display-authored, `c = d^2`). See `night-exposure-next.md` section 11.
 
+- JC2-148 (on branch): the terrain LOD scale `min(1/fov^2, 999.99994)` and the vegetation fade `f = max(fov^2, 0.38)`
+  follow the realised per-frame camera FOV (`CameraFov`, else the Projection): on foot 40 deg = LOD0 51.3 m / LOD1 512.9 m
+  and foliage fade 112.8..167.8 m. `--lodfactor 0..3` (native setting 0x17, default 0) feeds the vegetation `d2c`/`d34`
+  table and the model-LOD distance unit 1/1.5/2/3. The HUD shows FOV, LOD radii, fade range and lodfactor. The patch radius
+  7/11/13 and the terrain streaming radii are not native-derived yet (Gaps in the handoff).
+
 Open parity research (board, tags `research` + `parity-gap`): JC2-101..110, 112..117, 119..121,
 125..139 (124 done). GitHub `Rusty254/jc2-rs` (private) receives only the filtered `public` snapshot.
 

@@ -49,6 +49,16 @@ impl Default for CameraFov {
     }
 }
 
+/// The realised vertical FOV the FOV-scaled consumers (terrain LOD radii, vegetation fades)
+/// use this frame: [`CameraFov`] when the gameplay camera plugin is running, else the
+/// camera's own perspective projection (JC2-148). `None` for no camera / an orthographic one.
+pub fn realised_fov(camera_fov: Option<&CameraFov>, projection: Option<&Projection>) -> Option<f32> {
+    camera_fov.map(|c| c.fov_y).or_else(|| match projection? {
+        Projection::Perspective(p) => Some(p.fov),
+        _ => None,
+    })
+}
+
 /// The camera setting a vehicle's driver seat names (`camera_id`, key `0x742cdd23`) and the
 /// one for reversing (`camera_id_reverse`; unused, see the Gaps in the brief).
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +324,7 @@ fn vehicle_camera(vehicles: &VehicleQuery, entity: Entity) -> Option<(i32, f32)>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drive_fov(
+pub(crate) fn drive_fov(
     time: Res<Time>,
     state: Option<ResMut<GameplayCamera>>,
     mut fov: ResMut<CameraFov>,
@@ -577,5 +587,58 @@ mod tests {
             app.update();
         }
         assert!((fov(&app) - deg_to_rad(45.0)).abs() < 1e-3, "{}", fov(&app));
+    }
+
+    /// JC2-148, end to end: the manager's FOV reaches the terrain LOD scale and the vegetation
+    /// fade in the same frame. On foot 40 degrees: LOD0 51.29 m, LOD1 512.9 m, foliage fade
+    /// 112.8..167.8 m; the parachute's 45 degrees then moves them to 40.5 m / 405.3 m and
+    /// 89.2..144.2 m.
+    #[test]
+    fn consumers_follow_the_realised_fov() {
+        use crate::terrain_material::TerrainLod;
+        use crate::veg_fade::{VegetationFade, VegetationFadePlugin};
+        let Some(d) = data() else { return };
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(VegetationFadePlugin)
+            .init_resource::<CameraFov>()
+            .init_resource::<TerrainLod>()
+            .insert_resource(GameplayCamera::new(d))
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                Duration::from_millis(16),
+            ))
+            .add_systems(Update, drive_fov);
+        app.add_systems(Update, crate::terrain_material::update_terrain_lod.after(drive_fov));
+        app.world_mut().spawn((
+            FlyCamera {
+                yaw: 0.0,
+                pitch: 0.0,
+                speed: 1.0,
+            },
+            Camera3d::default(),
+            Projection::Perspective(PerspectiveProjection::default()),
+        ));
+        let hero = app.world_mut().spawn(Hero::default()).id();
+        for _ in 0..3 {
+            app.update();
+        }
+        let fade = |app: &App| {
+            let f = app.world().resource::<VegetationFade>();
+            (f.foliage.x / f.foliage.y, f.foliage.x / f.foliage.y + 1.0 / f.foliage.y)
+        };
+        let lod = *app.world().resource::<TerrainLod>();
+        assert_eq!(lod.fov, 0.698_131_7);
+        assert!((lod.lod0_radius() - 51.29).abs() < 0.01 && (lod.lod1_radius() - 512.9).abs() < 0.1);
+        let (a, b) = fade(&app);
+        assert!((a - 112.84).abs() < 0.05 && (b - 167.84).abs() < 0.05, "{a} {b}");
+        app.world_mut().get_mut::<Hero>(hero).unwrap().parachute = true;
+        for _ in 0..80 {
+            app.update();
+        }
+        let lod = *app.world().resource::<TerrainLod>();
+        assert!((lod.lod0_radius() - 40.53).abs() < 0.1, "{}", lod.lod0_radius());
+        assert!((lod.lod1_radius() - 405.3).abs() < 1.0);
+        let (a, b) = fade(&app);
+        assert!((a - 89.16).abs() < 0.3 && (b - 144.16).abs() < 0.3, "{a} {b}");
     }
 }

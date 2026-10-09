@@ -137,7 +137,13 @@ impl Plugin for ImpostorPlugin {
         app.insert_resource(ImpostorShader(shader))
             .add_plugins(MaterialPlugin::<ImpostorMaterial>::default())
             .add_systems(Startup, setup)
-            .add_systems(Update, (stream_impostors, push_fade));
+            .add_systems(
+                Update,
+                (
+                    stream_impostors,
+                    push_fade.after(crate::veg_fade::VegetationFadeSet),
+                ),
+            );
     }
 }
 

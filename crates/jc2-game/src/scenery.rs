@@ -39,6 +39,10 @@ pub struct SceneryConfig {
     /// (`plant_lod.rs`); N >= 1 forces that single `.lod` level for every plant (1 = full
     /// detail; 2 is a third of the triangles).
     pub vegetation_lod: usize,
+    /// Graphics setting `/lodfactor` 0..=3 (native id 0x17, default 0): the model-LOD distance
+    /// unit 1 / 1.5 / 2 / 3 of the native selection (`vegetation_lod == 0`). The vegetation
+    /// fade distances read [`crate::veg_fade::LodFactor`], which `main` sets from the same flag.
+    pub lodfactor: u32,
     /// Give the trees and rocks that have one their collision shape (needs physics).
     pub vegetation_physics: bool,
     /// Share of the bushes and rocks to keep, 0..=1 (the trees always stay): a jungle
@@ -64,6 +68,7 @@ impl Default for SceneryConfig {
         Self {
             vegetation: true,
             vegetation_lod: 0,
+            lodfactor: crate::veg_fade::LODFACTOR,
             vegetation_physics: true,
             bush_density: 1.0,
             static_geometry: true,
@@ -277,7 +282,7 @@ fn grow(
             }
             let model = containers
                 .iter()
-                .find_map(|c| resolve_plant(st, game, c, ty, scfg.vegetation_lod));
+                .find_map(|c| resolve_plant(st, game, c, ty, scfg.vegetation_lod, scfg.lodfactor));
             if model.is_none() {
                 *sc.stats.unresolved.entry(ty.model.clone()).or_default() += 1;
                 *st.unresolved.entry(ty.model.clone()).or_default() += 1;
@@ -366,6 +371,7 @@ fn resolve_plant(
     container: &str,
     ty: &jc2_formats::vegetation::VegetationType,
     lod: usize,
+    lodfactor: u32,
 ) -> Option<PlantModel> {
     let c = st.index.container(game, container)?;
     let lod_text = c.member(&ty.model)?;
@@ -374,7 +380,7 @@ fn resolve_plant(
     let mut lod_plan = None;
     let rbm = if lod == 0 {
         let slots = d.slots().map(|s| s.filter(|n| c.member(n).is_some()));
-        let plan = SlotPlan::new(d.lod_scale(), slots);
+        let plan = SlotPlan::with_lodfactor(d.lod_scale(), slots, lodfactor);
         let far = plan.models.get(plan.far_model()?)?.clone();
         if plan.switches() {
             let paths = plan

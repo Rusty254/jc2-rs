@@ -9,21 +9,42 @@
 //! constants depend only on the graphics setting and the camera FOV, so that is rarely).
 //!
 //! The FOV is the camera's realised vertical FOV (`camera+0x618`, vertical axis proven by
-//! JC2-141, `research/formats/camera-fov-next.md`), and `f = max(fov^2, 0.38)` has no upper
-//! cap. The native on-foot FOV is 40 degrees (`f = 0.487`: foliage fade 112.8..167.8 m); this
-//! project's camera still uses Bevy's default 45 degrees (`f = 0.617`: 89..144 m) until the
-//! camera-FOV runtime task lands, so the distances here follow the actual `Projection` each
-//! frame (non-native until then).
+//! JC2-141, `research/formats/camera-fov-next.md`): [`crate::gameplay_camera::CameraFov`]
+//! when the gameplay camera drives it (40 degrees on foot, 20/15 aim, 50 vehicles, ...),
+//! else the camera's `Projection`; `f = max(fov^2, 0.38)` has no upper cap. The constants
+//! are recomputed after the camera system each frame whenever the FOV or the lodfactor
+//! changed (JC2-148).
 //!
-//! Non-native, labelled: the `/lodfactor` graphics setting is not exposed in the project: it is
-//! fixed at the native default 0 ([`LODFACTOR`]).
+//! The graphics setting `/lodfactor` (0x17, "Geometric detail 0-3", native default 0) is
+//! the [`LodFactor`] resource (`--lodfactor`): it selects the `d2c`/`d34` distances
+//! (`veglod::engine_table`) and, in `scenery.rs`, the model-LOD distance unit 1 / 1.5 / 2 / 3
+//! (`veglod::distance_unit`). The patch radius 7 / 11 / 13 (`DAT_0108b8fb`) that the same
+//! setting changes is not understood and not applied (Gap).
 
 use bevy::prelude::*;
 use jc2_formats::veglod;
 
 /// Native default of the `/lodfactor` setting (`DAT_0108b924`, "Geometric detail 0-3,
-/// default 0"; JC2-126). Not exposed as a project option.
+/// default 0"; JC2-126).
 pub const LODFACTOR: u32 = 0;
+
+/// The graphics setting `/lodfactor` 0..=3 (native id 0x17, default 0). Read by the vegetation
+/// fade constants and the plant model-LOD selection; set once at start from `--lodfactor`.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LodFactor(pub u32);
+
+impl LodFactor {
+    /// Values above the documented 0-3 range are clamped to 3.
+    pub fn new(level: u32) -> Self {
+        Self(level.min(3))
+    }
+}
+
+impl Default for LodFactor {
+    fn default() -> Self {
+        Self(LODFACTOR)
+    }
+}
 
 /// The fade constants for the current camera: `foliage.xy` the foliage distance fade
 /// `1 - sat(dist * y - x)`, `top` / `trunk` the impostor `cb1[1]` vectors. `foliage.z` is 1 when
@@ -32,6 +53,8 @@ pub const LODFACTOR: u32 = 0;
 pub struct VegetationFade {
     /// Camera vertical FOV in radians used for `f` (the project camera's, see the module docs).
     pub fov: f32,
+    /// The `/lodfactor` the constants were built for.
+    pub lodfactor: u32,
     pub foliage: Vec4,
     pub top: Vec4,
     pub trunk: Vec4,
@@ -45,6 +68,7 @@ impl VegetationFade {
         let [fx, fy] = veglod::foliage_constants(&table, f);
         Self {
             fov,
+            lodfactor,
             foliage: Vec4::new(fx, fy, 1.0, 0.0),
             top: Vec4::from(veglod::top_constants(&table, f)),
             trunk: Vec4::from(veglod::trunk_constants(&table, f)),
@@ -64,16 +88,17 @@ const CULL_SLACK: f32 = 50.0;
 
 /// CPU-side visibility of a mesh of a streamed plant (project, not native). Foliage-material
 /// meshes get no `TREE_RANGE` / `BUSH_RANGE` hand-over (their native fade ends at most
-/// `foliage_fade_end_max` = 199.7 m away at any FOV); they are only hidden beyond that plus
+/// `foliage_fade_end_max` = 199.7 m away at any FOV for lodfactor 0); they are only hidden beyond that plus
 /// [`CULL_SLACK`], where the shader would discard every fragment anyway, which keeps the
 /// vertex work of far plants down without changing the picture. Other meshes keep the
 /// project's `far` range.
 pub fn plant_visibility_range(
     foliage: bool,
     far: Option<(f32, f32)>,
+    lodfactor: u32,
 ) -> Option<bevy::camera::visibility::VisibilityRange> {
     let end = if foliage {
-        let at = veglod::foliage_fade_end_max(&veglod::engine_table(LODFACTOR)) + CULL_SLACK;
+        let at = veglod::foliage_fade_end_max(&veglod::engine_table(lodfactor)) + CULL_SLACK;
         (at, at + 1.0)
     } else {
         far?
@@ -85,27 +110,40 @@ pub fn plant_visibility_range(
     })
 }
 
+/// The vegetation fade constants are updated in this set, after the gameplay camera has
+/// realised this frame's FOV; the impostor card system runs after it.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VegetationFadeSet;
+
 pub struct VegetationFadePlugin;
 
 impl Plugin for VegetationFadePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<VegetationFade>()
-            .add_systems(First, update_fade_from_camera);
+            .init_resource::<LodFactor>()
+            .add_systems(
+                Update,
+                update_fade_from_camera
+                    .in_set(VegetationFadeSet)
+                    .after(crate::gameplay_camera::drive_fov),
+            );
     }
 }
 
 fn update_fade_from_camera(
     cams: Query<&Projection, With<Camera3d>>,
+    camera_fov: Option<Res<crate::gameplay_camera::CameraFov>>,
+    lodfactor: Res<LodFactor>,
     mut fade: ResMut<VegetationFade>,
 ) {
-    let Some(fov) = cams.iter().find_map(|p| match p {
-        Projection::Perspective(p) => Some(p.fov),
-        _ => None,
-    }) else {
+    let Some(fov) = crate::gameplay_camera::realised_fov(
+        camera_fov.as_deref(),
+        cams.iter().next(),
+    ) else {
         return;
     };
-    if fov != fade.fov {
-        *fade = VegetationFade::new(LODFACTOR, fov);
+    if fov != fade.fov || lodfactor.0 != fade.lodfactor {
+        *fade = VegetationFade::new(lodfactor.0, fov);
     }
 }
 
@@ -147,5 +185,44 @@ mod tests {
         ));
         app.update();
         assert_eq!(*app.world().resource::<VegetationFade>(), VegetationFade::new(0, 1.2));
+    }
+
+    /// JC2-148: the fade start (`d2c / f`) at each mode's realised FOV, with no cap on `f`;
+    /// `CameraFov` wins over the projection, and the lodfactor setting is picked up.
+    #[test]
+    fn realised_fov_and_lodfactor_drive_the_fade() {
+        use crate::gameplay_camera::CameraFov;
+        let rad = |deg: f32| deg * 0.017_453_292;
+        let start = |f: &VegetationFade| f.foliage.x / f.foliage.y;
+        let mut app = App::new();
+        app.add_plugins(VegetationFadePlugin);
+        app.world_mut().spawn((Camera3d::default(), Projection::Perspective(default())));
+        // (degrees, start of the foliage fade at lodfactor 0): on foot, aim 20/15 (floor
+        // 0.38), vehicle, free camera, and a 90 degree FOV beyond f = 1
+        for (deg, want) in [
+            (40.0, 112.84),
+            (20.0, 144.74),
+            (15.0, 144.74),
+            (50.0, 72.22),
+            (45.0, 89.16),
+            (90.0, 22.29),
+        ] {
+            app.insert_resource(CameraFov { fov_y: rad(deg) });
+            app.update();
+            let f = *app.world().resource::<VegetationFade>();
+            assert!((start(&f) - want).abs() < 0.06, "{deg}: {}", start(&f));
+            assert!((1.0 / f.foliage.y - 55.0).abs() < 1e-3);
+        }
+        // lodfactor 2 and 3 start at 119 / f and 183 / f
+        app.insert_resource(CameraFov { fov_y: rad(40.0) });
+        for (lod, want) in [(1, 112.84), (2, 119.0 / 0.487_387_84), (3, 183.0 / 0.487_387_84)] {
+            app.insert_resource(LodFactor::new(lod));
+            app.update();
+            let f = *app.world().resource::<VegetationFade>();
+            assert_eq!(f.lodfactor, lod);
+            assert!((start(&f) - want).abs() < 0.06, "{lod}: {}", start(&f));
+        }
+        assert_eq!(LodFactor::new(7), LodFactor(3));
+        assert_eq!(LodFactor::default(), LodFactor(0));
     }
 }

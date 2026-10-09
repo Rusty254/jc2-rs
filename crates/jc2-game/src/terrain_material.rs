@@ -79,6 +79,59 @@ pub fn lod_scale(fov: f32) -> f32 {
     (1.0 / (fov * fov)).min(LOD_SCALE_MAX)
 }
 
+/// The terrain LOD scale of the camera as it is this frame (JC2-148): the CPU view of the
+/// quantity `terrain_splat.wgsl` derives from the view's projection
+/// (`fov = 2 atan(1 / clip_from_view[1][1])`, the same FOV [`crate::gameplay_camera::CameraFov`]
+/// holds). On foot (40 degrees) `scale` = 2.0517542, LOD 0 ends at 51.29 m and LOD 1 at
+/// 512.9 m; aim (20 / 15 degrees) pushes them out to 212 / 364.8 m and 2124 / 3648 m.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct TerrainLod {
+    /// The realised vertical FOV in radians.
+    pub fov: f32,
+    /// `min(1 / fov^2, 999.99994)`.
+    pub scale: f32,
+}
+
+impl TerrainLod {
+    pub fn at(fov: f32) -> Self {
+        Self {
+            fov,
+            scale: lod_scale(fov),
+        }
+    }
+
+    /// Chebyshev radius (m) of pure LOD 0.
+    pub fn lod0_radius(&self) -> f32 {
+        LOD0_RADIUS * self.scale
+    }
+
+    /// Chebyshev radius (m) of pure LOD 1.
+    pub fn lod1_radius(&self) -> f32 {
+        LOD1_RADIUS * self.scale
+    }
+}
+
+impl Default for TerrainLod {
+    fn default() -> Self {
+        Self::at(std::f32::consts::FRAC_PI_4)
+    }
+}
+
+/// Follow the realised camera FOV (after the gameplay camera system, like the vegetation
+/// fade): the shader reads the same FOV from the projection the camera renders with.
+pub(crate) fn update_terrain_lod(
+    cams: Query<&Projection, With<Camera3d>>,
+    camera_fov: Option<Res<crate::gameplay_camera::CameraFov>>,
+    mut lod: ResMut<TerrainLod>,
+) {
+    if let Some(fov) =
+        crate::gameplay_camera::realised_fov(camera_fov.as_deref(), cams.iter().next())
+        && fov != lod.fov
+    {
+        *lod = TerrainLod::at(fov);
+    }
+}
+
 /// The two LOD weights the game's terrain vertex shader (`fastter_sh*`) passes on for a
 /// point at camera-relative offset `rel`: `t0` (1 = LOD 0, the near atlas) and `t1`
 /// (1 = LOD 1 or nearer, 0 = the colour table), `1 - saturate((d - r k) / w)` of the
@@ -196,7 +249,13 @@ impl Plugin for TerrainMaterialPlugin {
         app.insert_resource(TerrainShader(shader));
         app.insert_resource(SunHorizonShader(horizon));
         app.add_plugins(MaterialPlugin::<TerrainSplatMaterial>::default());
-        app.add_systems(Update, update_horizon);
+        app.init_resource::<TerrainLod>().add_systems(
+            Update,
+            (
+                update_horizon,
+                update_terrain_lod.after(crate::gameplay_camera::drive_fov),
+            ),
+        );
     }
 }
 
@@ -815,6 +874,77 @@ fn main_pass_post_lighting_processing(p: PbrInput, c: vec4<f32>) -> vec4<f32> { 
         assert!((LOD1_RADIUS * k45 - 405.28).abs() < 1e-1);
         // the scale's clamp
         assert_eq!(lod_scale(1e-4), LOD_SCALE_MAX);
+    }
+
+    /// JC2-148: the radii at the realised gameplay FOVs (`f32(deg * 0.017453292)`, the
+    /// JC2-141 probe's `terrain_lod` fixtures): on foot 40 degrees, aim 20 and 15, vehicles
+    /// 50, the free camera / parachute 45, and the graphics-engine constructor's 65.
+    #[test]
+    fn terrain_radii_follow_each_mode_fov() {
+        let rad = |deg: f32| deg * 0.017_453_292;
+        // (degrees, scale, LOD0 radius, LOD1 radius)
+        for (deg, k, r0, r1) in [
+            (40.0, 2.051_754_2, 51.29, 512.9),
+            (20.0, 8.207_02, 205.18, 2051.75),
+            (15.0, 14.590_3, 364.8, 3647.6),
+            (50.0, 1.313_15, 32.83, 328.3),
+            (45.0, 1.621_139, 40.53, 405.28),
+            (65.0, 0.777_003, 19.43, 194.25),
+        ] {
+            let t = TerrainLod::at(rad(deg));
+            assert!((t.scale - k).abs() < 2e-4 * k, "{deg}: {}", t.scale);
+            assert!((t.lod0_radius() - r0).abs() < 0.02 * r0.max(10.0), "{deg}");
+            assert!((t.lod1_radius() - r1).abs() < 0.02 * r1.max(10.0), "{deg}");
+        }
+        // the quantity the shader derives from the camera matrix is the same FOV
+        for deg in [40.0_f32, 20.0, 15.0, 50.0, 45.0, 65.0] {
+            let p = PerspectiveProjection {
+                fov: rad(deg),
+                aspect_ratio: 16.0 / 9.0,
+                ..default()
+            };
+            let m = bevy::camera::CameraProjection::get_clip_from_view(&p);
+            let fov = 2.0 * (1.0_f32 / m.y_axis.y).atan();
+            assert!((lod_scale(fov) / lod_scale(rad(deg)) - 1.0).abs() < 1e-4, "{deg}");
+        }
+        // no hard cap in range: the clamp only bites below ~1.8 milliradians
+        assert_eq!(TerrainLod::at(1e-4).scale, LOD_SCALE_MAX);
+    }
+
+    /// The resource follows the camera's projection when no gameplay camera drives
+    /// `CameraFov`, and `CameraFov` when it does.
+    #[test]
+    fn terrain_lod_resource_follows_the_realised_fov() {
+        use crate::gameplay_camera::CameraFov;
+        let mut app = App::new();
+        app.init_resource::<TerrainLod>()
+            .add_systems(Update, update_terrain_lod);
+        let cam = app
+            .world_mut()
+            .spawn((
+                Camera3d::default(),
+                Projection::Perspective(PerspectiveProjection {
+                    fov: 0.698_131_7,
+                    ..default()
+                }),
+            ))
+            .id();
+        app.update();
+        let t = *app.world().resource::<TerrainLod>();
+        assert!((t.scale - 2.051_754_2).abs() < 1e-5, "{}", t.scale);
+        assert!((t.lod0_radius() - 51.29).abs() < 0.01);
+        // a new projection FOV is picked up the next frame
+        *app.world_mut().get_mut::<Projection>(cam).unwrap() =
+            Projection::Perspective(PerspectiveProjection {
+                fov: 0.349_065_85,
+                ..default()
+            });
+        app.update();
+        assert!((app.world().resource::<TerrainLod>().lod0_radius() - 205.18).abs() < 0.1);
+        // with the gameplay camera's resource present, it is the source
+        app.insert_resource(CameraFov { fov_y: 0.261_799_4 });
+        app.update();
+        assert!((app.world().resource::<TerrainLod>().lod0_radius() - 364.8).abs() < 0.3);
     }
 
     #[test]
