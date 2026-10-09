@@ -9,9 +9,12 @@
 //!   table: hour/24 across, zenith at the top row to horizon at the bottom).
 //! * `fog_gradient.dds` is a 4 × 128 alpha ramp (fog amount); its colour is constant.
 //!
-//! The sun's light colours and intensities are not in the data files that could be
-//! found (the per-hour tables inside the exe's weather object start out as 1.0 and
-//! `gradients.bmp` is an editor image); the game crate picks its own.
+//! The sun's light colours and intensities are not in `gradients.bmp`. That file is **not** an editor image: the exe loads it into ten
+//! per-hour tables ([`GradientTables`], `research/formats/light-tables-next.md`, JC2-100),
+//! which feed the cloud cards, the haze/fog colours, a point-light scale and a facade
+//! factor, not the sun or the ambient. The sun/moon colour and ambients are driven by
+//! `textures\landscape\gamezone_gradients.bmp` (JC2-115), not yet implemented; the game
+//! crate picks its own meanwhile (non-native).
 
 use crate::Result;
 use crate::dds::DdsImage;
@@ -22,6 +25,8 @@ pub const WEATHER_SETTINGS_FILE: &str = "weathersettings.bin";
 pub const CLOUD_SHADOW_SETTINGS_FILE: &str = "cloudshadows.bin";
 pub const SKY_GRADIENT_FILE: &str = "skygradient_dif.dds";
 pub const FOG_GRADIENT_FILE: &str = "fog_gradient.dds";
+/// `textures\atmosphere\gradients.bmp` (files are matched by name): the per-hour tables.
+pub const GRADIENTS_FILE: &str = "gradients.bmp";
 
 // weathersettings.bin keys (names found by guessing and hashing: see weather.md)
 const CLOUD_BASE: u32 = 0x4763_06ad; // `cloud_base`
@@ -248,6 +253,181 @@ impl Atmosphere {
     pub fn sky_colour(&self, hour: f32, v: f32) -> [f32; 3] {
         let c = self.sky.sample(hour.rem_euclid(24.0) / 24.0, v);
         [c[0], c[1], c[2]]
+    }
+}
+
+/// Hours per table (columns of `gradients.bmp`); every table has one more entry (24 = entry 0).
+pub const GRADIENT_HOURS: usize = 24;
+const GRADIENT_ROWS: usize = 22;
+/// `pow(x, 2.2)` with the double at 0x00e4aab0, the float 2.2 promoted (JC2-100, section 1).
+const GRADIENT_GAMMA: f64 = 2.200_000_047_683_716;
+
+/// The six RGB tables of the weather object (`FUN_00a46bd0`), named by their offsets in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RgbTable {
+    /// `+0x660`: haze table 0 (role in clear weather unresolved, gap G2).
+    A,
+    /// `+0xb10`: haze table 1 (as `A`).
+    B,
+    /// `+0xfc0`: cloud card lit colour (`FUN_00a53a80`).
+    C,
+    /// `+0x1470`: cloud card shaded colour.
+    D,
+    /// `+0x1920`: haze table above the sea (`cb0[14]` in clear weather).
+    E,
+    /// `+0x1dd0`: haze table when the camera is below 200 m.
+    F,
+}
+
+/// The ten per-hour tables the exe builds from `textures\atmosphere\gradients.bmp`
+/// (a 24 x 22, 24 bpp picture: 24 hours across), exactly as `FUN_00a46bd0` does
+/// (`research/formats/light-tables-next.md` section 1).
+///
+/// * `s0`: memory row 0, red only, raw.
+/// * `s[v]`: memory row `1 + 7v`, red only, raw (point-light scale).
+/// * `v[t][variant]`: memory rows `2 + 7 variant + t` (`t` = [`RgbTable`] order), RGB
+///   `** 2.2` (linear), `w` = 1.
+///
+/// Memory row 0 is the top of the picture (the BMP is bottom-up); entry 24 duplicates
+/// entry 0. Channels: R = byte 2, G = byte 1, B = byte 0, each `/ 255`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradientTables {
+    pub s0: [f32; GRADIENT_HOURS + 1],
+    pub s: [[f32; GRADIENT_HOURS + 1]; 3],
+    pub v: [[[[f32; 4]; GRADIENT_HOURS + 1]; 3]; 6],
+}
+
+/// The weights of variants 1 and 2 (`FUN_00a40080`): `precip` is the precipitation
+/// object's `+0x48`, `snow` its `+0x50`. Variant 0 is the base.
+pub fn variant_weights(precip: f32, snow: f32) -> (f32, f32) {
+    ((1.0 - snow) * precip, snow * precip)
+}
+
+/// `i = trunc(hour)`, `j = i + 1` wrapping to 0 above 23, `f = hour - i`: every table
+/// reader in the exe (`0x00a53a9d`) interpolates linearly between those two entries.
+fn hour_pair(hour: f32) -> (usize, usize, f32) {
+    let h = if hour.is_finite() {
+        hour.rem_euclid(24.0)
+    } else {
+        0.0
+    };
+    let i = (h as usize).min(GRADIENT_HOURS - 1);
+    let j = if i + 1 > GRADIENT_HOURS - 1 { 0 } else { i + 1 };
+    (i, j, (h - i as f32).clamp(0.0, 1.0))
+}
+
+impl GradientTables {
+    pub fn load(fs: &GameFs) -> Result<Self> {
+        Self::parse(&fs.read_inflated(GRADIENTS_FILE)?)
+    }
+
+    pub fn parse(bmp: &[u8]) -> Result<Self> {
+        let bad = |m: &str| crate::Error::format(format!("gradients.bmp: {m}"));
+        let u32_at = |o: usize| -> Result<u32> {
+            bmp.get(o..o + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .ok_or_else(|| bad("truncated header"))
+        };
+        if bmp.get(..2) != Some(b"BM") {
+            return Err(bad("not a BMP"));
+        }
+        let off = u32_at(10)? as usize;
+        let (w, h) = (u32_at(18)? as i32, u32_at(22)? as i32);
+        let bpp = bmp
+            .get(28..30)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .ok_or_else(|| bad("truncated header"))?;
+        if bpp != 24 || u32_at(30)? != 0 {
+            return Err(bad("needs an uncompressed 24 bpp picture"));
+        }
+        if w != GRADIENT_HOURS as i32 || h != GRADIENT_ROWS as i32 {
+            return Err(bad("needs 24 x 22 pixels (24 hours, 1 + 3 x 7 rows)"));
+        }
+        let pitch = (GRADIENT_HOURS * 3 + 3) & !3;
+        if bmp.len() < off.saturating_add(pitch * GRADIENT_ROWS) {
+            return Err(bad("truncated pixels"));
+        }
+        // memory row r is file row (h - 1 - r); pixel -> (R, G, B) = bytes (2, 1, 0) / 255
+        let px = |r: usize, c: usize| -> [f32; 3] {
+            let o = off + (GRADIENT_ROWS - 1 - r) * pitch + c * 3;
+            [
+                bmp[o + 2] as f32 / 255.0,
+                bmp[o + 1] as f32 / 255.0,
+                bmp[o] as f32 / 255.0,
+            ]
+        };
+        let lin = |x: f32| (x as f64).powf(GRADIENT_GAMMA) as f32;
+        let mut t = Self {
+            s0: [0.0; GRADIENT_HOURS + 1],
+            s: [[0.0; GRADIENT_HOURS + 1]; 3],
+            v: [[[[0.0; 4]; GRADIENT_HOURS + 1]; 3]; 6],
+        };
+        for c in 0..GRADIENT_HOURS {
+            t.s0[c] = px(0, c)[0];
+            for var in 0..3 {
+                t.s[var][c] = px(1 + 7 * var, c)[0];
+                for tab in 0..6 {
+                    let p = px(2 + 7 * var + tab, c);
+                    t.v[tab][var][c] = [lin(p[0]), lin(p[1]), lin(p[2]), 1.0];
+                }
+            }
+        }
+        t.s0[GRADIENT_HOURS] = t.s0[0];
+        for var in 0..3 {
+            t.s[var][GRADIENT_HOURS] = t.s[var][0];
+            for tab in 0..6 {
+                t.v[tab][var][GRADIENT_HOURS] = t.v[tab][var][0];
+            }
+        }
+        Ok(t)
+    }
+
+    fn scalar(tab: &[f32; GRADIENT_HOURS + 1], hour: f32) -> f32 {
+        let (i, j, f) = hour_pair(hour);
+        tab[i] + (tab[j] - tab[i]) * f
+    }
+
+    /// `S0` at `hour`, linear (the facade/merged-block factor, `CRenderEngine+0x29b4`).
+    pub fn s0_at(&self, hour: f32) -> f32 {
+        Self::scalar(&self.s0, hour)
+    }
+
+    /// The point-light scale table of one weather variant at `hour`.
+    pub fn scalar_at(&self, variant: usize, hour: f32) -> f32 {
+        Self::scalar(&self.s[variant.min(2)], hour)
+    }
+
+    /// The point-light scale with the variants mixed by `(w1, w2)` (`FUN_00a472f0`).
+    pub fn scalar_blend(&self, hour: f32, w1: f32, w2: f32) -> f32 {
+        let mut x = self.scalar_at(0, hour);
+        for (var, w) in [(1, w1), (2, w2)] {
+            if w > 0.0 {
+                x += (self.scalar_at(var, hour) - x) * w;
+            }
+        }
+        x
+    }
+
+    /// One RGB table of one weather variant at `hour` (linear RGB).
+    pub fn rgb_at(&self, table: RgbTable, variant: usize, hour: f32) -> [f32; 3] {
+        let tab = &self.v[table as usize][variant.min(2)];
+        let (i, j, f) = hour_pair(hour);
+        std::array::from_fn(|c| tab[i][c] + (tab[j][c] - tab[i][c]) * f)
+    }
+
+    /// An RGB table with the variants mixed by `(w1, w2)` (`FUN_00a53a80`, `FUN_00a432d0`):
+    /// variant 0 is lerped toward variant 1 by `w1`, then toward variant 2 by `w2`.
+    pub fn rgb_blend(&self, table: RgbTable, hour: f32, w1: f32, w2: f32) -> [f32; 3] {
+        let mut x = self.rgb_at(table, 0, hour);
+        for (var, w) in [(1, w1), (2, w2)] {
+            if w > 0.0 {
+                let y = self.rgb_at(table, var, hour);
+                for c in 0..3 {
+                    x[c] += (y[c] - x[c]) * w;
+                }
+            }
+        }
+        x
     }
 }
 
@@ -507,5 +687,132 @@ mod tests {
         assert!(zen[0] < noon[0]);
         // the fog ramp fades out
         assert!(a.fog.texel(0, 0)[3] > 0.9 && a.fog.texel(0, 127)[3] < 0.1);
+    }
+
+    // Fixtures below: values printed by `research/tools/light_tables_probe.py` (JC2-100).
+    fn tables() -> Option<GradientTables> {
+        let fs = game()?;
+        if !fs.contains(GRADIENTS_FILE) {
+            return None;
+        }
+        Some(GradientTables::load(&fs).expect("gradients.bmp parses"))
+    }
+
+    fn near3(a: [f32; 3], b: [f32; 3]) {
+        for c in 0..3 {
+            assert!((a[c] - b[c]).abs() < 1e-5, "{a:?} vs {b:?}");
+        }
+    }
+
+    fn blank_bmp() -> Vec<u8> {
+        let mut bmp = vec![0u8; 54 + 72 * 22];
+        bmp[..2].copy_from_slice(b"BM");
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&24i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&22i32.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        bmp
+    }
+
+    #[test]
+    fn gradients_reject_malformed_pictures() {
+        assert!(GradientTables::parse(&[]).is_err());
+        assert!(GradientTables::parse(b"BM").is_err());
+        let mut bmp = blank_bmp();
+        assert!(GradientTables::parse(&bmp).is_ok());
+        bmp[18..22].copy_from_slice(&23i32.to_le_bytes());
+        assert!(GradientTables::parse(&bmp).is_err());
+        assert!(GradientTables::parse(&blank_bmp()[..100]).is_err());
+    }
+
+    /// Row map, flip, channel order, gamma and the entry 24 copy on a synthetic picture.
+    #[test]
+    fn gradients_map_rows_channels_and_gamma() {
+        let mut bmp = blank_bmp();
+        // memory row m is file row 21 - m; bytes are B, G, R
+        let mut set = |mem_row: usize, col: usize, r: u8, g: u8, b: u8| {
+            let o = 54 + (21 - mem_row) * 72 + col * 3;
+            bmp[o..o + 3].copy_from_slice(&[b, g, r]);
+        };
+        set(0, 5, 51, 0, 0); // S0, hour 5: 0.2
+        set(8, 0, 255, 0, 0); // variant 1 scalar row (1 + 7)
+        set(2 + 7 + 2, 3, 255, 128, 0); // variant 1, table C
+        set(7, 0, 0, 255, 0); // variant 0, table F
+        let t = GradientTables::parse(&bmp).unwrap();
+        assert!((t.s0[5] - 0.2).abs() < 1e-6);
+        assert_eq!(t.s[1][0], 1.0);
+        assert_eq!(t.s[1][GRADIENT_HOURS], 1.0, "entry 24 = entry 0");
+        let c = t.v[RgbTable::C as usize][1][3];
+        assert_eq!(c[0], 1.0);
+        assert!((c[1] - (128.0f32 / 255.0).powf(2.2)).abs() < 1e-5);
+        assert_eq!((c[2], c[3]), (0.0, 1.0));
+        assert_eq!(t.v[RgbTable::F as usize][0][0], [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(t.v[RgbTable::F as usize][0][24], [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn variant_weights_follow_the_precipitation_object() {
+        assert_eq!(variant_weights(0.5, 0.0), (0.5, 0.0));
+        assert_eq!(variant_weights(0.5, 1.0), (0.0, 0.5));
+        assert_eq!(variant_weights(0.0, 0.7), (0.0, 0.0));
+        let (w1, w2) = variant_weights(0.8, 0.25);
+        assert!((w1 - 0.6).abs() < 1e-6 && (w2 - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hours_interpolate_linearly_and_wrap_23_to_0() {
+        let mut t = GradientTables::parse(&blank_bmp()).unwrap();
+        t.s0[23] = 0.4;
+        t.s0[0] = 0.2;
+        t.s0[24] = 0.2;
+        assert!((t.s0_at(23.5) - 0.3).abs() < 1e-6);
+        assert!((t.s0_at(23.0) - 0.4).abs() < 1e-6);
+        assert!((t.s0_at(24.0) - 0.2).abs() < 1e-6, "24 wraps to 0");
+        assert!((t.s0_at(-0.5) - 0.3).abs() < 1e-6);
+        // variant blend: variant 0 -> 1 by w1, then toward 2 by w2
+        t.v[2][0][12] = [0.0, 0.0, 0.0, 1.0];
+        t.v[2][1][12] = [1.0, 1.0, 1.0, 1.0];
+        t.v[2][2][12] = [0.0, 0.5, 1.0, 1.0];
+        near3(t.rgb_blend(RgbTable::C, 12.0, 0.0, 0.0), [0.0; 3]);
+        near3(t.rgb_blend(RgbTable::C, 12.0, 0.5, 0.0), [0.5; 3]);
+        near3(t.rgb_blend(RgbTable::C, 12.0, 0.5, 0.5), [0.25, 0.5, 0.75]);
+    }
+
+    /// Probe values at 0/6/12/18 and 23.5 (clear weather, variant 0 unless noted; linear RGB).
+    #[test]
+    fn real_gradient_tables_match_the_probe() {
+        let Some(t) = tables() else { return };
+        assert!((t.s0_at(0.0) - 63.0 / 255.0).abs() < 1e-6);
+        assert!((t.s0_at(6.0) - 0.184_313_73).abs() < 1e-6);
+        assert_eq!(t.s0_at(12.0), 0.0);
+        assert!((t.s0_at(18.0) - 0.196_078_43).abs() < 1e-6);
+        assert!((t.s0_at(23.5) - 0.264_705_88).abs() < 1e-6, "hour 23.5 wraps");
+        assert_eq!(t.scalar_at(0, 0.0), 1.0);
+        assert!((t.scalar_at(0, 12.0) - 0.250_980_4).abs() < 1e-6);
+        assert!((t.scalar_blend(12.0, 1.0, 0.0) - 1.0).abs() < 1e-6, "variant 1 is 1.0");
+        // C = cloud lit, D = shaded
+        near3(t.rgb_at(RgbTable::C, 0, 12.0), [0.560_499, 0.547_993, 0.517_401]);
+        near3(t.rgb_at(RgbTable::D, 0, 12.0), [0.399_293, 0.388_91, 0.363_604]);
+        near3(t.rgb_at(RgbTable::C, 0, 6.0), [1.0, 0.302_125, 0.136_099]);
+        near3(t.rgb_at(RgbTable::C, 0, 18.0), [1.0, 0.388_91, 0.065_754]);
+        near3(t.rgb_at(RgbTable::D, 0, 0.0), [0.011_881, 0.018_913, 0.026_549]);
+        near3(t.rgb_at(RgbTable::A, 0, 12.0), [0.0, 0.320_382, 0.940_601]);
+        near3(t.rgb_at(RgbTable::B, 0, 6.0), [0.141_98, 0.157_281, 0.197_516]);
+        near3(t.rgb_at(RgbTable::E, 0, 12.0), [0.008_373, 0.130_352, 0.130_352]);
+        near3(t.rgb_at(RgbTable::F, 0, 0.0), [0.0, 0.026_549, 0.044_553]);
+        // variants 1 and 2, and the 23.5 wrap
+        near3(t.rgb_at(RgbTable::A, 1, 6.0), [0.080_219, 0.082_414, 0.096_266]);
+        near3(t.rgb_at(RgbTable::C, 1, 12.0), [0.015_175; 3]);
+        near3(t.rgb_at(RgbTable::C, 0, 23.5), [0.100_115; 3]);
+        near3(t.rgb_at(RgbTable::A, 2, 23.5), [0.035_629, 0.042_219, 0.046_962]);
+        // the probe's variant mix of C: 12:00 with (w1, w2) = (0.5, 0.25), and 23.5
+        near3(
+            t.rgb_blend(RgbTable::C, 12.0, 0.5, 0.25),
+            [0.356_003, 0.348_187, 0.329_067],
+        );
+        near3(t.rgb_blend(RgbTable::C, 23.5, 0.3, 0.6), [0.089_922; 3]);
+        // gradients.bmp is 1640 bytes (probe BMP_SHA256 b66bf510...)
+        let fs = game().unwrap();
+        assert_eq!(fs.read_inflated(GRADIENTS_FILE).unwrap().len(), 1640);
     }
 }

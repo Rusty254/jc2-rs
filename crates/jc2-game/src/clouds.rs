@@ -584,7 +584,9 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
 }
 
 /// Tint of the clouds at an hour (sRGB): white by day, the sun's colour when it is low,
-/// a dark blue by night; and how bright the cirrus is.
+/// a dark blue by night; and how bright the cirrus is. **Non-native** project policy: used
+/// for the cirrus layer always, and for the cumulus cards only when `gradients.bmp` could not
+/// be read (otherwise their tint is the native lit colour, table `C`, `atmosphere.rs`).
 pub fn cloud_tint(st: &SkyState, cirrus: bool) -> Vec3 {
     let day = st.daylight;
     let low = 1.0 - smoothstep(4.0, 26.0, st.sun_elevation);
@@ -604,6 +606,7 @@ fn update_sky(
     mut commands: Commands,
     time: Res<TimeOfDay>,
     data: Res<SkyData>,
+    atmosphere: Option<Res<crate::atmosphere::AtmosphereState>>,
     assets: Option<ResMut<SkyAssets>>,
     cams: Query<&GlobalTransform, With<Camera3d>>,
     old_moon: Query<Entity, With<MoonDisc>>,
@@ -723,8 +726,14 @@ fn update_sky(
     if let Some(h) = &assets.cloud_material
         && let Some(mut m) = sprites.get_mut(h)
     {
-        let c = cloud_tint(&st, false);
-        m.base.base_color = Color::srgba(c.x, c.y, c.z, 1.0);
+        m.base.base_color = match atmosphere.as_deref() {
+            // native: the card's lit colour is table C (variant-weighted, linear RGB)
+            Some(a) if a.loaded => Color::linear_rgb(a.cloud_lit.x, a.cloud_lit.y, a.cloud_lit.z),
+            _ => {
+                let c = cloud_tint(&st, false);
+                Color::srgba(c.x, c.y, c.z, 1.0)
+            }
+        };
     }
     if let Some(h) = &assets.cirrus_material
         && let Some(mut m) = sprites.get_mut(h)

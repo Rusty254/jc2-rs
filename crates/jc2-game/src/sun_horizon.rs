@@ -30,6 +30,7 @@
 //! (sun_factor - 1)` for the directional light `is_sun` selects (see `sun_correction` in
 //! `terrain_splat.wgsl`).
 
+use crate::atmosphere::AtmosphereState;
 use crate::sky::Sun;
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -200,8 +201,15 @@ fn clamp_linear() -> ImageSampler {
 
 /// Recompute the constants from the Sun's direction (its light points along `-back`), and
 /// rewrite the buffer only when they changed.
+///
+/// At night the single light has flipped to the moon's side (`sky.rs`), so its direction is
+/// no longer the sun's: the true (pre-flip) sun vector comes from [`AtmosphereState`] and the
+/// flip, `k` squared and the floor are applied here as native does; only the light-matching
+/// vector (`sun.xyz`, what `is_sun` compares) is the light's actual direction. Without an
+/// [`AtmosphereState`] the light's own direction is taken as the sun's (the old behaviour).
 pub fn update_horizon(
     horizon: Option<Res<HorizonShadow>>,
+    atmosphere: Option<Res<AtmosphereState>>,
     sun: Query<&Transform, With<Sun>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut last: Local<Option<SunHorizon>>,
@@ -212,7 +220,12 @@ pub fn update_horizon(
     if !horizon.enabled {
         return;
     }
-    let now = SunHorizon::from_sun_direction(sun.back().as_vec3());
+    let light_dir = sun.back().as_vec3();
+    let mut now = SunHorizon::from_sun_direction(match &atmosphere {
+        Some(a) => a.sun_dir,
+        None => light_dir,
+    });
+    now.sun = light_dir.extend(now.sun.w);
     if *last == Some(now) {
         return;
     }

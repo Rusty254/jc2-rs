@@ -14,8 +14,18 @@
 //!   fog colour. The sun's light, the ambient light and the fog distance are mine (the
 //!   data files only carry the sky colours): see `weather.md`.
 //! * Two unlit discs mark the sun and the moon far away.
+//! * **One** directional light (the [`Sun`] entity), as in the exe (`FUN_00a58a00`): when the
+//!   sun is below the horizon its direction is negated, so the same light now comes from the
+//!   moon's side (`light-tables-next.md` section 5). The flip has no colour attenuation
+//!   term, only the 0.15 shadow floor (`sun_horizon.rs`). **Non-native:** the light's colour
+//!   and illuminance (sun/moon lux, ambient, fill, night dimming) are project policy; the
+//!   native sun/moon colour and ambients are driven by `gamezone_gradients.bmp` (JC2-115),
+//!   not yet implemented.
 
 use crate::Game;
+use crate::atmosphere::{
+    AtmosphereState, GradientData, load_gradients, scale_point_lights, update_atmosphere,
+};
 use crate::coords::to_bevy;
 use bevy::light::CascadeShadowConfigBuilder;
 use bevy::pbr::{DistanceFog, FogFalloff};
@@ -106,8 +116,6 @@ pub struct SkyData(pub Option<Atmosphere>);
 
 #[derive(Component)]
 pub struct Sun;
-#[derive(Component)]
-pub struct Moon;
 /// The soft fill light opposite the sun.
 #[derive(Component)]
 pub struct Fill;
@@ -125,8 +133,12 @@ pub struct SkyState {
     pub sun_dir: Vec3,
     pub moon_dir: Vec3,
     pub sun_elevation: f32,
-    pub sun_lux: f32,
     pub sun_colour: Vec3,
+    /// The single directional light: towards the sun by day, the negated vector (the moon's
+    /// side) once the sun is below the horizon (native flip). Colour and lux are non-native.
+    pub light_dir: Vec3,
+    pub light_lux: f32,
+    pub light_colour: Vec3,
     pub fill_lux: f32,
     pub fill_dir: Vec3,
     pub moon_lux: f32,
@@ -176,6 +188,19 @@ impl SkyState {
         let sky = NIGHT_SKY.lerp(day_sky, sky_w);
 
         let sun_dir = to_bevy(sun);
+        // native: L = -sun; if L.y > 0 (sun below the horizon) L = -L
+        let light_dir = if sun_dir.y < 0.0 { -sun_dir } else { sun_dir };
+        let sun_colour = SUN_LOW.lerp(SUN_HIGH, smoothstep(0.0, 22.0, e));
+        let sun_lux = SUN_LUX * sun_ext;
+        // NON-NATIVE night policy: the moon side's illuminance, seen at the flipped light's
+        // elevation (-e), added to what is left of the sun's
+        let night_lux = MOON_LUX * (1.0 - smoothstep(-6.0, 6.0, e)) * smoothstep(-2.0, 12.0, -e);
+        let light_lux = sun_lux + night_lux;
+        let light_colour = if light_lux > 0.0 {
+            (sun_colour * sun_lux + MOON_COLOUR * night_lux) / light_lux
+        } else {
+            sun_colour
+        };
         // the fill comes from the other side of the sky, low
         let flat = Vec3::new(-sun_dir.x, 0.0, -sun_dir.z).normalize_or(Vec3::X);
         let (sin_e, cos_e) = 19.0_f32.to_radians().sin_cos();
@@ -185,8 +210,10 @@ impl SkyState {
             sun_dir,
             moon_dir: to_bevy(moon),
             sun_elevation: e,
-            sun_lux: SUN_LUX * sun_ext,
-            sun_colour: SUN_LOW.lerp(SUN_HIGH, smoothstep(0.0, 22.0, e)),
+            sun_colour,
+            light_dir,
+            light_lux,
+            light_colour,
             fill_lux: FILL_LUX * ambient_w,
             fill_dir,
             moon_lux: MOON_LUX * (1.0 - smoothstep(-6.0, 6.0, e)) * smoothstep(-2.0, 12.0, moon_e),
@@ -219,11 +246,22 @@ impl Plugin for SkyPlugin {
                 paused: false,
             })
             .init_resource::<SkyData>()
+            .init_resource::<GradientData>()
+            .init_resource::<AtmosphereState>()
             .init_resource::<ClearColor>()
-            .add_systems(Startup, (load_sky_data, spawn_sky).chain())
+            .add_systems(Startup, (load_sky_data, load_gradients, spawn_sky).chain())
             .add_systems(
                 Update,
-                (clock_keys, tick_clock, apply_sky, follow_camera, clock_text).chain(),
+                (
+                    clock_keys,
+                    tick_clock,
+                    update_atmosphere,
+                    scale_point_lights,
+                    apply_sky,
+                    follow_camera,
+                    clock_text,
+                )
+                    .chain(),
             );
     }
 }
@@ -249,12 +287,12 @@ fn spawn_sky(
         Sun,
         Name::new("sun"),
         DirectionalLight {
-            illuminance: st.sun_lux,
-            color: colour(st.sun_colour),
+            illuminance: st.light_lux,
+            color: colour(st.light_colour),
             shadow_maps_enabled: cfg.sun_shadows,
             ..default()
         },
-        Transform::default().looking_to(-st.sun_dir, Vec3::Y),
+        Transform::default().looking_to(-st.light_dir, Vec3::Y),
     ));
     if cfg.sun_shadows {
         sun.insert(
@@ -268,17 +306,6 @@ fn spawn_sky(
             .build(),
         );
     }
-    commands.spawn((
-        Moon,
-        Name::new("moon"),
-        DirectionalLight {
-            illuminance: st.moon_lux,
-            color: colour(MOON_COLOUR),
-            shadow_maps_enabled: false,
-            ..default()
-        },
-        Transform::default().looking_to(-st.moon_dir, Vec3::Y),
-    ));
     commands.spawn((
         Fill,
         Name::new("sky fill"),
@@ -362,20 +389,15 @@ fn apply_sky(
     time: Res<TimeOfDay>,
     data: Res<SkyData>,
     mut clear: ResMut<ClearColor>,
-    mut sun: LightQuery<(With<Sun>, Without<Moon>, Without<Fill>)>,
-    mut moon: LightQuery<(With<Moon>, Without<Sun>, Without<Fill>)>,
-    mut fill: LightQuery<(With<Fill>, Without<Sun>, Without<Moon>)>,
+    mut sun: LightQuery<(With<Sun>, Without<Fill>)>,
+    mut fill: LightQuery<(With<Fill>, Without<Sun>)>,
     mut cams: Query<(&mut AmbientLight, &mut DistanceFog), With<Camera3d>>,
 ) {
     let st = SkyState::at(time.hours, data.0.as_ref());
     for (mut l, mut tf) in &mut sun {
-        l.illuminance = st.sun_lux;
-        l.color = colour(st.sun_colour);
-        *tf = Transform::default().looking_to(-st.sun_dir, Vec3::Y);
-    }
-    for (mut l, mut tf) in &mut moon {
-        l.illuminance = st.moon_lux;
-        *tf = Transform::default().looking_to(-st.moon_dir, Vec3::Y);
+        l.illuminance = st.light_lux;
+        l.color = colour(st.light_colour);
+        *tf = Transform::default().looking_to(-st.light_dir, Vec3::Y);
     }
     for (mut l, mut tf) in &mut fill {
         l.illuminance = st.fill_lux;
@@ -491,9 +513,9 @@ mod tests {
     }
 
     struct Look {
+        /// Height of the single light's direction (towards the light).
         sun_up: f32,
         sun_lux: f32,
-        moon_lux: f32,
         ambient: f32,
         clear: Vec3,
     }
@@ -506,17 +528,11 @@ mod tests {
             .unwrap();
         let sun_up = -sun_tf.forward().y;
         let sun_lux = sun_l.illuminance;
-        let moon_lux = w
-            .query_filtered::<&DirectionalLight, With<Moon>>()
-            .single(w)
-            .unwrap()
-            .illuminance;
         let ambient = w.query::<&AmbientLight>().single(w).unwrap().brightness;
         let c = w.resource::<ClearColor>().0.to_srgba();
         Look {
             sun_up,
             sun_lux,
-            moon_lux,
             ambient,
             clear: Vec3::new(c.red, c.green, c.blue),
         }
@@ -531,25 +547,43 @@ mod tests {
     }
 
     #[test]
-    fn sun_is_high_at_noon_and_gone_at_midnight() {
+    fn one_light_is_the_sun_by_day_and_the_moon_side_at_night() {
         let mut a = app(10.0, 1.0);
         let noon = at(&mut a, 12.0);
         assert!(noon.sun_up > 0.6, "sun height {}", noon.sun_up);
         assert!(noon.sun_lux > 8_000.0, "{}", noon.sun_lux);
-        assert!(noon.moon_lux < 1.0);
+        // the single sun/moon light and the sky fill: no separate Moon light
+        let w = a.world_mut();
+        assert_eq!(w.query::<&DirectionalLight>().iter(w).count(), 2);
+        // midnight: the sun is 32 degrees below the horizon, so the light is the negated
+        // sun vector (above the horizon on the moon's side), dim but not black
         let midnight = at(&mut a, 0.0);
-        assert!(midnight.sun_up < -0.4, "sun height {}", midnight.sun_up);
-        assert_eq!(midnight.sun_lux, 0.0);
-        assert!(midnight.moon_lux > 100.0, "{}", midnight.moon_lux);
-        // night is far darker: light (the moon is dimmer than the sun by a few times, as
-        // the game shows it), ambient and sky
-        let day_light = noon.sun_lux + noon.moon_lux;
-        let night_light = midnight.sun_lux + midnight.moon_lux;
-        assert!(night_light < day_light / 3.0);
+        let sun_below = SkyState::at(0.0, None).sun_dir;
+        assert!(sun_below.y < -0.4);
+        assert!(midnight.sun_up > 0.4, "light height {}", midnight.sun_up);
+        assert!((midnight.sun_up + sun_below.y).abs() < 1e-3, "negated sun vector");
+        assert!(midnight.sun_lux > 100.0, "{}", midnight.sun_lux);
+        // night is far darker (non-native project policy: light, ambient and sky)
+        assert!(midnight.sun_lux < noon.sun_lux / 3.0);
         assert!(midnight.ambient < noon.ambient / 4.0);
         assert!(midnight.clear.length() < noon.clear.length() / 10.0);
         // the noon sky is the colour the world always had
         assert!((noon.clear - NOON_SKY).length() < 0.02, "{:?}", noon.clear);
+    }
+
+    /// The flip happens where the sun crosses the horizon and only negates the vector.
+    #[test]
+    fn the_light_flips_when_the_sun_height_goes_negative() {
+        for hour in [0.0, 3.0, 5.0, 19.0, 22.0] {
+            let st = SkyState::at(hour, None);
+            assert!(st.sun_dir.y < 0.0);
+            assert!((st.light_dir + st.sun_dir).length() < 1e-5, "{hour}");
+        }
+        for hour in [6.5, 9.0, 12.0, 17.0] {
+            let st = SkyState::at(hour, None);
+            assert!(st.sun_dir.y > 0.0);
+            assert!((st.light_dir - st.sun_dir).length() < 1e-5, "{hour}");
+        }
     }
 
     /// The morning sun comes up in the east, which is +x (the map's right, `coords.rs`),
@@ -575,7 +609,9 @@ mod tests {
         let dusk = at(&mut a, 18.5);
         let noon = at(&mut a, 12.0);
         let night = at(&mut a, 23.0);
-        assert!(dusk.sun_lux < noon.sun_lux / 2.0 && dusk.sun_lux > night.sun_lux);
+        // the single light is the (nearly set) sun here; the night's moon-side light
+        // (non-native policy) is steady, so only the sky colour is ordered across all three
+        assert!(dusk.sun_lux < noon.sun_lux / 2.0 && night.sun_lux < noon.sun_lux / 3.0);
         assert!(dusk.clear.length() < noon.clear.length());
         assert!(dusk.clear.length() > night.clear.length());
     }

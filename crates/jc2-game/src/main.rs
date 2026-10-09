@@ -30,6 +30,7 @@
 
 mod ammo;
 mod archive_source;
+mod atmosphere;
 mod audio;
 mod audio_dsp;
 mod bitmap_text;

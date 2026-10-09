@@ -984,13 +984,17 @@ fn spawn_flash(
             bevy::light::NotShadowCaster,
             Name::new("muzzle flash"),
         ))
-        .with_child(PointLight {
-            color: Color::srgb(1.0, 0.75, 0.4),
-            intensity: 40_000.0,
-            range: 8.0,
-            shadow_maps_enabled: false,
-            ..default()
-        })
+        .with_child((
+            PointLight {
+                color: Color::srgb(1.0, 0.75, 0.4),
+                intensity: 40_000.0,
+                range: 8.0,
+                shadow_maps_enabled: false,
+                ..default()
+            },
+            // scaled each frame by the native per-hour point-light factor (atmosphere.rs)
+            crate::atmosphere::PointLightBase(40_000.0),
+        ))
         .id();
     if let Some((gun, _)) = mount {
         commands.entity(flash).insert(ChildOf(gun));

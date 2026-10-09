@@ -269,6 +269,7 @@ pub(crate) fn detonate(
 fn fireballs(
     mut commands: Commands,
     time: Res<Time>,
+    atmosphere: Option<Res<crate::atmosphere::AtmosphereState>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut q: Query<(Entity, &mut Fireball, &mut Transform, &mut PointLight)>,
 ) {
@@ -276,7 +277,10 @@ fn fireballs(
         f.age += time.delta_secs();
         let t = (f.age / FIREBALL_SECONDS).min(1.0);
         tf.scale = Vec3::splat(f.radius * (0.3 + 0.7 * (1.0 - (1.0 - t).powi(3))));
-        light.intensity = 4.0e7 * (1.0 - t).powi(2);
+        // native point-light colour scale S (1.0 at night, 0.25 by day); the unknown
+        // CRenderEngine+0x830 factor is taken as 1 (atmosphere.rs)
+        let scale = atmosphere.as_ref().map_or(1.0, |a| a.point_light_factor());
+        light.intensity = 4.0e7 * (1.0 - t).powi(2) * scale;
         if let Some(mut m) = materials.get_mut(&f.material) {
             m.base_color.set_alpha(0.9 * (1.0 - t));
             m.emissive = LinearRgba::rgb(30.0, 12.0, 2.0) * (1.0 - t);
