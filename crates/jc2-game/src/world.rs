@@ -18,6 +18,8 @@ use crate::vehicle::CameraMode;
 use avian3d::prelude::{Collider, RigidBody};
 use bevy::asset::LoadState;
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::Exposure;
+use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::{DistanceFog, FogFalloff};
@@ -1176,6 +1178,13 @@ pub(crate) fn setup(
         }),
         tf,
         cam,
+        // the native final chain (`post_effects.rs`): an 8-bit sRGB scene target (no HDR),
+        // no tone-mapping curve and no dither (the exe has neither), the camera exposure the
+        // light units are derived from (`sky_light.rs`), and the final pass
+        Tonemapping::None,
+        DebandDither::Disabled,
+        Exposure::BLENDER,
+        crate::post_effects::PostPass::default(),
         AmbientLight {
             color: Color::srgb(0.70, 0.80, 1.0),
             brightness: 140.0,

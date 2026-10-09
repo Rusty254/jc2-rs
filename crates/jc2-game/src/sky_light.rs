@@ -33,15 +33,32 @@
 //! * Without the files every value is the exe initialiser's 1.0 (`FUN_00a58640`), the state
 //!   before the first gradient update.
 //!
-//! **Units are non-native.** Native colours are HDR multipliers of the albedo (sun up to
-//! 5.667); Bevy wants absolute illuminance. [`LUX_PER_UNIT`] is the single scale: the sun is
-//! `colour / max * LUX_PER_UNIT * max` lux, and the ambient uses the same scale divided by
-//! pi ([`AMBIENT_PER_UNIT`]) because Bevy's diffuse BRDF carries the `1 / pi` that the native
-//! `C * (sun * N.L + ambient)` does not, which keeps the native sun : ambient ratio.
+//! **Units: the exposure identity (JC2-134; brief `night-exposure-next.md` sections 4 and 5).**
+//! The native pixel is `sqrt(clamp01(albedo * (sun N.L shadow + ambient + points)) * A * tint)`
+//! after the post mix: native colour unit 1.0 is display white. Bevy lights are absolute
+//! (lux, ambient brightness) and the camera multiplies the lit colour by its exposure `e0`.
+//! Bevy 0.19.1 (checked in the registry source, `bevy_camera::Exposure::exposure` and
+//! `bevy_pbr` `pbr_lighting.wgsl` / `pbr_functions.wgsl` / `render/light.rs`):
+//!
+//! * `e0 = exp2(-ev100) / 1.2` (default [`Exposure::BLENDER`], ev100 9.7, `e0` = 1.0019e-3);
+//! * the final lit colour is `e0 * (direct + indirect + ...)`, with the directional diffuse
+//!   term `albedo * (1 / pi) * lux * N.L` (`Fd_Burley` ends in `1 / PI`) and the ambient
+//!   term `albedo * ambient colour * brightness` (no `1 / pi`).
+//!
+//! So a native sun colour `S` and ambient colour `Amb` reproduce the native product when
+//! `lux = S * pi / e0` ([`lux_per_unit`]) and `brightness = Amb / e0` ([`ambient_per_unit`]);
+//! the camera exposure is unchanged (Bevy's default), only the light units are derived from it.
+//! This replaces the former policy scale 1,770 (JC2-122), which rendered about 0.565x of the
+//! native brightness. **The identity is native; the camera's `e0` is Bevy's own choice and any
+//! value gives the same picture as long as the lights use this scale.** What it does not give
+//! by itself: the clamp at 1.0 and the `sqrt` encode (the post pass, `post_effects.rs`), the
+//! tint and saturation blocks, and `A` (auto-exposure, JC2-134 phase 2). Point lights
+//! (`PointLightBase`), the fog and the sky colour keep their project-tuned (non-native) units.
 
 use crate::Game;
 use crate::sky::TimeOfDay;
 use crate::world::Streamer;
+use bevy::camera::Exposure;
 use bevy::prelude::*;
 use jc2_formats::terrain::{GAMEZONE_RESET_BYTE, GameZoneCell, zone_cell};
 use jc2_formats::weather::{
@@ -49,13 +66,22 @@ use jc2_formats::weather::{
     ZONE_TYPE_DEFAULT, sun_colour_transform,
 };
 
-/// **Policy, not native:** Bevy lux per unit of native sun colour. Chosen so the noon `Default`
-/// sun (luminance 5.085 with the scene shader weights) gives 9,000 lux, the noon sun the
-/// project used before the native tables (`sky.rs`, `SUN_LUX`): 9,000 / 5.085 = 1,770.
-pub const LUX_PER_UNIT: f32 = 1_770.0;
-/// **Policy, derived from [`LUX_PER_UNIT`]:** Bevy `AmbientLight` brightness per unit of native
-/// ambient colour (`/ pi`, see the module comment).
-pub const AMBIENT_PER_UNIT: f32 = LUX_PER_UNIT / std::f32::consts::PI;
+/// The exposure `e0` of the game camera: Bevy's default [`Exposure::BLENDER`], written
+/// explicitly on the camera (`world.rs`) so the light scale below cannot drift from it.
+pub fn camera_exposure() -> f32 {
+    Exposure::BLENDER.exposure()
+}
+
+/// Bevy lux per unit of native sun colour: `pi / e0` (module comment). **Native identity.**
+pub fn lux_per_unit() -> f32 {
+    std::f32::consts::PI / camera_exposure()
+}
+
+/// Bevy `AmbientLight` brightness per unit of native ambient colour: `1 / e0`.
+/// **Native identity.**
+pub fn ambient_per_unit() -> f32 {
+    1.0 / camera_exposure()
+}
 
 /// The zone set used until the game zone map is found: gradient set 7, `Default`
 /// (**non-native** stand-in).
@@ -119,13 +145,13 @@ impl LightState {
             .lerp(self.sky_ambient, (n_y * 0.5 + 0.5).clamp(0.0, 1.0))
     }
 
-    /// The Bevy light values for this state (units: non-native, see the module comment).
+    /// The Bevy light values for this state (units: the exposure identity, see the module comment).
     pub fn to_bevy(self) -> BevyLights {
         // colour / max with illuminance = max * scale keeps the HDR colour exactly
         let m = self.sun.max_element();
         let (sun_color, sun_illuminance) = if m > 0.0 {
             let c = self.sun / m;
-            (Color::linear_rgb(c.x, c.y, c.z), m * LUX_PER_UNIT)
+            (Color::linear_rgb(c.x, c.y, c.z), m * lux_per_unit())
         } else {
             (Color::BLACK, 0.0)
         };
@@ -135,7 +161,7 @@ impl LightState {
         let a = mid.max_element();
         let (ambient_color, ambient_brightness) = if a > 0.0 {
             let c = mid / a;
-            (Color::linear_rgb(c.x, c.y, c.z), a * AMBIENT_PER_UNIT)
+            (Color::linear_rgb(c.x, c.y, c.z), a * ambient_per_unit())
         } else {
             (Color::BLACK, 0.0)
         };
@@ -144,7 +170,7 @@ impl LightState {
             sun_illuminance,
             ambient_color,
             ambient_brightness,
-            ambient_tilt: (self.sky_ambient - self.ground_ambient) * (0.5 * AMBIENT_PER_UNIT),
+            ambient_tilt: (self.sky_ambient - self.ground_ambient) * (0.5 * ambient_per_unit()),
         }
     }
 }
@@ -388,7 +414,7 @@ mod tests {
         l.step(None, 3.0, 0.016);
         assert_eq!(l.state, CONSTRUCTOR);
         let b = l.bevy();
-        assert_eq!(b.sun_illuminance, LUX_PER_UNIT);
+        assert_eq!(b.sun_illuminance, lux_per_unit());
         assert_eq!(b.ambient_tilt, Vec3::ZERO);
     }
 
@@ -556,15 +582,15 @@ mod tests {
         };
         let b = s.to_bevy();
         let c = b.sun_color.to_linear();
-        let back = Vec3::new(c.red, c.green, c.blue) * (b.sun_illuminance / LUX_PER_UNIT);
+        let back = Vec3::new(c.red, c.green, c.blue) * (b.sun_illuminance / lux_per_unit());
         assert!((back - s.sun).abs().max_element() < 1e-4, "{back:?}");
-        assert!((b.sun_illuminance - 5.667 * LUX_PER_UNIT).abs() < 1e-2);
+        assert!((b.sun_illuminance - 5.667 * lux_per_unit()).abs() < 1e-1);
         // uniform ambient + tilt * N.y reproduces lerp(cb0[11], cb0[10], N.y / 2 + 1/2)
         let a = b.ambient_color.to_linear();
         let uniform = Vec3::new(a.red, a.green, a.blue) * b.ambient_brightness;
         for n_y in [-1.0_f32, -0.3, 0.0, 0.6, 1.0] {
             let got = uniform + b.ambient_tilt * n_y;
-            let want = s.hemisphere(n_y) * AMBIENT_PER_UNIT;
+            let want = s.hemisphere(n_y) * ambient_per_unit();
             assert!(
                 (got - want).abs().max_element() < 1e-2,
                 "{n_y}: {got:?} vs {want:?}"
@@ -580,14 +606,42 @@ mod tests {
         assert_eq!((z.sun_illuminance, z.ambient_brightness), (0.0, 0.0));
     }
 
-    /// Noon `Default` must stay comparable to the project's former noon sun (9,000 lux).
+    /// The exposure identity (module comment): Bevy's diffuse light `albedo / pi * lux * N.L * e0`
+    /// and ambient `albedo * brightness * e0` give the native `albedo * (S * N.L + Amb)`.
     #[test]
-    fn the_scale_puts_noon_default_near_the_former_sun() {
+    fn the_exposure_identity_reproduces_the_native_product() {
+        let e0 = camera_exposure();
+        // Bevy 0.19.1: exp2(-ev100) / 1.2 at ev100 9.7
+        let expected = 2.0_f32.powf(-9.7) / 1.2;
+        assert!((e0 - expected).abs() < 1e-9, "{e0} vs {expected}");
+        assert!((e0 - 1.0019e-3).abs() < 2e-7, "{e0}");
+        assert!((lux_per_unit() - std::f32::consts::PI / e0).abs() < 1.0);
+        assert!((ambient_per_unit() - 1.0 / e0).abs() < 1e-1);
+        // the brief's rounded values: about 3,135 lux and 998 per unit
+        assert!(
+            (lux_per_unit() - 3_135.0).abs() < 10.0,
+            "{}",
+            lux_per_unit()
+        );
+        assert!(
+            (ambient_per_unit() - 998.0).abs() < 4.0,
+            "{}",
+            ambient_per_unit()
+        );
+        // one native unit of sun at N.L = 1 and albedo a gives a * 1.0 after exposure
+        let (albedo, n_dot_l, sun, amb) = (0.4_f32, 0.7_f32, 2.0_f32, 0.3_f32);
+        let bevy = albedo / std::f32::consts::PI * (sun * lux_per_unit()) * n_dot_l * e0
+            + albedo * (amb * ambient_per_unit()) * e0;
+        let native = albedo * (sun * n_dot_l + amb);
+        assert!((bevy - native).abs() < 1e-5, "{bevy} vs {native}");
+        // the native sun : ambient ratio of the earlier policy is kept (lux = pi * ambient scale)
+        assert!((lux_per_unit() / ambient_per_unit() - std::f32::consts::PI).abs() < 1e-4);
+        // noon Default: sun luminance 5.085 -> 15.9 klux, the native product and not the old 9,000
         let Some(g) = retail() else { return };
         let b = light_state(&g, 7, 3.0, 12.0).to_bevy();
         let c = b.sun_color.to_linear();
         let lux = Vec3::new(c.red, c.green, c.blue) * b.sun_illuminance;
         let lum = lux.dot(Vec3::new(0.2125, 0.7154, 0.0721));
-        assert!((lum - 9_000.0).abs() < 100.0, "{lum}");
+        assert!((lum / lux_per_unit() - 5.085).abs() < 0.01, "{lum}");
     }
 }

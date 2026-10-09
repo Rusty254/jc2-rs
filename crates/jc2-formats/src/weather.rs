@@ -762,6 +762,241 @@ pub fn parse_clock(s: &str) -> Option<f32> {
     (0.0..=24.0).contains(&h).then_some(h % 24.0)
 }
 
+// ------------------------------------------------------------------------------------------
+// The hour-dependent post-effect blocks (JC2-124 brief `night-exposure-next.md` section 2;
+// JC2-134). `settings\landscape_effects.bin`, container `post_effects` (hash `d69d4965`).
+// ------------------------------------------------------------------------------------------
+
+/// The size of the post-effect manager's setting array `S(n)` (the floats at `P + 0x44 + 4 n`).
+/// A block fills `S0..=S17`, `S25`, `S26`; the rest stay 0 (keys absent from the file).
+pub const POST_SETTINGS: usize = 27;
+
+/// Setting indices of the keys the blocks carry (brief section 2.2; the block parser
+/// `FUN_0091a970`, the settings loader `FUN_0096f920` and the writer `FUN_0091d160` agree).
+pub mod post {
+    /// HighPass saturation mix.
+    pub const HIGHPASS_SATURATION: usize = 0;
+    /// HighPass exponent.
+    pub const HIGHPASS_EXPONENT: usize = 1;
+    /// Overlay strength, bright branch.
+    pub const OVERLAY_BRIGHT: usize = 2;
+    /// Overlay strength, dark branch.
+    pub const OVERLAY_DARK: usize = 3;
+    /// `blur`: blur blend.
+    pub const BLUR: usize = 4;
+    /// Depth-of-field far focus start (m).
+    pub const DOF_FAR: usize = 5;
+    /// Depth-of-field near focus (0 = off).
+    pub const DOF_NEAR: usize = 6;
+    /// Exposure offset + 1 (`cb1[2].x = S7 - 1`).
+    pub const EXPOSURE_ONE: usize = 7;
+    /// Auto-exposure x (weight of the darkest tap).
+    pub const AUTO_X: usize = 8;
+    /// Auto-exposure y (strength).
+    pub const AUTO_Y: usize = 9;
+    /// Auto-exposure key.
+    pub const AUTO_KEY: usize = 10;
+    /// Tint R.
+    pub const TINT_R: usize = 11;
+    /// Tint G.
+    pub const TINT_G: usize = 12;
+    /// Tint B.
+    pub const TINT_B: usize = 13;
+    /// `saturation`: saturation clamp end.
+    pub const SATURATION_END: usize = 14;
+    /// Saturation offset.
+    pub const SATURATION_OFFSET: usize = 15;
+    /// Saturation slope against luminance.
+    pub const SATURATION_SLOPE: usize = 16;
+    /// The other clamp end of the saturation factor.
+    pub const SATURATION_OTHER_END: usize = 17;
+    /// Depth-of-field blend gain.
+    pub const DOF_GAIN: usize = 25;
+    /// Heat-haze selector.
+    pub const HEAT_HAZE: usize = 26;
+}
+
+/// A block of post-effect settings indexed by `S(n)`.
+pub type PostBlock = [f32; POST_SETTINGS];
+
+const PE_CONTAINER: &str = "post_effects";
+const PE_NIGHT: u32 = 0x0a10_a074;
+const PE_DAY: u32 = 0x0a48_aa9b;
+const PE_HOURS: u32 = 0x9623_2764;
+/// The four hour thresholds, in order 4.5, 5.5, 18.5, 19.5.
+const PE_HOUR_KEYS: [u32; 4] = [0xf10e_7ec1, 0x2201_37a5, 0x88d3_6ba1, 0xf56f_fcb7];
+/// The per-zone override container's gradient-set key and its four slot containers
+/// (slot 1 and 2 patch the day pair, 3 and 4 the night pair).
+const PE_ZONE_SET: u32 = 0x5767_7bdc;
+const PE_SLOTS: [u32; 4] = [0x8eba_4969, 0x2e67_4fd1, 0xde6c_5fe4, 0x1eeb_7740];
+/// Key hash of each setting `S(n)` (brief section 2.2). `blur` and `saturation` are names
+/// whose hashes are `0xc07a98af` and `0x8b639e1e` (test `post_effect_key_names_hash_as_the_brief_says`).
+const PE_KEYS: [(usize, u32); 20] = [
+    (0, 0x84a1_ec42),
+    (1, 0x1418_74c9),
+    (2, 0xb989_17f0),
+    (3, 0x2098_968f),
+    (4, 0xc07a_98af),
+    (5, 0xae11_0681),
+    (6, 0xb862_814f),
+    (7, 0x463e_ece2),
+    (8, 0xa4d3_1fce),
+    (9, 0x7772_4563),
+    (10, 0x566b_d67c),
+    (11, 0xab26_27cc),
+    (12, 0xe57d_0a03),
+    (13, 0x679d_ef2a),
+    (14, 0x8b63_9e1e),
+    (15, 0xcc44_e277),
+    (16, 0xfad8_9ab2),
+    (17, 0x15ba_5c5b),
+    (25, 0xbd54_de7b),
+    (26, 0x91fe_df25),
+];
+
+/// A zone's overrides: for the gradient set it names, single keys patched into slots 1..4
+/// of the set's blocks (`FUN_00a6a550`; slot 4 follows slot 3 by sequence, brief section 2.1).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PostZoneOverride {
+    /// The gradient set (key `#57677bdc`).
+    pub set: usize,
+    /// `(S index, value)` patches of slots 1, 2 (day) and 3, 4 (night).
+    pub slots: [Vec<(usize, f32)>; 4],
+}
+
+/// The night and day post-effect blocks of `settings\landscape_effects.bin`, the hour
+/// windows and the per-zone overrides. [`PostEffectBlocks::params`] is the exe's per-frame
+/// block selection and blend (`FUN_00a5e010`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PostEffectBlocks {
+    /// Block `#0a10a074`: before the first and from the last threshold.
+    pub night: PostBlock,
+    /// Block `#0a48aa9b`: between the second and third threshold.
+    pub day: PostBlock,
+    /// `#96232764`: 4.5, 5.5, 18.5, 19.5.
+    pub hours: [f32; 4],
+    pub overrides: Vec<PostZoneOverride>,
+}
+
+impl PostEffectBlocks {
+    pub fn load(fs: &GameFs) -> Result<Self> {
+        Self::parse(&fs.read_inflated(LANDSCAPE_EFFECTS_FILE)?)
+    }
+
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        let file = PropertyFile::parse_any(data)?;
+        let root = file
+            .nodes
+            .first()
+            .ok_or_else(|| crate::Error::format("landscape_effects.bin is empty"))?;
+        Self::from_root(root)
+    }
+
+    fn from_root(root: &Node) -> Result<Self> {
+        let missing = |what: &str| {
+            crate::Error::format(format!("landscape_effects.bin: missing or bad {what}"))
+        };
+        let post = root
+            .child(PE_CONTAINER)
+            .ok_or_else(|| missing("post_effects"))?;
+        let block = |h: u32, what: &str| -> Result<PostBlock> {
+            let node = child_by_hash(post, h).ok_or_else(|| missing(what))?;
+            let mut b = [0.0; POST_SETTINGS];
+            for (n, key) in PE_KEYS {
+                b[n] = num(node, key).ok_or_else(|| missing(what))?;
+            }
+            Ok(b)
+        };
+        let night = block(PE_NIGHT, "night block #0a10a074")?;
+        let day = block(PE_DAY, "day block #0a48aa9b")?;
+        let hours_node = child_by_hash(post, PE_HOURS).ok_or_else(|| missing("hours #96232764"))?;
+        let mut hours = [0.0; 4];
+        for (slot, key) in hours.iter_mut().zip(PE_HOUR_KEYS) {
+            *slot = num(hours_node, key).ok_or_else(|| missing("hour threshold"))?;
+        }
+        if !hours.windows(2).all(|w| w[0] < w[1]) {
+            return Err(missing("hour thresholds (not increasing)"));
+        }
+        let mut overrides = Vec::new();
+        for (_, zone) in &post.children {
+            let Some(set) = num(zone, PE_ZONE_SET) else {
+                continue; // the blocks and the hour container
+            };
+            let mut o = PostZoneOverride {
+                set: set as usize,
+                ..Default::default()
+            };
+            for (patch, slot_key) in o.slots.iter_mut().zip(PE_SLOTS) {
+                if let Some(slot) = child_by_hash(zone, slot_key) {
+                    for (n, key) in PE_KEYS {
+                        if let Some(v) = num(slot, key) {
+                            patch.push((n, v));
+                        }
+                    }
+                }
+            }
+            overrides.push(o);
+        }
+        Ok(Self {
+            night,
+            day,
+            hours,
+            overrides,
+        })
+    }
+
+    /// Slot `i` (0..4 = slots 1..4) of gradient `set`: the day (slots 1, 2) or night
+    /// (3, 4) block with the zone's patches applied.
+    fn slot(&self, set: usize, i: usize) -> PostBlock {
+        let mut b = if i < 2 { self.day } else { self.night };
+        for o in self.overrides.iter().filter(|o| o.set == set) {
+            for &(n, v) in &o.slots[i] {
+                b[n] = v;
+            }
+        }
+        b
+    }
+
+    /// The settings the exe applies at `hour` (0..24) for gradient `set` (`FUN_00a5e010`):
+    /// with `n` the number of thresholds `<= hour`, `n` in {2, 3} takes the day pair
+    /// (slot 2 weight `1 - w`, slot 1 weight `w`) and otherwise the night pair (slot 4,
+    /// slot 3); for odd `n` that is blended with the other pair across the window
+    /// (`t = (hour - T[n-1]) / (T[n] - T[n-1])`: dawn night to day, dusk day to night).
+    ///
+    /// `w` is the intensity weight (`intensity byte * Z[0x1a80 + set * 4]`); it is the
+    /// variant weight of [`LandscapeEffects::variant_weight`] here (**inferred**), and has
+    /// no effect in the shipped data because both slots of a pair are identical except in
+    /// set 8.
+    pub fn params(&self, set: usize, w: f32, hour: f32) -> PostBlock {
+        let pair = |day: bool| -> PostBlock {
+            let (hi, lo) = if day { (0, 1) } else { (2, 3) };
+            lerp_block(&self.slot(set, lo), &self.slot(set, hi), w.clamp(0.0, 1.0))
+        };
+        let n = self.hours.iter().filter(|&&t| t <= hour).count();
+        let day = n == 2 || n == 3;
+        let cur = pair(day);
+        if n == 1 || n == 3 {
+            let (lo, hi) = (self.hours[n - 1], self.hours[n]);
+            let t = ((hour - lo) / (hi - lo)).clamp(0.0, 1.0);
+            lerp_block(&cur, &pair(!day), t)
+        } else {
+            cur
+        }
+    }
+}
+
+/// A direct child container by key hash.
+fn child_by_hash(n: &Node, h: u32) -> Option<&Node> {
+    n.children
+        .iter()
+        .find(|(k, _)| k.hash() == h)
+        .map(|(_, c)| c)
+}
+
+fn lerp_block(a: &PostBlock, b: &PostBlock, t: f32) -> PostBlock {
+    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1286,5 +1521,223 @@ mod tests {
         }
         .to_bytes();
         assert!(LandscapeEffects::parse(&one).is_err());
+    }
+
+    // ---- post-effect blocks (JC2-134; fixtures: night_exposure_probe.py data checks) ----
+
+    use post::*;
+
+    fn retail_blocks() -> Option<PostEffectBlocks> {
+        let fs = game()?;
+        fs.contains(LANDSCAPE_EFFECTS_FILE).then(|| {
+            PostEffectBlocks::load(&fs).expect("landscape_effects.bin post_effects parses")
+        })
+    }
+
+    #[test]
+    fn post_effect_key_names_hash_as_the_brief_says() {
+        assert_eq!(crate::hash::hash_str("blur"), 0xc07a_98af);
+        assert_eq!(crate::hash::hash_str("saturation"), 0x8b63_9e1e);
+        assert_eq!(crate::hash::hash_str("post_effects"), 0xd69d_4965);
+    }
+
+    #[test]
+    fn retail_night_and_day_blocks_match_the_probe() {
+        let Some(b) = retail_blocks() else { return };
+        assert_eq!(b.hours, [4.5, 5.5, 18.5, 19.5]);
+        let n = &b.night;
+        // night #0a10a074: S8 0, S9 0.08, S10 0.32, S7 1, tint (1, 1, 1.6), S14 0.95, S15 0.6, S16 10, S17 0
+        assert_eq!((n[AUTO_X], n[AUTO_Y], n[AUTO_KEY]), (0.0, 0.08, 0.32));
+        assert_eq!(n[EXPOSURE_ONE], 1.0);
+        assert_eq!((n[TINT_R], n[TINT_G], n[TINT_B]), (1.0, 1.0, 1.6));
+        assert_eq!(
+            (
+                n[SATURATION_END],
+                n[SATURATION_OFFSET],
+                n[SATURATION_SLOPE],
+                n[SATURATION_OTHER_END]
+            ),
+            (0.95, 0.6, 10.0, 0.0)
+        );
+        assert_eq!((n[OVERLAY_BRIGHT], n[OVERLAY_DARK]), (0.1, 0.8));
+        assert_eq!((n[DOF_FAR], n[DOF_GAIN], n[BLUR]), (150.0, 0.3, 0.0));
+        let d = &b.day;
+        // day #0a48aa9b: S8 0.3, S9 0.1, S10 0.32, S7 1, tint (1,1,1), S14 1, S15 0.9, S16 -0.8, S17 1
+        assert_eq!((d[AUTO_X], d[AUTO_Y], d[AUTO_KEY]), (0.3, 0.1, 0.32));
+        assert_eq!(d[EXPOSURE_ONE], 1.0);
+        assert_eq!((d[TINT_R], d[TINT_G], d[TINT_B]), (1.0, 1.0, 1.0));
+        assert_eq!(
+            (
+                d[SATURATION_END],
+                d[SATURATION_OFFSET],
+                d[SATURATION_SLOPE],
+                d[SATURATION_OTHER_END]
+            ),
+            (1.0, 0.9, -0.8, 1.0)
+        );
+        assert_eq!((d[OVERLAY_BRIGHT], d[OVERLAY_DARK]), (0.1, 0.7));
+        assert_eq!((d[DOF_FAR], d[DOF_GAIN]), (120.0, 0.4));
+        // the settings that differ between the blocks (probe): S3, S5, S8, S9, S13..S17, S25
+        let diff: Vec<usize> = (0..POST_SETTINGS).filter(|&i| n[i] != d[i]).collect();
+        assert_eq!(diff, [3, 5, 8, 9, 13, 14, 15, 16, 17, 25]);
+    }
+
+    fn sorted(v: &[(usize, f32)]) -> Vec<(usize, f32)> {
+        let mut v = v.to_vec();
+        v.sort_by_key(|p| p.0);
+        v
+    }
+
+    #[test]
+    fn retail_overrides_are_the_probes() {
+        let Some(b) = retail_blocks() else { return };
+        let zone = |set: usize| b.overrides.iter().find(|o| o.set == set);
+        // City, Sea, Jungle, Grass and Default are present and empty
+        for set in [3, 4, 5, 6, 7] {
+            assert!(zone(set).unwrap().slots.iter().all(Vec::is_empty), "{set}");
+        }
+        let arctic = zone(1).unwrap();
+        let day = vec![
+            (OVERLAY_BRIGHT, 0.25),
+            (AUTO_Y, 0.04),
+            (TINT_B, 1.25),
+            (SATURATION_END, 0.9),
+        ];
+        let mut want = day;
+        want.sort_by_key(|p| p.0);
+        assert_eq!(sorted(&arctic.slots[0]), want);
+        assert_eq!(sorted(&arctic.slots[1]), want);
+        // night slots 3, 4: tint reset to (1, 1, 1)
+        let neutral = vec![(TINT_R, 1.0), (TINT_G, 1.0), (TINT_B, 1.0)];
+        assert_eq!(sorted(&arctic.slots[2]), neutral);
+        assert_eq!(sorted(&arctic.slots[3]), neutral);
+        let desert = zone(2).unwrap();
+        assert_eq!(desert.slots[0].len(), 12);
+        assert!(desert.slots[2].is_empty() && desert.slots[3].is_empty());
+        assert!(desert.slots[0].contains(&(HEAT_HAZE, 1.0)));
+        assert!(desert.slots[0].contains(&(DOF_FAR, 50.0)));
+        let water = zone(9).unwrap();
+        let want_water = vec![
+            (BLUR, 0.15),
+            (DOF_FAR, 8.0),
+            (TINT_B, 1.3),
+            (DOF_GAIN, 0.65),
+        ];
+        for slot in &water.slots {
+            assert_eq!(sorted(slot), want_water);
+        }
+        // height set 8: S5 150 in slots 2 and 4, 1500 in slots 1 and 3
+        let height = zone(8).unwrap();
+        assert_eq!(height.slots[0], [(DOF_FAR, 1500.0)]);
+        assert_eq!(height.slots[1], [(DOF_FAR, 150.0)]);
+        assert_eq!(height.slots[2], [(DOF_FAR, 1500.0)]);
+        assert_eq!(height.slots[3], [(DOF_FAR, 150.0)]);
+    }
+
+    /// The probe's hour model (`block_params`): night before 4:30 and from 19:30, day from
+    /// 5:30 to 18:30, linear 4:30..5:30 and 18:30..19:30; 5:00 and 19:00 are 50 % blends.
+    #[test]
+    fn the_hour_blend_follows_the_thresholds() {
+        let Some(b) = retail_blocks() else { return };
+        // a zone without overrides: Default, set 7
+        let at = |h: f32| b.params(7, 1.0, h);
+        for h in [0.0, 3.0, 4.0, 4.5] {
+            assert_eq!(at(h), b.night, "night at {h}");
+        }
+        for h in [5.5, 6.0, 12.0, 18.0, 18.5] {
+            assert_eq!(at(h), b.day, "day at {h}");
+        }
+        for h in [19.5, 21.0, 23.0, 23.99] {
+            assert_eq!(at(h), b.night, "night at {h}");
+        }
+        // 5:00 and 19:00: half way (probe: S9 0.09, S13 1.3)
+        for h in [5.0, 19.0] {
+            let p = at(h);
+            assert!((p[AUTO_Y] - 0.09).abs() < 1e-6, "{h}: {}", p[AUTO_Y]);
+            assert!((p[TINT_B] - 1.3).abs() < 1e-6);
+            assert!((p[SATURATION_OFFSET] - 0.75).abs() < 1e-6);
+            assert!((p[SATURATION_SLOPE] - 4.6).abs() < 1e-5);
+            assert!((p[AUTO_X] - 0.15).abs() < 1e-6);
+        }
+        // linear: a quarter of the way from night to day at 4:45, three quarters at 5:15
+        assert!((at(4.75)[AUTO_Y] - 0.085).abs() < 1e-6);
+        assert!((at(5.25)[AUTO_Y] - 0.095).abs() < 1e-6);
+        // dusk goes the other way: 18:45 is a quarter of the way toward night
+        assert!((at(18.75)[AUTO_Y] - 0.095).abs() < 1e-6);
+        assert!((at(19.25)[AUTO_Y] - 0.085).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_arctic_overrides_apply_to_the_day_and_night_pairs() {
+        let Some(b) = retail_blocks() else { return };
+        // set 1 = Arctic: day tint B 1.25, S9 0.04, saturation end 0.9, S2 0.25; night neutral
+        let noon = b.params(1, 1.0, 12.0);
+        assert_eq!(
+            (
+                noon[TINT_B],
+                noon[AUTO_Y],
+                noon[SATURATION_END],
+                noon[OVERLAY_BRIGHT]
+            ),
+            (1.25, 0.04, 0.9, 0.25)
+        );
+        // other keys keep the day block's
+        assert_eq!(noon[SATURATION_OFFSET], b.day[SATURATION_OFFSET]);
+        let night = b.params(1, 1.0, 0.0);
+        assert_eq!(
+            (night[TINT_R], night[TINT_G], night[TINT_B]),
+            (1.0, 1.0, 1.0)
+        );
+        assert_eq!(night[SATURATION_END], b.night[SATURATION_END]);
+        assert_eq!(night[AUTO_Y], b.night[AUTO_Y]);
+        // dawn blends the two overridden blocks: B (1.0 + 1.25) / 2 at 5:00
+        assert!((b.params(1, 1.0, 5.0)[TINT_B] - 1.125).abs() < 1e-6);
+        // Desert: heat haze flag, S5 50 by day only
+        let desert = b.params(2, 1.0, 12.0);
+        assert_eq!((desert[HEAT_HAZE], desert[DOF_FAR]), (1.0, 50.0));
+        assert_eq!(b.params(2, 1.0, 0.0)[HEAT_HAZE], 0.0);
+        // a set without an override container is the plain block
+        assert_eq!(b.params(0, 1.0, 12.0), b.day);
+    }
+
+    /// Slot 2 weight `1 - w`, slot 1 weight `w` (day); slot 4 `1 - w`, slot 3 `w` (night).
+    #[test]
+    fn the_intensity_weight_mixes_the_slots_of_a_pair() {
+        let mut day = [0.0; POST_SETTINGS];
+        day[AUTO_Y] = 0.1;
+        let b = PostEffectBlocks {
+            night: [0.0; POST_SETTINGS],
+            day,
+            hours: [4.5, 5.5, 18.5, 19.5],
+            overrides: vec![PostZoneOverride {
+                set: 8,
+                slots: [
+                    vec![(DOF_FAR, 1500.0)],
+                    vec![(DOF_FAR, 150.0)],
+                    vec![(DOF_FAR, 1500.0)],
+                    vec![(DOF_FAR, 150.0)],
+                ],
+            }],
+        };
+        assert_eq!(b.params(8, 1.0, 12.0)[DOF_FAR], 1500.0);
+        assert_eq!(b.params(8, 0.0, 12.0)[DOF_FAR], 150.0);
+        assert!((b.params(8, 0.25, 12.0)[DOF_FAR] - (150.0 + 0.25 * 1350.0)).abs() < 1e-3);
+        assert_eq!(b.params(8, 1.0, 0.0)[DOF_FAR], 1500.0);
+        // the other sets are untouched
+        assert_eq!(b.params(7, 0.5, 12.0)[DOF_FAR], 0.0);
+        assert_eq!(b.params(7, 0.5, 12.0)[AUTO_Y], 0.1);
+    }
+
+    #[test]
+    fn post_effect_blocks_reject_missing_containers() {
+        assert!(PostEffectBlocks::parse(&[]).is_err());
+        let one = PropertyFile {
+            nodes: vec![Node {
+                values: vec![(Key::Hash(LE_SMOOTHING), Variant::Float(1.0))],
+                ..Default::default()
+            }],
+        }
+        .to_bytes();
+        assert!(PostEffectBlocks::parse(&one).is_err());
     }
 }

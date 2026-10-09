@@ -262,3 +262,18 @@ Order of work; each step is independently testable and none needs the unproven p
    as decoded-not-validated (Gap 5).
 6. **Lights:** `#178dbdf8` as the gain of the glow-sprite shader when those sprites exist (Gap 8); not part of the exposure work.
 7. Not part of this handoff: the cutscene overrides, heat haze, stereo, the unknown flags (Gaps 1, 2, 9).
+
+## 9. Implementation status (JC2-134 phase 1, on branch)
+
+Steps 1 to 4 of section 8 are implemented; step 5 (auto-exposure `A`, phase 2) is not (`A = 1`, labelled non-native).
+
+* `jc2_formats::weather::PostEffectBlocks` (in `weather.rs` next to `LandscapeEffects`, not in `landscape.rs`, which is the terrain
+  materials module): night/day blocks, thresholds, zone overrides (slots 1..4), `params(set, w, hour)` = `FUN_00a5e010`.
+* `jc2-game` `post_effects.rs` (`PostEffectState`, `PostPass`, `post_effects.wgsl`): the settings by hour and zone set, and the final
+  fullscreen pass (clamp, saturation clamp, `* (A + S7 - 1) * tint`, `sqrt`). The game camera has no HDR (the 8-bit sRGB main texture
+  is the native clamped 8-bit scene target), `Tonemapping::None`, `DebandDither::Disabled`, `Exposure::BLENDER`.
+* Gap 10 decision: the surface is sRGB, so the pass returns the sRGB decode of `sqrt(C)`; the hardware encode restores `sqrt(C)`
+  exactly (no custom swap-chain format, no double encoding).
+* `sky_light.rs`: `lux_per_unit() = pi / e0`, `ambient_per_unit() = 1 / e0`, `e0 = exp2(-ev100) / 1.2` verified in Bevy 0.19.1
+  (`bevy_camera::Exposure::exposure`; `pbr_functions.wgsl`: `view.exposure * (direct + indirect)`; `Fd_Burley` ends in `1 / PI`;
+  ambient `colour * brightness`): 3,135.6 lux and 998.1 per unit at ev100 9.7 (`e0` = 1.0019e-3).

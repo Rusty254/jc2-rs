@@ -10,7 +10,7 @@
 
 `claude/orchestrator` is the sole reviewer/integrator again (AGENTS.md "Coordinator and review").
 Reviews run the full suite with `JC2_TEST_DIR` set (retail tests skip silently without it).
-Master 29b0718: 492/492 tests, clippy `-D warnings` clean. Accepted today:
+Master e368688: 507/507 tests, clippy `-D warnings` clean. Accepted today:
 
 - JC2-022 sun/horizon shadow, JC2-045 weapon mounts, JC2-085 General material (earlier today).
 - JC2-046 authored player weapon accuracy and angular scatter (AI/special states still approximate).
@@ -26,9 +26,12 @@ Master 29b0718: 492/492 tests, clippy `-D warnings` clean. Accepted today:
   tile; start base = Arctic). Nights are now dark from native data. Policy: `LUX_PER_UNIT` (noon
   Default = 9000 lux) until tone map/auto-exposure (JC2-124) are known; no height/underwater/rain/snow
   branches yet (JC2-132).
+- JC2-124 / JC2-134 phase 1 native display chain: no HDR/tonemap on the world camera, clamp 0..1,
+  night/day post blocks (saturation clamp, tint), sqrt (gamma 2.0) encode, exposure identity
+  `lux_per_unit = pi/e0` replacing the policy scale. Auto-exposure (A = 1 for now) is JC2-137.
 
 Open parity research (board, tags `research` + `parity-gap`): JC2-101..110, 112..117, 119..121,
-124..133. GitHub `Rusty254/jc2-rs` (private) receives only the filtered `public` snapshot.
+125..139 (124 done). GitHub `Rusty254/jc2-rs` (private) receives only the filtered `public` snapshot.
 
 ## Current integration, 8 October
 

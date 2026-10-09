@@ -20,7 +20,7 @@
 //!   term, only the 0.15 shadow floor (`sun_horizon.rs`). Its **colour is native**: the sun/moon
 //!   colour, and the sky/ground ambient, come from `gamezone_gradients.bmp` by hour and zone
 //!   (`sky_light.rs`, JC2-122; the zone set is a labelled stand-in there). Only the scale from
-//!   native colour units to Bevy lux (`sky_light::LUX_PER_UNIT`) is project policy. There is no
+//!   native colour units to Bevy lux (`sky_light::lux_per_unit`) is the exposure identity `pi / e0`. There is no
 //!   separate Moon or sky-fill light (the exe has none).
 //! * Still **non-native** policy here: the sky/fog colour, the fog distances, the fog's
 //!   sun-scatter colour, the discs, and the sun colour / moon strength the cloud tint reads
@@ -365,7 +365,7 @@ fn apply_sky(
     mut cams: Query<(&mut AmbientLight, &mut DistanceFog), With<Camera3d>>,
 ) {
     let st = SkyState::at(time.hours, data.0.as_ref());
-    // native colour of the one light and the ambient (sky_light.rs); units are its policy
+    // native colour of the one light and the ambient (sky_light.rs); units are the exposure identity
     let lights = lighting.bevy();
     for (mut l, mut tf) in &mut sun {
         l.illuminance = lights.sun_illuminance;
@@ -550,7 +550,7 @@ mod tests {
     }
 
     /// The light's colour and the camera ambient are the native table values at the hour,
-    /// through the one named policy scale (`sky_light.rs`).
+    /// through the exposure identity (`sky_light.rs`).
     #[test]
     fn the_lights_take_their_colour_from_the_zone_tables() {
         use crate::sky_light::{light_state, synthetic};

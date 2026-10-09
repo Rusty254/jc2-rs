@@ -67,9 +67,10 @@ mod parachute;
 mod particle_fixture;
 mod physics;
 mod pickups;
-mod plant_lod;
 mod plane;
+mod plant_lod;
 mod poses;
+mod post_effects;
 mod ragdoll;
 mod rbm_loader;
 mod rig;
@@ -544,7 +545,9 @@ fn main() {
                     speed: cli.day_speed.max(0.0),
                     sun_shadows: cli.sun_shadows,
                 },
-            });
+            })
+            // the native final colour chain (clamp, saturation clamp, tint, sqrt encode)
+            .add_plugins(post_effects::PostEffectPlugin);
             if let Some(xz) = start_at {
                 app.insert_resource(world::StartAt(xz));
             }
