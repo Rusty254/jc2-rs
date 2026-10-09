@@ -510,6 +510,7 @@ pub mod testing {
         ))
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
+        .init_asset::<crate::general_material::GeneralMaterial>()
         .register_asset_loader(RbmLoader::default())
         .insert_resource(Game { fs })
         .insert_resource(Fleet::new(1, false))
@@ -640,6 +641,7 @@ mod tests {
         ))
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
+        .init_asset::<crate::general_material::GeneralMaterial>()
         .register_asset_loader(RbmLoader::default())
         .insert_resource(Game { fs })
         .insert_resource(WorldConfig {

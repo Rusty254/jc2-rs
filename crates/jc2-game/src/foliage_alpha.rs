@@ -94,6 +94,8 @@ pub fn attach(entity: &mut EntityCommands, source: &Handle<FoliageMaterial>, sta
 pub struct RbmMaterial {
     pub standard: Handle<StandardMaterial>,
     pub foliage: Option<(Handle<FoliageMaterial>, FoliageAlpha)>,
+    /// The native General route (JC2-085); `standard` is its legacy fallback.
+    pub general: Option<Handle<crate::general_material::GeneralMaterial>>,
 }
 fn insert_rbm_material(mut world: DeferredWorld, context: HookContext) {
     let material = world.get::<RbmMaterial>(context.entity).unwrap().clone();
@@ -101,9 +103,21 @@ fn insert_rbm_material(mut world: DeferredWorld, context: HookContext) {
     let mut entity = commands.entity(context.entity);
     if let Some((source, state)) = material.foliage {
         attach(&mut entity, &source, state);
+    } else if let Some(general) = material.general {
+        entity
+            .remove::<(
+                MeshMaterial3d<StandardMaterial>,
+                MeshMaterial3d<FoliageMaterial>,
+                FoliageInstance,
+            )>()
+            .insert(MeshMaterial3d(general));
     } else {
         entity
-            .remove::<(MeshMaterial3d<FoliageMaterial>, FoliageInstance)>()
+            .remove::<(
+                MeshMaterial3d<FoliageMaterial>,
+                MeshMaterial3d<crate::general_material::GeneralMaterial>,
+                FoliageInstance,
+            )>()
             .insert(MeshMaterial3d(material.standard));
     }
 }
@@ -123,6 +137,7 @@ pub struct FoliageInstancePlugin;
 impl Plugin for FoliageInstancePlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<FoliageMaterial>()
+            .init_asset::<crate::general_material::GeneralMaterial>()
             .init_resource::<OwnedFoliageMaterials>()
             .add_systems(PostUpdate, sync_instances.before(AssetEventSystems));
     }
@@ -325,10 +340,12 @@ mod tests {
         let normal = RbmMaterial {
             standard: standard.clone(),
             foliage: None,
+            general: None,
         };
         let leaf = RbmMaterial {
             standard: standard.clone(),
             foliage: Some((source.clone(), state)),
+            general: None,
         };
         let entity = app.world_mut().spawn(normal.clone()).id();
         app.update();

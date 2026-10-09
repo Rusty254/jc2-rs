@@ -48,6 +48,7 @@ mod explosion;
 mod fleet;
 mod foliage_alpha;
 mod foliage_fixture;
+mod general_material;
 mod grapple;
 mod grass;
 mod heat;
@@ -458,7 +459,10 @@ fn main() {
     )
     .init_asset::<rbm_loader::RbmAsset>()
     .register_asset_loader(rbm_loader::RbmLoader::default())
-    .add_plugins(foliage_alpha::FoliageMaterialPlugin);
+    .add_plugins((
+        foliage_alpha::FoliageMaterialPlugin,
+        general_material::GeneralMaterialPlugin,
+    ));
     if cli.exit_after.is_some() || cli.screenshot.is_some() {
         app.add_plugins(smoke::SmokePlugin {
             exit_after: cli.exit_after,

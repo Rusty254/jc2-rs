@@ -12,7 +12,7 @@ use bevy::asset::{AssetLoader, LoadContext, RenderAssetUsages};
 use bevy::image::ImageLoaderSettings;
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
-use jc2_formats::rbm::{RbmModel, RenderBlock};
+use jc2_formats::rbm::{GeneralHeader, RbmModel, RenderBlock, general_vertex_colour};
 use jc2_formats::texture_policy::{GAMMA_CORRECT_FILE, GammaExceptions, GammaMode, dds_view_pair};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -87,6 +87,8 @@ pub struct RbmBlock {
     /// Colour image policy and resource/view diagnostics for this exact load.
     pub diffuse_view: Option<RbmTextureView>,
     pub foliage: Option<RbmFoliage>,
+    /// The native General route (JC2-085); `None` keeps `material` (legacy fallback).
+    pub general: Option<RbmGeneral>,
     pub mesh: Handle<Mesh>,
     pub material: Handle<StandardMaterial>,
     pub triangles: usize,
@@ -99,6 +101,12 @@ pub struct RbmFoliage {
     pub material: Handle<crate::foliage_alpha::FoliageMaterial>,
     pub state: jc2_formats::foliage::FoliageAlpha,
 }
+#[derive(Clone, Debug)]
+pub struct RbmGeneral {
+    pub material: Handle<crate::general_material::GeneralMaterial>,
+    #[allow(dead_code)] // kept for diagnostics and the retail tests
+    pub header: GeneralHeader,
+}
 impl RbmBlock {
     pub fn material_component(&self) -> crate::foliage_alpha::RbmMaterial {
         self.material_component_with(self.material.clone())
@@ -107,9 +115,14 @@ impl RbmBlock {
         &self,
         standard: Handle<StandardMaterial>,
     ) -> crate::foliage_alpha::RbmMaterial {
+        let standard_id = standard.id();
         crate::foliage_alpha::RbmMaterial {
             standard,
             foliage: self.foliage.as_ref().map(|f| (f.material.clone(), f.state)),
+            // A caller-supplied StandardMaterial (comparison views) overrides the route.
+            general: (standard_id == self.material.id())
+                .then(|| self.general.as_ref().map(|g| g.material.clone()))
+                .flatten(),
         }
     }
 }
@@ -140,6 +153,10 @@ struct SourcePolicy {
 #[derive(TypePath)]
 pub struct RbmLoader {
     mode: GammaMode,
+    /// Native General route (JC2-085). `JC2_GENERAL_LEGACY` turns it off (comparison).
+    general_route: bool,
+    /// `JC2_GENERAL_SPEC_STANDIN`: the unresolved specular colour cb0[1] as the Sun's.
+    spec_standin: bool,
     // Per-loader, per-source: never share a process-global exception list across
     // independently mounted GameFs instances/AssetServers. Mounts are immutable;
     // refreshing the exception asset requires a fresh loader/application.
@@ -156,6 +173,8 @@ impl RbmLoader {
     pub fn new(mode: GammaMode) -> Self {
         Self {
             mode,
+            general_route: std::env::var_os("JC2_GENERAL_LEGACY").is_none(),
+            spec_standin: std::env::var_os("JC2_GENERAL_SPEC_STANDIN").is_some(),
             policies: Mutex::new(HashMap::new()),
         }
     }
@@ -210,6 +229,43 @@ impl RbmLoader {
             .or_insert_with(|| Arc::new(policy))
             .clone()
     }
+}
+
+/// A linear (data) image next to the model: MPM and UV1 AO are numeric, not colour.
+async fn load_data_image(
+    cx: &mut LoadContext<'_>,
+    parent: &std::path::Path,
+    source: &AssetSourceId<'_>,
+    name: &str,
+    cache: &mut HashMap<String, Option<Handle<Image>>>,
+    label: String,
+) -> Option<Handle<Image>> {
+    if name.is_empty() {
+        return None;
+    }
+    let key = name.to_ascii_lowercase();
+    if let Some(handle) = cache.get(&key) {
+        return handle.clone();
+    }
+    let tex_path = bevy::asset::AssetPath::from_path_buf(parent.join(name.replace('\\', "/")))
+        .with_source(source.clone_owned());
+    let image = cx
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| settings.is_srgb = false)
+        .load_value::<Image>(tex_path)
+        .await;
+    let handle = match image {
+        Ok(image) => Some(cx.add_labeled_asset(label, image.take())),
+        Err(error) => {
+            warn!(
+                "RBM {}: data texture {name} unavailable: {error}; the General channel is off",
+                cx.path()
+            );
+            None
+        }
+    };
+    cache.insert(key, handle.clone());
+    handle
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -313,13 +369,43 @@ impl AssetLoader for RbmLoader {
 
         let mut blocks = Vec::with_capacity(model.blocks.len());
         let mut normal_images: HashMap<String, Option<Handle<Image>>> = HashMap::new();
+        let mut data_images: HashMap<String, Option<Handle<Image>>> = HashMap::new();
         let mut colour_images: HashMap<ColourImageKey, (Option<Handle<Image>>, RbmTextureView)> =
             HashMap::new();
         for (i, block) in model.blocks.iter().enumerate() {
             if block.mesh.positions.is_empty() {
                 continue;
             }
-            let mesh_value = block_to_mesh(block);
+            let mut mesh_value = block_to_mesh(block);
+            // General routing is decided first: the vertex colour (VS 188280) belongs to
+            // the native route's mesh only.
+            let general_header = block
+                .general
+                .as_ref()
+                .filter(|_| self.general_route && block.type_name == "General")
+                .filter(|header| {
+                    if let Some(reason) = crate::general_material::unsupported_reason(header) {
+                        debug!("RBM {path}: General block {i} keeps the legacy material: {reason}");
+                        false
+                    } else {
+                        true
+                    }
+                });
+            if general_header.is_some()
+                && block.mesh.packed_colours.len() == block.mesh.positions.len()
+            {
+                let colours: Vec<[f32; 4]> = block
+                    .mesh
+                    .packed_colours
+                    .iter()
+                    .map(|c| general_vertex_colour(*c))
+                    .collect();
+                if colours.iter().flatten().all(|v| v.is_finite()) {
+                    mesh_value.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
+                } else {
+                    warn!("RBM {path}: General block {i} has a non-finite vertex colour; ignored");
+                }
+            }
             let has_tangents = mesh_value.contains_attribute(Mesh::ATTRIBUTE_TANGENT)
                 && block.mesh.uv0.len() == block.mesh.positions.len()
                 && block.mesh.uv0.iter().flatten().all(|v| v.is_finite());
@@ -468,6 +554,30 @@ impl AssetLoader for RbmLoader {
             } else {
                 None
             };
+            let (mpm_image, ao_image) = if general_header.is_some() {
+                (
+                    load_data_image(
+                        cx,
+                        &parent,
+                        &source,
+                        &block.material.properties,
+                        &mut data_images,
+                        format!("mpm{i}"),
+                    )
+                    .await,
+                    load_data_image(
+                        cx,
+                        &parent,
+                        &source,
+                        &block.material.deformed_diffuse,
+                        &mut data_images,
+                        format!("ao{i}"),
+                    )
+                    .await,
+                )
+            } else {
+                (None, None)
+            };
             let material = StandardMaterial {
                 base_color: if texture.is_some() {
                     Color::WHITE
@@ -498,6 +608,39 @@ impl AssetLoader for RbmLoader {
                     state.enabled(),state.reference());
                 RbmFoliage {material:cx.add_labeled_asset(format!("foliage{i}"),source),state}
             });
+            let general = general_header.map(|header| {
+                let params = crate::general_material::GeneralParams::new(
+                    header,
+                    mpm_image.is_some(),
+                    ao_image.is_some(),
+                    self.spec_standin,
+                );
+                debug!(
+                    "RBM {path}: General block {i} native route flags={:#x} power={} mpm={} ao={} channel_textures={} channel_ao={} (unproven: reflection t4, specular colour cb0[1], point lights; snow off)",
+                    header.render_flags,
+                    header.specular_power,
+                    mpm_image.is_some(),
+                    ao_image.is_some(),
+                    header.channel_textures(),
+                    header.channel_ao_factor > 0.5,
+                );
+                let base = crate::general_material::source_material(
+                    material.clone(),
+                    header.alpha_test(),
+                );
+                let source = crate::general_material::GeneralMaterial {
+                    base,
+                    extension: crate::general_material::GeneralExtension::new(
+                        params,
+                        mpm_image.clone(),
+                        ao_image.clone(),
+                    ),
+                };
+                RbmGeneral {
+                    material: cx.add_labeled_asset(format!("general{i}"), source),
+                    header: header.clone(),
+                }
+            });
             if block.type_name == "BillboardFoliage" {
                 warn!(
                     "RBM {path}: billboard x4 shader evidence exists, instance/enable ownership unsupported; retaining legacy alpha fallback"
@@ -509,6 +652,7 @@ impl AssetLoader for RbmLoader {
                 diffuse,
                 diffuse_view,
                 foliage,
+                general,
                 mesh,
                 material,
                 triangles: block.mesh.triangle_count(),
@@ -579,6 +723,7 @@ mod tests {
             },
             params: Vec::new(),
             foliage_flags: None,
+            general: None,
             extra_attribute_streams: 0,
             instances: Vec::new(),
         }
@@ -997,6 +1142,7 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<RbmAsset>()
             .init_asset::<crate::foliage_alpha::FoliageMaterial>()
+            .init_asset::<crate::general_material::GeneralMaterial>()
             // Headless loading retains original BC pixels; no GPU is needed to
             // inspect the colour/data views. DDS does not decompress BC on an
             // unsupported device, so NONE would reject the retail maps.
@@ -1110,6 +1256,7 @@ mod tests {
         .init_asset::<Image>()
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
+        .init_asset::<crate::general_material::GeneralMaterial>()
         .register_asset_loader(ImageLoader::new(CompressedImageFormats::BC))
         .register_asset_loader(RbmLoader::default());
         let one: Handle<RbmAsset> = app
@@ -1275,6 +1422,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn retail_general_hook_and_crate_take_the_native_route() {
+        use crate::general_material::{
+            GeneralMaterial, SHADER_CHANNEL_TEXTURES, SHADER_HAS_AO, SHADER_HAS_MPM,
+        };
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = Arc::new(GameFs::open(dir).unwrap());
+        let mut app = loader_app(fs.clone());
+        let asset_server = app.world().resource::<AssetServer>();
+        let hook: Handle<RbmAsset> =
+            asset_server.load("jc2://general.blz/wea04_lod1-grapplinghook.rbm");
+        let prop: Handle<RbmAsset> = asset_server.load("jc2://obj.cratesx2.ee/go003_lod1-a.rbm");
+        for model in [&hook, &prop] {
+            wait_for_asset(&mut app, model);
+        }
+        let models = app.world().resource::<Assets<RbmAsset>>();
+        let general_materials = app.world().resource::<Assets<GeneralMaterial>>();
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let images = app.world().resource::<Assets<Image>>();
+        for (model, power, channel_textures) in [(&hook, 120.0, false), (&prop, 16.0, true)] {
+            let block = &models.get(model).unwrap().blocks[0];
+            assert_eq!(block.type_name, "General");
+            let general = block.general.as_ref().expect("native route");
+            let material = general_materials.get(&general.material).unwrap();
+            assert_eq!(
+                general.header.render_flags,
+                if channel_textures { 0x60 } else { 0 }
+            );
+            let params = material.extension.params;
+            assert_eq!(params.specular_power, power);
+            assert_eq!(
+                params.flags & SHADER_CHANNEL_TEXTURES != 0,
+                channel_textures
+            );
+            assert_ne!(params.flags & SHADER_HAS_MPM, 0);
+            assert_ne!(params.flags & SHADER_HAS_AO, 0);
+            // MPM and the UV1 AO map are numeric data: linear images, not the colour view
+            for handle in [&material.extension.mpm, &material.extension.ao] {
+                let image = images.get(handle.as_ref().unwrap()).unwrap();
+                assert!(!image.texture_descriptor.format.is_srgb());
+            }
+            assert_eq!(material.base.alpha_mode, AlphaMode::Opaque);
+            assert_eq!(material.base.perceptual_roughness, 1.0);
+            // the VS 188280 vertex colour is on the mesh; UV1 is for the AO map
+            let mesh = meshes.get(&block.mesh).unwrap();
+            assert!(mesh.contains_attribute(Mesh::ATTRIBUTE_COLOR));
+            assert!(mesh.contains_attribute(Mesh::ATTRIBUTE_UV_1));
+        }
+        // the legacy switch leaves the old StandardMaterial path, without vertex colours
+        let mut app = app_with_reader_and_loader(
+            AssetSourceBuilder::new(move || Box::new(JcAssetReader::new(fs.clone()))),
+            RbmLoader {
+                general_route: false,
+                ..RbmLoader::default()
+            },
+        );
+        let legacy: Handle<RbmAsset> = app
+            .world()
+            .resource::<AssetServer>()
+            .load("jc2://general.blz/wea04_lod1-grapplinghook.rbm");
+        wait_for_asset(&mut app, &legacy);
+        let block = &app
+            .world()
+            .resource::<Assets<RbmAsset>>()
+            .get(&legacy)
+            .unwrap()
+            .blocks[0];
+        assert!(block.general.is_none());
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        assert!(
+            !meshes
+                .get(&block.mesh)
+                .unwrap()
+                .contains_attribute(Mesh::ATTRIBUTE_COLOR)
+        );
     }
 
     #[test]

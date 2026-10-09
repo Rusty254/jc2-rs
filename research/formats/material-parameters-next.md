@@ -53,7 +53,7 @@ Main-pass mappings below follow actual instruction data flow.
 
 | Family / retail fixture | Verified texture role/channel | Consumers and limits |
 |---|---|---|
-| General; `general.blz/wea04_lod1-grapplinghook.rbm`, block0 | t0 hook_diff.dds RGBA, multiplied by vertex COLOR; t1 hook_nrm.dds RGB normal decoded 2*RGB-1; t2 hook_mpm.dds R controls environment reflection with view-angle factor, G direct specular strength, B blends ambient+sun lighting toward `2-lighting`; t3 hook_dummy.dds RGB UV1 AO/color multiplier with optional ChannelAOMask dot product | General PS **6062008**; `FUN_00972ce0` binds material slots 0/1/2/3 and uploads cb2 channel masks/power. B is an emissive-like lighting remap, not metalness. Alpha channel of t2 was not consumed in this variant. Retail fixture is General v3, 146 vertices/138 triangles, SpecularPower=120 and render flags=0. |
+| General; `general.blz/wea04_lod1-grapplinghook.rbm`, block0 | t0 hook_diff.dds RGBA, multiplied by vertex COLOR; t1 hook_nrm.dds RGB normal decoded 2*RGB-1; t2 hook_mpm.dds R controls environment reflection with view-angle factor, G direct specular strength, B remaps ambient+sun lighting as `L + B*(2-L)` (a lerp toward the constant 2); t3 hook_dummy.dds RGB UV1 AO/color multiplier with optional ChannelAOMask dot product | General PS **6062008**; `FUN_00972ce0` binds material slots 0/1/2/3 and uploads cb2 channel masks/power. B is an emissive-like lighting remap, not metalness. Alpha channel of t2 was not consumed in this variant. Retail fixture is General v3, 146 vertices/138 triangles, SpecularPower=120 and render flags=0. |
 | CarPaint; `lave.v014_jeep.ee/v014_lod1-cover.rbm` | t0 diffuse, t1 RGB normal 2*RGB-1, t2 MPM; damage variants sample additional diffuse/normal/properties slots | CarPaint PS **973444**, binary read `FUN_00955ef0`, type vtable 0x00f2382c. Full MPM channel roles and 13 parameter names remain **unknown** in this pass; do not copy General/Skinned mappings. Retail cover params include two RGB triples [0.187,0.146,0.065], index6=10, flags index13=1024. |
 | SkinnedGeneral; `characters/maincharacters/rico/mc01_lod1-rico.rbm`, block0 | t0 mc01_clothes_dif.dds, t1 mc01_clothes_nrm.dds, t2 mc01_clothes_mpm.dds: B -> base exponent `32*B+4` (additional shader term can add up to 64); R scales diffuse ambient/sun and specular terms; G scales a separately coloured view/normal lighting contribution | SkinnedGeneral PS **6753928**, normal t1 RGB 2*RGB-1, frontface flip. G is a secondary appearance contribution, not proven metalness/roughness. Exact authoring names still unknown. Block0 is v3, 997 vertices/1452 triangles; eye block12 and hair blocks14/15 provide separate alpha/variant fixtures. |
 | VegetationBark; `vegetation_1.blz/Arctic_T22_PineL_LOD1-Whole.rbm`, block0 | primary diffuse/normal are arctic_pine_bark_dif/nrm; t0 diffuse, t1 RGB normal; later slots contain arctic_t22_trunk_dif/nrm for secondary bark representation | Bark_Water PS **946732**, type setup `FUN_0095c890`, binary read **0x00966840**. No MPM semantics in this shader; slot named properties can hold a diffuse texture. No universal AOC channel assignment established for bark variants. |
@@ -63,11 +63,17 @@ General PS precise equations (suppressing fog/local lights for clarity):
 
 ```
 C = diffuse * vertex_colour * selected_UV1_AO
-L = lerp(ambient_plus_sun, 2 - ambient_plus_sun, MPM.b) + point_lights
+L = ambient_plus_sun + MPM.b * (2 - ambient_plus_sun) + point_lights
 reflection = MPM.r * (1 - saturate(dot(N,V))^8) * sampled_environment * lighting_colour
 spec = pow(max(dot(N,H), .001), SpecularPower) * shadow * MPM.g * other_mask
 result = C*L + reflection + spec
 ```
+
+**JC2-085 correction:** PS6062008 computes `add r8.xyz, neg(r4.xyzx),
+l(2,2,2,0)` followed by `mad r4.xyz, r2.zzzz, r8.xyzx, r4.xyzx`.
+This is interpolation toward the constant2, not toward `2-L`. For L=.5/B=.5,
+the original yields1.25; the previous brief's expression yielded1.0. With B=1,
+the original yields2 regardless of L before the separate point-light addition.
 
 These are legacy forward-lighting contracts. A PBR roughness approximation needs
 documented conversion and controlled comparisons; the original exponent is not

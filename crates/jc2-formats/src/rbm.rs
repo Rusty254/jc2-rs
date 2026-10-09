@@ -130,6 +130,9 @@ pub struct MeshData {
     pub tangents: Vec<[f32; 4]>,
     pub uv0: Vec<[f32; 2]>,
     pub uv1: Vec<[f32; 2]>,
+    /// General/Lambert vertex colour stored as a packed float. Preserve the
+    /// integer representation; General VS188280 decodes its fractional RGB.
+    pub packed_colours: Vec<u32>,
     /// Triangle list.
     pub indices: Vec<u16>,
     /// Skinning (`SkinnedGeneral`): four skeleton bone indices and weights per vertex,
@@ -201,12 +204,72 @@ pub struct RenderBlock {
     pub params: Vec<f32>,
     /// Verified VegetationFoliage +0x3c flags, separate from five header floats.
     pub foliage_flags: Option<u32>,
+    /// General's exact header, independent of the material texture trailer.
+    pub general: Option<GeneralHeader>,
     /// Deform / skin / colour attributes that are parsed past but not yet
     /// interpreted are counted here so nothing is silently lost.
     pub extra_attribute_streams: u8,
     /// Merged "batch" blocks carry no geometry of their own: they place
     /// `<name>_part<N>.rbm` models from the same container.
     pub instances: Vec<Instance>,
+}
+
+/// CRenderBlockGeneral +34..7f, verified by importer00935840/reader00973da0.
+/// Packing extents/colour are compiler metadata; do not reinterpret integers as
+/// floats or apply colour_extent to VS188280's fractional colour decode.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeneralHeader {
+    pub channel_texture_mask: [f32; 4],
+    pub channel_ao_mask: [f32; 3],
+    pub channel_ao_factor: f32,
+    pub depth_offset: f32,
+    pub specular_power: f32,
+    pub vertex_format: u32,
+    pub position_extent: f32,
+    pub uv0_extent: [f32; 2],
+    pub uv1_extent: [f32; 2],
+    pub colour_extent: f32,
+    pub packed_colour: u32,
+    pub render_flags: u32,
+}
+impl GeneralHeader {
+    pub fn channel_textures(&self) -> bool {
+        self.render_flags & 0x20 != 0
+    }
+    pub fn alpha_test(&self) -> bool {
+        self.render_flags & 0x100 != 0
+    }
+    pub fn no_culling(&self) -> bool {
+        self.render_flags & 1 != 0
+    }
+    /// Native first-positive channel selector00949b50; retains all mask values.
+    pub fn variant_key(&self) -> u8 {
+        let texture = if self.channel_textures() {
+            self.channel_texture_mask
+                .iter()
+                .position(|v| *v > 0.0)
+                .map_or(0, |i| i as u8 + 1)
+        } else {
+            0
+        };
+        let ao = if self.render_flags & 0x200 != 0 {
+            self.channel_ao_mask
+                .iter()
+                .position(|v| *v > 0.0)
+                .map_or(0, |i| (i as u8 + 1) * 8)
+        } else {
+            0
+        };
+        texture | ao
+    }
+}
+
+/// General VS188280: frc(c * [1,1/64,1/4096]), with instance alpha supplied
+/// separately. `colour_extent` is not multiplied in this consumer.
+pub fn general_vertex_colour(raw: u32) -> [f32; 4] {
+    let c = f32::from_bits(raw);
+    let fraction = |v: f32| v - v.floor();
+    [fraction(c), fraction(c / 64.0), fraction(c / 4096.0), 1.0]
 }
 
 /// One placement from a Merged batch block.
@@ -440,6 +503,7 @@ fn new_block(version: u8, material: Material, params: Vec<f32>) -> RenderBlock {
         mesh: MeshData::default(),
         params,
         foliage_flags: None,
+        general: None,
         extra_attribute_streams: 0,
         instances: Vec::new(),
     }
@@ -603,7 +667,7 @@ fn read_general_vertices(
             mesh.uv1.push([r.f32()?, r.f32()?]);
             let (nn, _) = unpack_normal(r.f32()?);
             let (t, s) = unpack_normal(r.f32()?);
-            let _colour = r.f32()?;
+            mesh.packed_colours.push(r.u32()?);
             mesh.normals.push(nn);
             mesh.tangents.push([t[0], t[1], t[2], s]);
         }
@@ -620,7 +684,7 @@ fn read_general_vertices(
             mesh.uv1.push([c * uv1_scale[0], d * uv1_scale[1]]);
             let (nn, _) = unpack_normal(r.f32()?);
             let (t, s) = unpack_normal(r.f32()?);
-            let _colour = r.f32()?;
+            mesh.packed_colours.push(r.u32()?);
             let (x, y, z) = (snorm(r.i16()?), snorm(r.i16()?), snorm(r.i16()?));
             let _w = r.i16()?;
             mesh.positions.push([x * scale, y * scale, z * scale]);
@@ -651,12 +715,34 @@ fn parse_general(r: &mut Reader) -> Result<RenderBlock> {
         *s = r.f32()?;
         params.push(*s);
     }
-    if version == 3 {
-        params.push(r.i32()? as f32);
-        params.push(r.i32()? as f32);
-    }
+    let (packed_colour, render_flags) = if version == 3 {
+        let colour = r.u32()?;
+        let flags = r.u32()?;
+        // Legacy params remain diagnostic only; typed fields preserve all bits.
+        params.push(colour as i32 as f32);
+        params.push(flags as i32 as f32);
+        (colour, flags)
+    } else {
+        // Reader00973da0 defaults the absent v2 fields to ffffffff/40.
+        (u32::MAX, 0x40)
+    };
+    let header = GeneralHeader {
+        channel_texture_mask: params[0..4].try_into().unwrap(),
+        channel_ao_mask: params[4..7].try_into().unwrap(),
+        channel_ao_factor: params[7],
+        depth_offset: params[8],
+        specular_power: params[9],
+        vertex_format: flag,
+        position_extent: scales[0],
+        uv0_extent: [scales[1], scales[2]],
+        uv1_extent: [scales[3], scales[4]],
+        colour_extent: scales[5],
+        packed_colour,
+        render_flags,
+    };
     let material = read_material(r)?;
     let mut b = new_block(version, material, params);
+    b.general = Some(header);
     let big = flag == 0;
     read_general_vertices(
         r,
@@ -1043,6 +1129,104 @@ fn parse_merged(r: &mut Reader) -> Result<RenderBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn general_typed_header_preserves_integer_bits_and_native_v2_defaults() {
+        for version in [2, 3] {
+            let mut bytes = vec![version];
+            for value in [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 120.0] {
+                bytes.extend(value.to_le_bytes());
+            }
+            bytes.extend(1u32.to_le_bytes());
+            for value in [1.0f32, 2.0, 3.0, 4.0, 5.0, 0.4241] {
+                bytes.extend(value.to_le_bytes());
+            }
+            if version == 3 {
+                bytes.extend(0xff959515u32.to_le_bytes());
+                bytes.extend(0x80000221u32.to_le_bytes());
+            }
+            bytes.extend([0u8; 32]); // eight empty texture names
+            bytes.extend(3u32.to_le_bytes()); // distinct texture trailer
+            bytes.extend([0u8; 8]); // no vertices/faces
+            let block = parse_general(&mut Reader::new(&bytes)).unwrap();
+            let header = block.general.unwrap();
+            assert_eq!(header.specular_power, 120.0);
+            assert_eq!(header.vertex_format, 1);
+            assert_eq!(header.uv0_extent, [2.0, 3.0]);
+            assert_eq!(header.uv1_extent, [4.0, 5.0]);
+            assert_eq!(header.colour_extent, 0.4241);
+            assert_eq!(block.material.flags, 3);
+            if version == 3 {
+                assert_eq!(header.packed_colour, 0xff959515);
+                assert_eq!(header.render_flags, 0x80000221);
+                assert_eq!(header.variant_key(), 3 | 16);
+                assert!(header.no_culling());
+            } else {
+                assert_eq!(header.packed_colour, u32::MAX);
+                assert_eq!(header.render_flags, 0x40);
+                assert_eq!(header.variant_key(), 0);
+            }
+        }
+        // Literal VS188280 fractional decode, with no colour-extent multiplier.
+        assert_eq!(
+            general_vertex_colour(3104.25f32.to_bits()),
+            [0.25, 0.50390625, 0.75787354, 1.0]
+        );
+        assert_eq!(
+            general_vertex_colour((-0.25f32).to_bits()),
+            [0.75, 0.99609375, 0.99993896, 1.0]
+        );
+    }
+
+    #[test]
+    fn original_general_hook_and_opaque_crate_headers_colours_and_textures() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            eprintln!("SKIP General originals: JC2_TEST_DIR absent");
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        for (container, member, count, power, flags) in [
+            ("general.blz", "wea04_lod1-grapplinghook.rbm", 146, 120.0, 0),
+            ("obj.cratesx2.ee", "go003_lod1-a.rbm", 364, 16.0, 0x60),
+        ] {
+            let bytes = fs.read_inflated(container).unwrap();
+            let archive = crate::sarc::SmallArchive::parse(&bytes).unwrap();
+            let model =
+                RbmModel::parse(archive.data(&bytes, archive.get(member).unwrap()).unwrap())
+                    .unwrap();
+            assert!(model.truncated_at.is_none());
+            let block = &model.blocks[0];
+            let header = block.general.as_ref().unwrap();
+            assert_eq!(header.specular_power, power);
+            assert_eq!(header.render_flags, flags);
+            assert_eq!(header.vertex_format, 1);
+            assert_eq!(block.mesh.vertex_count(), count);
+            assert_eq!(block.mesh.packed_colours.len(), count);
+            assert_eq!(block.mesh.uv1.len(), count);
+            assert_eq!(block.material.flags, 3);
+            assert!(
+                block
+                    .mesh
+                    .packed_colours
+                    .iter()
+                    .all(|c| general_vertex_colour(*c).iter().all(|v| v.is_finite()))
+            );
+            if flags == 0 {
+                assert_eq!(header.packed_colour, 4287993237);
+                assert_eq!(block.material.properties, "hook_mpm.dds");
+                assert_eq!(block.material.deformed_diffuse, "hook_dummy.dds");
+                assert_eq!(
+                    general_vertex_colour(block.mesh.packed_colours[0]),
+                    [0.359375, 0.36499023, 0.36507797, 1.0]
+                );
+            } else {
+                assert_eq!(header.channel_texture_mask, [0.0, 0.0, 1.0, 0.0]);
+                assert_eq!(header.variant_key(), 3);
+                assert_eq!(block.material.properties, "g_specular_1_mpm.dds");
+                assert_eq!(block.material.deformed_diffuse, "g_dirt_8.dds");
+            }
+        }
+    }
 
     #[test]
     fn foliage_parameter_flags_retain_all_raw_bits_and_float_fields() {

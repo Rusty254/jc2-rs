@@ -23,6 +23,10 @@ No other agent (including `codex/orchestrator` and every `codex/*` worker) merge
 `master`, commits directly on `master`, marks tasks `done` or promotes backlog tasks to
 `ready`. Finish your work on your own branch/worktree, hand it in, then stop and wait.
 
+**First step in every new worktree:** run `git merge-base --is-ancestor master HEAD`. If it fails, your
+worktree was created from the public snapshot (no shared history); run `git reset --hard master`
+before doing anything else.
+
 Hand-in (every task, research or runtime):
 1. Commit on your branch; run `git merge master` first so the branch contains current master.
 2. Runtime work: run the full `cargo test --release --workspace` and

@@ -172,7 +172,7 @@ pub fn ao_image(img: &DdsImage) -> Result<Image, String> {
 }
 
 /// AO 1, no horizon: the map of a world without shadows.
-fn open_ground() -> Image {
+pub(crate) fn open_ground() -> Image {
     let mut image = Image::new(
         Extent3d {
             width: 1,

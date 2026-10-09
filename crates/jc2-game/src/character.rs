@@ -1829,6 +1829,7 @@ mod tests {
         .init_asset::<StandardMaterial>()
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
+        .init_asset::<crate::general_material::GeneralMaterial>()
         .init_asset_loader::<RbmLoader>()
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
