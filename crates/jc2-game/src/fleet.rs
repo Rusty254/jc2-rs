@@ -9,6 +9,7 @@
 use crate::Game;
 use crate::boat::{build_boat, find_open_water};
 use crate::coords::{bevy_xyz, engine_xz, mat_to_bevy};
+use crate::gameplay_camera::VehicleCamera;
 use crate::heli::build_heli;
 use crate::rbm_loader::RbmAsset;
 use crate::vehicle::{
@@ -74,6 +75,8 @@ struct Pending {
     name: String,
     kind: Kind,
     parts: DollParts,
+    /// The driver seat controller's camera setting (`camera_id`), when the doll has one.
+    camera: Option<VehicleCamera>,
 }
 
 #[derive(Resource)]
@@ -228,12 +231,17 @@ fn request_parts(mut fleet: ResMut<Fleet>, assets: Res<AssetServer>, game: Res<G
             continue;
         };
         info!("{container}: a {} requested", kind.label());
+        let camera = doll
+            .driver_seat()
+            .and_then(|s| Some((s.camera_id?, s.camera_id_reverse)))
+            .map(|(id, reverse)| VehicleCamera { id, reverse });
         fleet.pending.push(Pending {
             origin,
             req,
             name: container,
             kind,
             parts,
+            camera,
         });
     }
 }
@@ -399,6 +407,9 @@ fn spawn_ready(
         }
         if let Some(origin) = p.origin {
             commands.entity(id).insert(origin);
+        }
+        if let Some(camera) = p.camera {
+            commands.entity(id).insert(camera);
         }
         fleet.spawned.push((id, p.req.tile));
     }

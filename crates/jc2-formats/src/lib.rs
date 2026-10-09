@@ -50,6 +50,7 @@ pub mod animation;
 pub mod areaset;
 pub mod blackmarket;
 pub mod browse;
+pub mod camera;
 pub mod cgd;
 pub mod chaos;
 pub mod character;

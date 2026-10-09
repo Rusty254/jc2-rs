@@ -176,6 +176,12 @@ pub struct Seat {
     /// The smart object's transform in the vehicle frame (engine axes): where the seated
     /// character's hips go.
     pub world: Transform3,
+    /// The seat controller's `camera_id` (key `0x742cdd23`, camera setting id): the
+    /// camera a seated player sees through (`camera-fov-next.md`), when the seat has a
+    /// controller carrying one.
+    pub camera_id: Option<i32>,
+    /// The controller's `camera_id_reverse` (`0xb4ad6a59`).
+    pub camera_id_reverse: Option<i32>,
 }
 
 impl Seat {
@@ -482,6 +488,8 @@ const STEER_SPEED: u32 = 0xc71a85bb; // by value
 const CHASSIS_MASS: u32 = 0xa2b2218e; // by value
 const CENTER_OF_MASS: u32 = 0x3e5f5109; // by value
 const TRIGGER_EXTENTS: u32 = 0x2be1_0cce; // by value: a smart-object trigger's box
+const SEAT_CAMERA_ID: u32 = 0x742c_dd23;
+const SEAT_CAMERA_REVERSE: u32 = 0xb4ad_6a59;
 const STUNT_ZONE: u32 = 0xcceaa327; // by value: a stunt controller's area tag ("CAB")
 
 fn collect(node: &Node, depth: usize, doll: &mut VehicleDoll) {
@@ -678,6 +686,8 @@ fn collect(node: &Node, depth: usize, doll: &mut VehicleDoll) {
                 doll.seats.push(Seat {
                     name: name.to_string(),
                     world: mat(node, "world").unwrap_or(Transform3::IDENTITY),
+                    camera_id: seat_camera(node, SEAT_CAMERA_ID),
+                    camera_id_reverse: seat_camera(node, SEAT_CAMERA_REVERSE),
                 });
             }
         }
@@ -686,6 +696,16 @@ fn collect(node: &Node, depth: usize, doll: &mut VehicleDoll) {
     for (_, c) in &node.children {
         collect(c, depth, doll);
     }
+}
+
+/// A key of the seat's controller child (`CDriverSeatController`, `CPassengerSeatController`,
+/// the helicopter and plane controllers): the first direct child whose `_class` ends in
+/// `Controller` and carries the key.
+fn seat_camera(seat: &Node, key: u32) -> Option<i32> {
+    seat.children
+        .iter()
+        .filter(|(_, c)| c.str("_class").is_some_and(|c| c.ends_with("Controller")))
+        .find_map(|(_, c)| i(c, key))
 }
 
 fn mat(n: &Node, name: &str) -> Option<Transform3> {
@@ -777,6 +797,11 @@ impl VehicleDoll {
     /// Total mass: chassis plus parts.
     pub fn mass(&self) -> f32 {
         self.base.as_ref().map(|b| b.mass).unwrap_or(1500.0)
+    }
+
+    /// The camera setting id of the driver's seat controller (`camera_id`).
+    pub fn driver_camera_id(&self) -> Option<i32> {
+        self.driver_seat().and_then(|s| s.camera_id)
     }
 
     /// The driver's seat (`SO_Driver`), when the doll has one.
@@ -1002,6 +1027,27 @@ mod tests {
 
     /// The real jeep and bus: a stunt position on the hardtop and one on the hood.
     /// Needs JC2_TEST_DIR with `lave.v014_jeep.ee` reachable.
+    /// The driver's seat controller names the camera setting (`camera_id` /
+    /// `camera_id_reverse`, JC2-141 census): the jeep is 62 / 74.
+    #[test]
+    fn driver_camera_ids() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let ids = |name: &str| {
+            let data = fs.read_inflated(name).ok()?;
+            let sarc = crate::sarc::SmallArchive::parse(&data).ok()?;
+            let e = sarc.entries.iter().find(|e| e.name.ends_with(".mvdoll"))?;
+            let doll = VehicleDoll::parse(sarc.data(&data, e).ok()?).ok()?;
+            let s = doll.driver_seat()?;
+            Some((s.camera_id, s.camera_id_reverse))
+        };
+        if let Some(j) = ids("lave.v014_jeep.ee") {
+            assert_eq!(j, (Some(62), Some(74)));
+        }
+    }
+
     #[test]
     fn jeep_stunt_positions() {
         let Ok(dir) = std::env::var("JC2_TEST_DIR") else {

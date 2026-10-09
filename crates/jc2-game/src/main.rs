@@ -50,6 +50,7 @@ mod explosion;
 mod fleet;
 mod foliage_alpha;
 mod foliage_fixture;
+mod gameplay_camera;
 mod general_material;
 mod grapple;
 mod grass;
@@ -605,6 +606,7 @@ fn main() {
                 app.insert_resource(mission_browser::OpenMissionsAtStart(id.clone()));
             }
             if physics {
+                app.add_plugins(gameplay_camera::GameplayCameraPlugin);
                 app.add_plugins(physics::JcPhysicsPlugin)
                     .insert_resource(chaos::ChaosStart {
                         chaos: cli.chaos,

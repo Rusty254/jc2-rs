@@ -65,9 +65,12 @@ pub const LOD1_WIDTH: f32 = 50.0;
 /// Upper clamp of the FOV scale (`FUN_00a61220`).
 #[cfg_attr(not(test), allow(dead_code))] // CPU mirror of terrain_splat.wgsl, checked by the tests
 pub const LOD_SCALE_MAX: f32 = 999.99994;
-/// The game camera's default vertical FOV (camera constructor, `0x3f91361e`, 65°).
-#[cfg_attr(not(test), allow(dead_code))] // CPU mirror of terrain_splat.wgsl, checked by the tests
-pub const NATIVE_FOV: f32 = 1.134_464;
+/// The graphics-engine camera object's constructor FOV (`FUN_00924d80`, `0x3f91361e`, 65°).
+/// It is **not** a gameplay FOV: the camera manager overwrites it on its first frame
+/// (JC2-141; on foot the game runs 40°, see `gameplay_camera.rs`). Kept as a fixture value
+/// for the LOD-scale tests only.
+#[cfg(test)]
+pub const ENGINE_CAMERA_CTOR_FOV: f32 = 1.134_464;
 
 /// The FOV scale of the LOD radii: `min(1 / fov², 999.99994)`, `fov` the camera's
 /// vertical field of view in radians (`FUN_00a61220`, camera `+0x618`).
@@ -789,11 +792,11 @@ fn main_pass_post_lighting_processing(p: PbrInput, c: vec4<f32>) -> vec4<f32> { 
     /// `fastter_sh*` vertex shader) at its own 65° camera and at Bevy's 45° default.
     #[test]
     fn lod_blend_matches_the_native_boundaries() {
-        let k = lod_scale(NATIVE_FOV);
+        let k = lod_scale(ENGINE_CAMERA_CTOR_FOV);
         assert!((k - 0.777_003).abs() < 1e-5, "{k}");
         let (r0, r1) = (LOD0_RADIUS * k, LOD1_RADIUS * k);
         assert!((r0 - 19.425).abs() < 1e-3 && (r1 - 194.251).abs() < 1e-2);
-        let at = |d: f32| lod_blend(Vec3::new(d, 0.0, 0.0), NATIVE_FOV);
+        let at = |d: f32| lod_blend(Vec3::new(d, 0.0, 0.0), ENGINE_CAMERA_CTOR_FOV);
         assert_eq!(at(0.0), (1.0, 1.0));
         assert_eq!(at(r0 - 0.01).0, 1.0);
         assert!((at(r0 + 12.5).0 - 0.5).abs() < 1e-4);
@@ -802,9 +805,9 @@ fn main_pass_post_lighting_processing(p: PbrInput, c: vec4<f32>) -> vec4<f32> { 
         assert!((at(r1 + 25.0).1 - 0.5).abs() < 1e-4);
         assert_eq!(at(r1 + LOD1_WIDTH + 0.01), (0.0, 0.0));
         // Chebyshev, not Euclidean: (30, 5, -30) is 30 m away, height counts too
-        let (t0, _) = lod_blend(Vec3::new(30.0, 5.0, -30.0), NATIVE_FOV);
+        let (t0, _) = lod_blend(Vec3::new(30.0, 5.0, -30.0), ENGINE_CAMERA_CTOR_FOV);
         assert!((t0 - (1.0 - (30.0 - r0) / 25.0)).abs() < 1e-5);
-        let (t0, _) = lod_blend(Vec3::new(0.0, 30.0, 0.0), NATIVE_FOV);
+        let (t0, _) = lod_blend(Vec3::new(0.0, 30.0, 0.0), ENGINE_CAMERA_CTOR_FOV);
         assert!(t0 < 0.6);
         // Bevy's default camera (45°): 40.5 / 65.5 m and 405 / 455 m
         let k45 = lod_scale(std::f32::consts::FRAC_PI_4);

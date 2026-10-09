@@ -3,7 +3,12 @@
 # usage: with-build-lock.sh <label> <command> [args...]
 # Waits until the lock is free, holds it for the command, releases on exit.
 # A lock older than 45 minutes is assumed abandoned and is broken.
-HERE="${JC2_LOCK_DIR:-$(cd "$(dirname "$0")" && pwd)/.lock}"
+# One lock for the main checkout and every git worktree: resolve the shared .git dir, so a
+# worktree copy of this script does not lock only itself.
+COMMON="$(git -C "$(dirname "$0")" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+if [ -n "$COMMON" ]; then DEFAULT_LOCK="$(dirname "$COMMON")/scripts/.lock"
+else DEFAULT_LOCK="$(cd "$(dirname "$0")" && pwd)/.lock"; fi
+HERE="${JC2_LOCK_DIR:-$DEFAULT_LOCK}"
 LOCK="$HERE/lock"; mkdir -p "$HERE"
 label="$1"; shift
 while ! mkdir "$LOCK" 2>/dev/null; do

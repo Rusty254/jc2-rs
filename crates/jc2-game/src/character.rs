@@ -201,6 +201,9 @@ impl Plugin for CharacterPlugin {
             app.add_plugins(crate::grapple::GrapplePlugin);
         }
         app.add_plugins(crate::ragdoll::RagdollPlugin);
+        if !app.is_plugin_added::<crate::gameplay_camera::GameplayCameraPlugin>() {
+            app.add_plugins(crate::gameplay_camera::GameplayCameraPlugin);
+        }
         app.init_resource::<CameraMode>()
             .insert_resource(HeroEnabled)
             .init_resource::<HeroInput>()
@@ -1412,7 +1415,7 @@ fn pick_base(
     if !hero.grounded {
         let clip = if hero.air_time < 0.35 && lin.y > 0.5 {
             Clip::Jump
-        } else if hero.air_time > 1.5 && lin.y < -12.0 && has(Clip::Dive) {
+        } else if crate::gameplay_camera::is_skydiving(hero, lin.y) && has(Clip::Dive) {
             Clip::Dive
         } else {
             Clip::Fall
