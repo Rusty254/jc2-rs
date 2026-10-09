@@ -12,7 +12,7 @@
 //! | `facade_night` (`S0`) | pixel `cb2[0].x` of the merged/facade render blocks (inferred: a "lights on" factor) | **stored only**: this crate has no facade/merged-block material |
 //!
 //! The six RGB tables of `gradients.bmp` do **not** feed the sun colour or the ambient. Those
-//! are driven by `textures\landscape\gamezone_gradients.bmp` (JC2-115), not yet implemented;
+//! are driven by `textures\landscape\gamezone_gradients.bmp` (JC2-115, `sky_light.rs`, JC2-122);
 //! nothing here touches them. Interaction (gap): gamezone rows 2/3 also feed the cloud object,
 //! so the cloud card colours set here from table `C` may be overridden or combined natively.
 //!
@@ -215,14 +215,20 @@ mod tests {
             .id();
         // no tables: the project's intensity stands
         app.update();
-        assert_eq!(app.world().get::<PointLight>(tagged).unwrap().intensity, 1000.0);
+        assert_eq!(
+            app.world().get::<PointLight>(tagged).unwrap().intensity,
+            1000.0
+        );
         // tables at noon (variant 0): 0.25 of night
         let mut s = AtmosphereState::evaluate(None, 12.0, 0.0, 0.0);
         s.loaded = true;
         s.point_light_scale = 0.25;
         app.insert_resource(s);
         app.update();
-        assert_eq!(app.world().get::<PointLight>(tagged).unwrap().intensity, 250.0);
+        assert_eq!(
+            app.world().get::<PointLight>(tagged).unwrap().intensity,
+            250.0
+        );
         assert_eq!(app.world().get::<PointLight>(plain).unwrap().intensity, 7.0);
     }
 
@@ -242,6 +248,10 @@ mod tests {
         app.update();
         let s = app.world().resource::<AtmosphereState>();
         assert_eq!((s.hour, s.precip, s.w1), (6.0, 0.5, 0.5));
-        assert!(s.sun_dir.y > 0.0 && s.sun_dir.x > 0.7, "dawn sun {:?}", s.sun_dir);
+        assert!(
+            s.sun_dir.y > 0.0 && s.sun_dir.x > 0.7,
+            "dawn sun {:?}",
+            s.sun_dir
+        );
     }
 }

@@ -514,6 +514,55 @@ impl GlobalTerrain {
     }
 }
 
+/// One byte of the game zone map (`CGameZoneMap`, 8 m cells, last section of a terrain tile;
+/// `research/formats/gamezone-map-next.md`): `intensity (2 bits) | type (3 bits) | low3`.
+/// The accessors are `FUN_00a5e400` (bits 6..7), `FUN_00a5e3f0` (bits 3..5), `FUN_00a5e410`
+/// (bits 0..2). The type is the gradient light set (identity map in `landscape_effects.bin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GameZoneCell(pub u8);
+
+impl GameZoneCell {
+    /// Bits 3..5: 0 None, 1 Arctic, 2 Desert, 3 Jungle, 4 Sea, 5 City, 6 Grass, 7 Default.
+    pub fn zone_type(self) -> u8 {
+        (self.0 >> 3) & 7
+    }
+    /// Bits 6..7 (0..3).
+    pub fn intensity(self) -> u8 {
+        self.0 >> 6
+    }
+    /// Bits 0..2 (a sub-zone field; not used by lighting).
+    pub fn low3(self) -> u8 {
+        self.0 & 7
+    }
+}
+
+/// The byte the engine's patch reset fills with (`FUN_00a56090`: `memset(..., 0xe0, 0x1000)`),
+/// Sea at intensity 3. **Non-native as a fallback** for tiles that are not loaded or positions
+/// outside the world: the engine reads an unrelated ring slot there.
+pub const GAMEZONE_RESET_BYTE: u8 = 0xE0;
+
+/// `FUN_00a5eb50`: the tile and cell of a world position, in float32 exactly as the engine does
+/// it (no bounds check: `x = 16384` gives tile 64, `x < -16384` tile -1). Returns
+/// `(tile_x, tile_z, cell_x, cell_z)`, cells 0..63 (cell = row `z` * 64 + column `x`).
+pub fn zone_cell(x: f32, z: f32) -> (i32, i32, usize, usize) {
+    fn split(v: f32) -> (i32, usize) {
+        // (v - (-16384)) * (1/512); cvttss2si truncates, then 1 is subtracted when the
+        // fraction is negative
+        let u = (v - WORLD_MIN) * 0.001_953_125;
+        let t = u as i32;
+        let mut frac = u - t as f32;
+        let mut tile = t;
+        if frac < 0.0 {
+            tile -= 1;
+            frac += 1.0;
+        }
+        (tile, ((frac * 64.0) as i32).clamp(0, 63) as usize)
+    }
+    let (tx, cx) = split(x);
+    let (tz, cz) = split(z);
+    (tx, tz, cx, cz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,5 +700,56 @@ mod tests {
         let h = g.height_at(0.0, -16384.0 + 640.0 + 32.0);
         assert!((h - 10.5 * HEIGHT_SCALE).abs() < 1e-4, "{h}");
         assert_eq!(g.height_at(-20000.0, 0.0), height_to_metres(NO_DATA));
+    }
+    #[test]
+    fn zone_cell_follows_the_engines_float_sequence() {
+        // the probe's fixtures (gamezone-map-next.md section 5)
+        assert_eq!(zone_cell(-1280.0, -6712.0), (29, 18, 32, 57));
+        assert_eq!(zone_cell(-16384.0, -16384.0), (0, 0, 0, 0));
+        assert_eq!(zone_cell(-16000.0, -16000.0), (0, 0, 48, 48));
+        assert_eq!(zone_cell(16384.0, 0.0).0, 64, "no bounds check: tile 64");
+        assert_eq!(zone_cell(-16385.0, 0.0).0, -1, "below the world: tile -1");
+        assert_eq!(zone_cell(-16385.0, 0.0).2, 63);
+        // the byte layout
+        let c = GameZoneCell(0xC8);
+        assert_eq!((c.zone_type(), c.intensity(), c.low3()), (1, 3, 0));
+        let c = GameZoneCell(0x3A);
+        assert_eq!((c.zone_type(), c.intensity(), c.low3()), (7, 0, 2));
+        let sea = GameZoneCell(GAMEZONE_RESET_BYTE);
+        assert_eq!((sea.zone_type(), sea.intensity()), (4, 3));
+    }
+
+    /// The probe's lookups on the real tiles (needs the game files): position -> byte.
+    #[test]
+    fn real_zone_bytes_match_the_probe_fixtures() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let Ok(fs) = crate::vfs::GameFs::open(dir) else {
+            return;
+        };
+        #[rustfmt::skip]
+        let fixtures: [(f32, f32, u8); 12] = [
+            (-1280.0, -6712.0, 0xC8),   // start base: Arctic, intensity 3
+            (3164.6, -3777.0, 0xC8),    // research facility
+            (6884.9, -3508.6, 0x0C),    // military base 45x25: Arctic, intensity 0, low3 4
+            (-9493.4, 5583.0, 0xD0),    // desert base
+            (-15092.0, -14524.0, 0xD8), // jungle interior
+            (-16000.0, -16000.0, 0xE0), // open ocean
+            (-15364.0, -3092.0, 0xE8),  // city interior
+            (-3749.1, 9594.4, 0xF0),    // grass village
+            (12473.3, 11692.6, 0xF8),   // Default base
+            (-6635.8, -3585.5, 0x3A),   // airport: Default, intensity 0, low3 2
+            (-2730.4, 4622.7, 0x50),    // village 26x41: Desert, intensity 1
+            (-16384.0, -16384.0, 0xE0), // world corner
+        ];
+        for (x, z, want) in fixtures {
+            let (tx, tz, cx, cz) = zone_cell(x, z);
+            let name = tile_file_name(tx as u32, tz as u32);
+            let data = fs.read_inflated(&name).expect("terrain tile is readable");
+            let tile = TerrainTile::parse(&data).expect("tile parses");
+            assert_eq!(tile.gamezone.len(), 4096, "{name}");
+            assert_eq!(tile.gamezone[cz * 64 + cx], want, "({x}, {z}) in {name}");
+        }
     }
 }

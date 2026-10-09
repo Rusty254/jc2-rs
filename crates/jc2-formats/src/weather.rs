@@ -13,8 +13,8 @@
 //! per-hour tables ([`GradientTables`], `research/formats/light-tables-next.md`, JC2-100),
 //! which feed the cloud cards, the haze/fog colours, a point-light scale and a facade
 //! factor, not the sun or the ambient. The sun/moon colour and ambients are driven by
-//! `textures\landscape\gamezone_gradients.bmp` (JC2-115), not yet implemented; the game
-//! crate picks its own meanwhile (non-native).
+//! `textures\landscape\gamezone_gradients.bmp` ([`GameZoneGradients`], with the constants of
+//! `settings\landscape_effects.bin` in [`LandscapeEffects`]; JC2-115, JC2-122).
 
 use crate::Result;
 use crate::dds::DdsImage;
@@ -431,6 +431,272 @@ impl GradientTables {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// gamezone_gradients.bmp: the native sun/moon colour and sky/ground ambient (JC2-115, JC2-122)
+// ---------------------------------------------------------------------------------------------
+
+/// `textures\landscape\gamezone_gradients.bmp` (named by `settings\landscape_effects.bin`; files
+/// are matched by name).
+pub const GAMEZONE_GRADIENTS_FILE: &str = "gamezone_gradients.bmp";
+/// `settings\landscape_effects.bin`, matched by name.
+pub const LANDSCAPE_EFFECTS_FILE: &str = "landscape_effects.bin";
+/// Gradient sets that hold data: 0..7 the game zone types, 8 height, 9 underwater, 10 rain,
+/// 11 snow. The picture has 16; sets 12..15 are black filler (night-light-next.md section 3).
+pub const ZONE_SETS: usize = 12;
+const ZONE_PICTURE_SETS: usize = 16;
+/// Colour rows per set. Row 0 sun/moon colour, row 1 colour 2, rows 2/3 cloud colours, row 4 the
+/// sky ambient (`cb0[10]`, up-facing), row 5 the ground ambient (`cb0[11]`, down-facing).
+pub const ZONE_ROWS: usize = 6;
+pub const ROW_SUN: usize = 0;
+pub const ROW_SKY_AMBIENT: usize = 4;
+pub const ROW_GROUND_AMBIENT: usize = 5;
+/// The game zone type `Default` of `terrain\gamezone.bin` (id 7); its gradient set is 7.
+pub const ZONE_TYPE_DEFAULT: usize = 7;
+const ZONE_VARIANTS: usize = 2;
+const ZONE_PICTURE_W: i32 = (ZONE_VARIANTS * GRADIENT_HOURS) as i32; // 48
+const ZONE_PICTURE_H: i32 = (ZONE_PICTURE_SETS * ZONE_ROWS) as i32; // 96
+/// `1 / 2.2` as the double at `0x00e5b860` (the float 2.2 promoted).
+const GRADIENT_INV_GAMMA: f64 = 0.454_545_438_289_642_33;
+
+/// The 12 data sets x 6 rows x 2 variants x 24 hours of `gamezone_gradients.bmp`
+/// (`FUN_00a632b0`): pixel `(set * 6 + row, variant * 24 + hour)`, R = byte 2, memory row 0 =
+/// top of the picture, `rgb ** 2.2` (linear); entry 24 of each variant = entry 0 (the day
+/// wraps). Sets 12..15 are black filler and not kept. Index: `t[set][row][variant][hour]`.
+pub type ZoneTable = [[[[[f32; 3]; GRADIENT_HOURS + 1]; ZONE_VARIANTS]; ZONE_ROWS]; ZONE_SETS];
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GameZoneGradients {
+    pub t: Box<ZoneTable>,
+}
+
+impl GameZoneGradients {
+    pub fn load(fs: &GameFs) -> Result<Self> {
+        Self::parse(&fs.read_inflated(GAMEZONE_GRADIENTS_FILE)?)
+    }
+
+    /// A table from a function of `(set, row, variant, hour)` (hour 0..24; entry 24 repeats
+    /// entry 0). For tests and synthetic fixtures.
+    pub fn from_fn(f: impl Fn(usize, usize, usize, usize) -> [f32; 3]) -> Self {
+        let mut t =
+            Box::new([[[[[0.0; 3]; GRADIENT_HOURS + 1]; ZONE_VARIANTS]; ZONE_ROWS]; ZONE_SETS]);
+        for (s, set) in t.iter_mut().enumerate() {
+            for (r, row) in set.iter_mut().enumerate() {
+                for (v, var) in row.iter_mut().enumerate() {
+                    for (h, entry) in var.iter_mut().take(GRADIENT_HOURS).enumerate() {
+                        *entry = f(s, r, v, h);
+                    }
+                    var[GRADIENT_HOURS] = var[0];
+                }
+            }
+        }
+        Self { t }
+    }
+
+    pub fn parse(bmp: &[u8]) -> Result<Self> {
+        let bad = |m: &str| crate::Error::format(format!("gamezone_gradients.bmp: {m}"));
+        let u32_at = |o: usize| -> Result<u32> {
+            bmp.get(o..o + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .ok_or_else(|| bad("truncated header"))
+        };
+        if bmp.get(..2) != Some(b"BM") {
+            return Err(bad("not a BMP"));
+        }
+        let off = u32_at(10)? as usize;
+        let (w, h) = (u32_at(18)? as i32, u32_at(22)? as i32);
+        let bpp = bmp
+            .get(28..30)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .ok_or_else(|| bad("truncated header"))?;
+        if bpp != 24 || u32_at(30)? != 0 {
+            return Err(bad("needs an uncompressed 24 bpp picture"));
+        }
+        if w != ZONE_PICTURE_W || h != ZONE_PICTURE_H {
+            return Err(bad("needs 48 x 96 pixels (16 sets x 6 rows, 2 x 24 hours)"));
+        }
+        let pitch = (w as usize * 3 + 3) & !3;
+        if bmp.len() < off.saturating_add(pitch * h as usize) {
+            return Err(bad("truncated pixels"));
+        }
+        // memory row r is file row (h - 1 - r); pixel -> (R, G, B) = bytes (2, 1, 0) / 255
+        let px = |r: usize, c: usize| -> [f32; 3] {
+            let o = off + (h as usize - 1 - r) * pitch + c * 3;
+            [
+                bmp[o + 2] as f32 / 255.0,
+                bmp[o + 1] as f32 / 255.0,
+                bmp[o] as f32 / 255.0,
+            ]
+        };
+        let lin = |x: f32| (x as f64).powf(GRADIENT_GAMMA) as f32;
+        Ok(Self::from_fn(|s, r, v, hour| {
+            let p = px(s * ZONE_ROWS + r, v * GRADIENT_HOURS + hour);
+            [lin(p[0]), lin(p[1]), lin(p[2])]
+        }))
+    }
+
+    /// One row of one variant at `hour`, linear between hour `i` and `i + 1` (entry 24 wraps).
+    pub fn row_at(&self, set: usize, row: usize, variant: usize, hour: f32) -> [f32; 3] {
+        let tab = &self.t[set.min(ZONE_SETS - 1)][row.min(ZONE_ROWS - 1)][variant.min(1)];
+        let (i, j, f) = hour_pair(hour);
+        std::array::from_fn(|c| tab[i][c] + (tab[j][c] - tab[i][c]) * f)
+    }
+
+    /// The six rows of a set at `hour` for the variant weight `wv` (0..1):
+    /// `wv * variant 0 + (1 - wv) * variant 1`, the base case of `FUN_00a5d390` (on the ground,
+    /// no rain or snow; night-light-next.md section 4). That variant 0 is the high-intensity
+    /// one is inferred; it only matters in sets 2, 3 and 9.
+    pub fn rows(&self, set: usize, wv: f32, hour: f32) -> [[f32; 3]; ZONE_ROWS] {
+        let wv = wv.clamp(0.0, 1.0);
+        std::array::from_fn(|r| {
+            let a = self.row_at(set, r, 0, hour);
+            let b = self.row_at(set, r, 1, hour);
+            std::array::from_fn(|c| a[c] * wv + b[c] * (1.0 - wv))
+        })
+    }
+}
+
+/// The final transform of the sun colour (vector 0 only; exe `0x00a5df12..0x00a5df52`):
+/// `x -> ((x ** (1 / 2.2)) * gain) ** 2.2` per channel. With the picture's 255 and gain 2.2 the
+/// maximum is `2.2 ** 2.2` = 5.667. The other vectors (colour 2, the ambients) are used raw.
+pub fn sun_colour_transform(rgb: [f32; 3], gain: f32) -> [f32; 3] {
+    rgb.map(|x| {
+        let x = x.max(0.0) as f64;
+        ((x.powf(GRADIENT_INV_GAMMA) * gain as f64).powf(GRADIENT_GAMMA)) as f32
+    })
+}
+
+// settings\landscape_effects.bin keys. Names where the hash matched (`gradient_for_zone_NN`,
+// `game_zones`, `max_gradient_N`); the rest are the hashes whose values the exe's loader
+// `FUN_00a69830` reads from the exe key table (exe address and destination in the comments;
+// night-light-next.md section 2).
+const LE_GRADIENT_BLOCK: u32 = 0xe675_b7c8; // the block holding the gradient keys
+const LE_IMAGE_PATH: u32 = 0x0c47_9c2f; // 0x00f1223c: "textures\landscape\gamezone_gradients.bmp"
+const LE_ALTITUDE_A: u32 = 0x12c1_139f; // 0x00f12240 -> Z+0x1aec: 30 m
+const LE_ALTITUDE_B: u32 = 0xe2ac_8f85; // 0x00f12244 -> Z+0x1af0: 300 m
+const LE_ALTITUDE_C: u32 = 0x7157_f3a4; // 0x00f12248 -> Z+0x1ae4: 1000 m
+const LE_UNDERWATER_DEPTH: u32 = 0xd91f_594f; // 0x00f1224c -> Z+0x1ae8: 120 m
+const LE_SET_ALTITUDE: u32 = 0x5aa8_f383; // 0x00f12250 -> Z+0x1ad0: 8
+const LE_SET_UNDERWATER: u32 = 0x33c9_5e4b; // 0x00f12254 -> Z+0x1ad4: 9
+const LE_SET_RAIN: u32 = 0x49c4_c7d7; // 0x00f12258 -> Z+0x1ad8: 10
+const LE_SET_SNOW: u32 = 0xa4b4_4b37; // 0x00f1225c -> Z+0x1adc: 11
+const LE_GAIN: u32 = 0x9c93_19fc; // 0x00f121ec -> Z+0x147e0: 2.2 (constructor default 1.7)
+const LE_SMOOTHING: u32 = 0xa08d_04c3; // root value -> Z+0x1ac0: 1.0 (the smoothing rate, 1/s)
+/// Zone-type count of `gradient_for_zone_NN` (zone type N -> gradient set).
+pub const ZONE_TYPES: usize = 8;
+/// Entries of `game_zones` (`max_gradient_0..9`).
+const MAX_GRADIENT_KEYS: usize = 10;
+
+/// What `settings\landscape_effects.bin` gives the gradient system (`FUN_00a69830`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LandscapeEffects {
+    /// The picture (`textures\landscape\gamezone_gradients.bmp`).
+    pub image: String,
+    /// `gradient_for_zone_NN`: the gradient set of game zone type N (identity in the retail
+    /// file: Arctic 1, Desert 2, Jungle 3, Sea 4, City 5, Grass 6, Default 7, None 0).
+    pub zone_set: [u32; ZONE_TYPES],
+    /// The gain of the sun-colour transform (2.2 in the file; the exe constructor's own
+    /// default is 1.7).
+    pub gain: f32,
+    /// The smoothing rate (key `#a08d04c3`, 1.0): the state moves toward the target by
+    /// `clamp(rate * dt)` per frame.
+    pub smoothing_rate: f32,
+    /// `max_gradient_0..9` (3 each). The variant weight of a zone cell is
+    /// `intensity / max_gradient` (probe reading of `Z[0x1a80 + set * 4]`).
+    pub max_gradient: [f32; MAX_GRADIENT_KEYS],
+    /// Sets used by the branches that are not implemented here (night-light-next.md gap 2):
+    /// altitude 8, underwater 9, rain 10, snow 11.
+    pub set_altitude: u32,
+    pub set_underwater: u32,
+    pub set_rain: u32,
+    pub set_snow: u32,
+    /// The altitude thresholds 30 / 300 / 1000 m and the underwater depth 120 m (same gap).
+    pub altitude: [f32; 3],
+    pub underwater_depth: f32,
+}
+
+impl LandscapeEffects {
+    pub fn load(fs: &GameFs) -> Result<Self> {
+        Self::parse(&fs.read_inflated(LANDSCAPE_EFFECTS_FILE)?)
+    }
+
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        let missing = |what: &str| {
+            crate::Error::format(format!("landscape_effects.bin: missing or bad {what}"))
+        };
+        let file = PropertyFile::parse_any(data)?;
+        let root = file
+            .nodes
+            .first()
+            .ok_or_else(|| crate::Error::format("landscape_effects.bin is empty"))?;
+        let block = root
+            .children
+            .iter()
+            .find(|(k, _)| k.hash() == LE_GRADIENT_BLOCK)
+            .map(|(_, n)| n)
+            .ok_or_else(|| missing("gradient block #e675b7c8"))?;
+        let image = match block.value_hash(LE_IMAGE_PATH) {
+            Some(Variant::Str(s)) => s.clone(),
+            _ => return Err(missing("gradient image path")),
+        };
+        let get = |n: &Node, h: u32, what: &str| num(n, h).ok_or_else(|| missing(what));
+        let mut zone_set = [0u32; ZONE_TYPES];
+        for (i, slot) in zone_set.iter_mut().enumerate() {
+            let name = format!("gradient_for_zone_{i:02}");
+            let v = get(block, crate::hash::hash_str(&name), &name)?;
+            if !(0.0..ZONE_SETS as f32).contains(&v) {
+                return Err(missing(&name));
+            }
+            *slot = v as u32;
+        }
+        let zones = root
+            .child("game_zones")
+            .ok_or_else(|| missing("game_zones"))?;
+        let mut max_gradient = [0.0; MAX_GRADIENT_KEYS];
+        for (i, slot) in max_gradient.iter_mut().enumerate() {
+            let name = format!("max_gradient_{i}");
+            *slot = get(zones, crate::hash::hash_str(&name), &name)?;
+            if *slot <= 0.0 {
+                return Err(missing(&name));
+            }
+        }
+        let gain = get(block, LE_GAIN, "gradient gain")?;
+        let smoothing_rate = get(root, LE_SMOOTHING, "smoothing rate #a08d04c3")?;
+        Ok(Self {
+            image,
+            zone_set,
+            gain,
+            smoothing_rate,
+            max_gradient,
+            set_altitude: get(block, LE_SET_ALTITUDE, "altitude set")? as u32,
+            set_underwater: get(block, LE_SET_UNDERWATER, "underwater set")? as u32,
+            set_rain: get(block, LE_SET_RAIN, "rain set")? as u32,
+            set_snow: get(block, LE_SET_SNOW, "snow set")? as u32,
+            altitude: [
+                get(block, LE_ALTITUDE_A, "altitude 30")?,
+                get(block, LE_ALTITUDE_B, "altitude 300")?,
+                get(block, LE_ALTITUDE_C, "altitude 1000")?,
+            ],
+            underwater_depth: get(block, LE_UNDERWATER_DEPTH, "underwater depth")?,
+        })
+    }
+
+    /// The gradient set of a game zone type (0..7; larger types clamp to `Default`).
+    pub fn set_for_zone_type(&self, zone_type: usize) -> usize {
+        self.zone_set
+            .get(zone_type)
+            .copied()
+            .unwrap_or(self.zone_set[ZONE_TYPE_DEFAULT]) as usize
+    }
+
+    /// The variant weight of the zone intensity (0..3, bits 6..7 of the cell byte) in the
+    /// base case: `clamp(intensity / max_gradient[set])`. Sets above 9 have no weight in the
+    /// file; the last one stands (they enter through the rain/snow weights natively).
+    pub fn variant_weight(&self, set: usize, intensity: f32) -> f32 {
+        let m = self.max_gradient[set.min(MAX_GRADIENT_KEYS - 1)];
+        (intensity / m).clamp(0.0, 1.0)
+    }
+}
+
 /// The exe's sun: the unit vector `a = (0, 1, 1) / √2` is turned about the axis
 /// `b = (0, −1, 0.8)` (normalised) by `(hour − 12) · 15°`.
 const SUN_REST: [f32; 3] = [0.0, 1.0, 1.0];
@@ -786,25 +1052,52 @@ mod tests {
         assert!((t.s0_at(6.0) - 0.184_313_73).abs() < 1e-6);
         assert_eq!(t.s0_at(12.0), 0.0);
         assert!((t.s0_at(18.0) - 0.196_078_43).abs() < 1e-6);
-        assert!((t.s0_at(23.5) - 0.264_705_88).abs() < 1e-6, "hour 23.5 wraps");
+        assert!(
+            (t.s0_at(23.5) - 0.264_705_88).abs() < 1e-6,
+            "hour 23.5 wraps"
+        );
         assert_eq!(t.scalar_at(0, 0.0), 1.0);
         assert!((t.scalar_at(0, 12.0) - 0.250_980_4).abs() < 1e-6);
-        assert!((t.scalar_blend(12.0, 1.0, 0.0) - 1.0).abs() < 1e-6, "variant 1 is 1.0");
+        assert!(
+            (t.scalar_blend(12.0, 1.0, 0.0) - 1.0).abs() < 1e-6,
+            "variant 1 is 1.0"
+        );
         // C = cloud lit, D = shaded
-        near3(t.rgb_at(RgbTable::C, 0, 12.0), [0.560_499, 0.547_993, 0.517_401]);
-        near3(t.rgb_at(RgbTable::D, 0, 12.0), [0.399_293, 0.388_91, 0.363_604]);
+        near3(
+            t.rgb_at(RgbTable::C, 0, 12.0),
+            [0.560_499, 0.547_993, 0.517_401],
+        );
+        near3(
+            t.rgb_at(RgbTable::D, 0, 12.0),
+            [0.399_293, 0.388_91, 0.363_604],
+        );
         near3(t.rgb_at(RgbTable::C, 0, 6.0), [1.0, 0.302_125, 0.136_099]);
         near3(t.rgb_at(RgbTable::C, 0, 18.0), [1.0, 0.388_91, 0.065_754]);
-        near3(t.rgb_at(RgbTable::D, 0, 0.0), [0.011_881, 0.018_913, 0.026_549]);
+        near3(
+            t.rgb_at(RgbTable::D, 0, 0.0),
+            [0.011_881, 0.018_913, 0.026_549],
+        );
         near3(t.rgb_at(RgbTable::A, 0, 12.0), [0.0, 0.320_382, 0.940_601]);
-        near3(t.rgb_at(RgbTable::B, 0, 6.0), [0.141_98, 0.157_281, 0.197_516]);
-        near3(t.rgb_at(RgbTable::E, 0, 12.0), [0.008_373, 0.130_352, 0.130_352]);
+        near3(
+            t.rgb_at(RgbTable::B, 0, 6.0),
+            [0.141_98, 0.157_281, 0.197_516],
+        );
+        near3(
+            t.rgb_at(RgbTable::E, 0, 12.0),
+            [0.008_373, 0.130_352, 0.130_352],
+        );
         near3(t.rgb_at(RgbTable::F, 0, 0.0), [0.0, 0.026_549, 0.044_553]);
         // variants 1 and 2, and the 23.5 wrap
-        near3(t.rgb_at(RgbTable::A, 1, 6.0), [0.080_219, 0.082_414, 0.096_266]);
+        near3(
+            t.rgb_at(RgbTable::A, 1, 6.0),
+            [0.080_219, 0.082_414, 0.096_266],
+        );
         near3(t.rgb_at(RgbTable::C, 1, 12.0), [0.015_175; 3]);
         near3(t.rgb_at(RgbTable::C, 0, 23.5), [0.100_115; 3]);
-        near3(t.rgb_at(RgbTable::A, 2, 23.5), [0.035_629, 0.042_219, 0.046_962]);
+        near3(
+            t.rgb_at(RgbTable::A, 2, 23.5),
+            [0.035_629, 0.042_219, 0.046_962],
+        );
         // the probe's variant mix of C: 12:00 with (w1, w2) = (0.5, 0.25), and 23.5
         near3(
             t.rgb_blend(RgbTable::C, 12.0, 0.5, 0.25),
@@ -814,5 +1107,184 @@ mod tests {
         // gradients.bmp is 1640 bytes (probe BMP_SHA256 b66bf510...)
         let fs = game().unwrap();
         assert_eq!(fs.read_inflated(GRADIENTS_FILE).unwrap().len(), 1640);
+    }
+
+    // ---- gamezone_gradients.bmp / landscape_effects.bin (JC2-122) -------------------------
+
+    /// A 48 x 96 24 bpp BMP whose pixel `(mem_row, x)` is `f(mem_row, x)` as (R, G, B) bytes;
+    /// memory row 0 is the top of the picture = the last file row.
+    fn zone_bmp(f: impl Fn(usize, usize) -> [u8; 3]) -> Vec<u8> {
+        let (w, h, pitch) = (48usize, 96usize, 144usize);
+        let mut bmp = vec![0u8; 54 + pitch * h];
+        bmp[..2].copy_from_slice(b"BM");
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&(w as i32).to_le_bytes());
+        bmp[22..26].copy_from_slice(&(h as i32).to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        for r in 0..h {
+            for x in 0..w {
+                let [red, g, b] = f(r, x);
+                let o = 54 + (h - 1 - r) * pitch + x * 3;
+                bmp[o..o + 3].copy_from_slice(&[b, g, red]);
+            }
+        }
+        bmp
+    }
+
+    #[test]
+    fn zone_picture_layout_channels_and_wrap() {
+        // pixel (mem_row, x): R = 2 row, G = 5 x, B = 7
+        let bmp = zone_bmp(|r, x| [r as u8 * 2, x as u8 * 5, 7]);
+        let g = GameZoneGradients::parse(&bmp).unwrap();
+        // set 2 row 3 = memory row 15; variant 1 hour 4 = column 28
+        let e = g.t[2][3][1][4];
+        let lin = |b: f32| ((b / 255.0) as f64).powf(2.200_000_047_683_716) as f32;
+        near3(e, [lin(30.0), lin(140.0), lin(7.0)]);
+        // entry 24 repeats entry 0; hour 23.5 sits halfway between them
+        assert_eq!(g.t[0][0][0][24], g.t[0][0][0][0]);
+        let mid = g.row_at(0, 0, 0, 23.5);
+        for (c, m) in mid.iter().enumerate() {
+            let want = (g.t[0][0][0][23][c] + g.t[0][0][0][0][c]) / 2.0;
+            assert!((m - want).abs() < 1e-6);
+        }
+        // rows(): wv mixes variant 0 and 1
+        let lo = g.rows(2, 0.0, 4.0)[3];
+        let hi = g.rows(2, 1.0, 4.0)[3];
+        near3(lo, g.row_at(2, 3, 1, 4.0));
+        near3(hi, g.row_at(2, 3, 0, 4.0));
+        let half = g.rows(2, 0.5, 4.0)[3];
+        for c in 0..3 {
+            assert!((half[c] - (lo[c] + hi[c]) / 2.0).abs() < 1e-6);
+        }
+        // sizes and bit depth are checked
+        let mut small = bmp.clone();
+        small[18..22].copy_from_slice(&24i32.to_le_bytes());
+        assert!(GameZoneGradients::parse(&small).is_err());
+        assert!(GameZoneGradients::parse(&bmp[..bmp.len() - 1]).is_err());
+        assert!(GameZoneGradients::parse(b"nope").is_err());
+    }
+
+    #[test]
+    fn the_sun_transform_peaks_at_2_2_to_the_2_2() {
+        let top = sun_colour_transform([1.0, 1.0, 1.0], 2.2);
+        for c in top {
+            assert!((c - 5.666_696).abs() < 2e-3, "{top:?}");
+        }
+        assert_eq!(sun_colour_transform([0.0; 3], 2.2), [0.0; 3]);
+        // gain 1: the 1/2.2 and 2.2 powers cancel
+        let id = sun_colour_transform([0.25, 0.5, 0.75], 1.0);
+        for (a, b) in id.iter().zip([0.25, 0.5, 0.75]) {
+            assert!((a - b).abs() < 1e-5);
+        }
+        // a blended pixel p becomes (2.2 p) ** 2.2 in the linear domain
+        let p = 0.5f64;
+        let want = (2.2 * p).powf(2.2) as f32;
+        assert!((sun_colour_transform([(p.powf(2.2)) as f32; 3], 2.2)[0] - want).abs() < 1e-3);
+    }
+
+    /// The probe's table (`night_light_probe.py`, brief section 5): set, hour, sun/moon colour
+    /// after the transform, sky ambient `cb0[10]`, ground ambient `cb0[11]`, intensity 3.
+    #[test]
+    fn zone_gradients_match_the_probe_rows() {
+        let Some(fs) = game() else { return };
+        if !fs.contains(GAMEZONE_GRADIENTS_FILE) || !fs.contains(LANDSCAPE_EFFECTS_FILE) {
+            return;
+        }
+        let raw = fs.read_inflated(GAMEZONE_GRADIENTS_FILE).unwrap();
+        // 13,880 B, probe BMP_SHA256 b43e8c1b...
+        assert_eq!(raw.len(), 13_880);
+        let g = GameZoneGradients::parse(&raw).expect("gamezone_gradients.bmp parses");
+        let le = LandscapeEffects::load(&fs).expect("landscape_effects.bin parses");
+        type Row = (usize, f32, [f32; 3], [f32; 3], [f32; 3]);
+        #[rustfmt::skip]
+        let rows: [Row; 12] = [
+            (1, 0.0,  [0.532, 0.616, 0.707], [0.048, 0.114, 0.170], [0.006, 0.006, 0.032]),
+            (1, 4.0,  [0.532, 0.616, 0.707], [0.122, 0.201, 0.298], [0.006, 0.006, 0.032]),
+            (1, 6.0,  [2.698, 0.909, 0.467], [0.284, 0.251, 0.298], [0.235, 0.263, 0.293]),
+            (1, 9.0,  [2.383, 2.175, 1.662], [0.000, 0.080, 0.085], [0.723, 0.789, 0.745]),
+            (1, 12.0, [1.922, 1.763, 1.376], [0.000, 0.021, 0.070], [0.883, 0.941, 0.867]),
+            (1, 18.0, [1.977, 0.631, 0.164], [0.148, 0.231, 0.284], [0.247, 0.164, 0.099]),
+            (1, 21.0, [0.532, 0.616, 0.707], [0.048, 0.114, 0.170], [0.006, 0.006, 0.032]),
+            (7, 0.0,  [0.330, 0.723, 1.223], [0.008, 0.145, 0.316], [0.006, 0.006, 0.032]),
+            (7, 6.0,  [4.646, 1.563, 0.805], [0.284, 0.251, 0.298], [0.028, 0.028, 0.028]),
+            (7, 12.0, [5.667, 5.051, 3.697], [0.000, 0.017, 0.041], [0.730, 0.554, 0.263]),
+            (7, 18.0, [3.394, 1.079, 0.280], [0.148, 0.231, 0.284], [0.145, 0.062, 0.024]),
+            (7, 21.0, [0.330, 0.723, 1.223], [0.008, 0.145, 0.316], [0.006, 0.006, 0.032]),
+        ];
+        for (set, hour, sun, sky, gnd) in rows {
+            let wv = le.variant_weight(set, 3.0);
+            assert_eq!(wv, 1.0, "intensity 3 of max_gradient 3");
+            let r = g.rows(set, wv, hour);
+            let s = sun_colour_transform(r[ROW_SUN], le.gain);
+            for c in 0..3 {
+                let at = format!("set {set} hour {hour} channel {c}");
+                assert!((s[c] - sun[c]).abs() < 6e-4, "{at} sun {s:?} vs {sun:?}");
+                assert!((r[ROW_SKY_AMBIENT][c] - sky[c]).abs() < 6e-4, "{at} sky");
+                assert!(
+                    (r[ROW_GROUND_AMBIENT][c] - gnd[c]).abs() < 6e-4,
+                    "{at} ground"
+                );
+            }
+        }
+        // sets 0..8 hold one constant night colour for hours 19..23 and 0..4 (row 0)
+        for set in 0..9 {
+            let night = g.t[set][ROW_SUN][0][0];
+            for h in (0..5).chain(19..24) {
+                assert_eq!(g.t[set][ROW_SUN][0][h], night, "set {set} hour {h}");
+            }
+        }
+        // the variants differ in sets 2 (row 4) and 3 (row 5), not in 7 or 1
+        let differs = |set: usize, row: usize| g.t[set][row][0] != g.t[set][row][1];
+        assert!(differs(2, 4) && differs(3, 5) && !differs(7, 0) && !differs(1, 4));
+    }
+
+    #[test]
+    fn landscape_effects_carry_the_zone_map_gain_and_weights() {
+        let Some(fs) = game() else { return };
+        if !fs.contains(LANDSCAPE_EFFECTS_FILE) {
+            return;
+        }
+        // 2,637 B, probe LE_SHA256 43fa8c17...
+        assert_eq!(
+            fs.read_inflated(LANDSCAPE_EFFECTS_FILE).unwrap().len(),
+            2_637
+        );
+        let le = LandscapeEffects::load(&fs).expect("landscape_effects.bin parses");
+        assert_eq!(le.image, "textures\\landscape\\gamezone_gradients.bmp");
+        // zone type N uses gradient set N
+        assert_eq!(le.zone_set, [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(le.set_for_zone_type(ZONE_TYPE_DEFAULT), 7);
+        assert_eq!(
+            le.set_for_zone_type(99),
+            7,
+            "unknown types fall back to Default"
+        );
+        assert!((le.gain - 2.2).abs() < 1e-6);
+        assert_eq!(le.smoothing_rate, 1.0);
+        assert_eq!(le.max_gradient, [3.0; 10]);
+        assert_eq!(
+            (le.set_altitude, le.set_underwater, le.set_rain, le.set_snow),
+            (8, 9, 10, 11)
+        );
+        assert_eq!(le.altitude, [30.0, 300.0, 1000.0]);
+        assert_eq!(le.underwater_depth, 120.0);
+        // wv = intensity / 3
+        assert_eq!(le.variant_weight(7, 3.0), 1.0);
+        assert_eq!(le.variant_weight(7, 0.0), 0.0);
+        assert!((le.variant_weight(7, 1.0) - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(le.variant_weight(7, 9.0), 1.0, "clamped");
+    }
+
+    #[test]
+    fn landscape_effects_reject_missing_keys() {
+        assert!(LandscapeEffects::parse(&[]).is_err());
+        let one = PropertyFile {
+            nodes: vec![Node {
+                values: vec![(Key::Hash(LE_SMOOTHING), Variant::Float(1.0))],
+                ..Default::default()
+            }],
+        }
+        .to_bytes();
+        assert!(LandscapeEffects::parse(&one).is_err());
     }
 }

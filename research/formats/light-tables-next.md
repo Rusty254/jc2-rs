@@ -23,6 +23,10 @@ claims depend on was additionally decoded from the exe bytes and is pinned by a 
    `cb0[10]`/`cb0[11]` are (1,1,1). **This contradicts the dark, blue nights in the original footage**
    (`reference/world/night-city-lights-sea-moon-from-base-ledge_s38.jpg`). The mechanism that darkens night is
    **unresolved** (Gaps G1). Nothing here may be used to justify a hand-tuned night curve as native.
+   > **Correction (JC2-115, implemented in JC2-122):** this item and section 5 are **superseded by `night-light-next.md`**: the 1.0 values are overwritten every
+   > frame by a call chain (`FUN_00a751b0` -> `FUN_00a66c30` -> `FUN_00a5d390` -> setter `FUN_0089f9d0`), which a store sweep cannot
+   > see; the source is `textures\landscape\gamezone_gradients.bmp`. The object holding `+0x204..+0x243` is the sky object
+   > S = W+0x10, not W. G1 is closed at the mechanism level.
 4. `cb0[9]` and `cb0[12].w` are **shadow-system** constants, not light tables.
 5. The weather variant depends on **cloud cover only indirectly** and on the weather zone and snow factor
    (section 3).
@@ -137,6 +141,9 @@ Hour-interpolated values (probe, linear RGB; clear weather, variant 0; `S*` raw)
 
 ## 5. Sun and ambient: the writers of `weather+0x204..+0x234` (negative result)
 
+> **Correction (JC2-115, implemented in JC2-122):** this negative result is wrong; see `night-light-next.md` (the writer is a call, S = W+0x10, driven by
+> `gamezone_gradients.bmp`). The text below is kept as the record of the sweep that missed it.
+
 `FUN_00a58a00` (called from `FUN_00a472f0` every frame; `this` = W):
 
 * inputs, all 1.0 forever: sun colour `+0x204..+0x210`; light colour #2 `+0x214..+0x220` (read `x 4.0`);
@@ -189,7 +196,7 @@ The shader multiplies these directly (`sun = cb0[3] * sat(N.-L) * shadow * ...`,
 
 ## 8. Gaps (native details still unknown)
 
-* **G1. What makes night dark.** With the traced chain `cb0[3]`/`cb0[10]`/`cb0[11]` are constant (1,1,1) while the original
+* **G1. What makes night dark.** *(Closed at the mechanism level by `night-light-next.md`, implemented in JC2-122.)* With the traced chain `cb0[3]`/`cb0[10]`/`cb0[11]` are constant (1,1,1) while the original
   footage has dim blue nights. Candidates (all unverified): a writer to `weather+0x204..` through an alias; a
   lighting term in the shaders that depends on an input we have not mapped; the haze/fog colours doing the work.
   Blocks: native sun/ambient colours for JC2-084/085/022. Next: dump the General and FastTer deferred/forward variants' uses of `cb0[1..2]`,
@@ -205,7 +212,8 @@ The shader multiplies these directly (`sun = cb0[3] * sat(N.-L) * shadow * ...`,
 
 ## 9. Bounded runtime handoff (not implemented)
 
-Do **not** wire the six RGB tables to Bevy's sun or ambient: the native sun/ambient are not table driven (G1).
+Do **not** wire the six RGB tables of `gradients.bmp` to Bevy's sun or ambient. *(Correction: the sun/ambient are table driven, but by
+`gamezone_gradients.bmp`, not by these six tables; `night-light-next.md`, `sky_light.rs`.)*
 
 1. `jc2_formats::weather::GradientTables` (new): parse `gradients.bmp` exactly as section 1 (R,G,B, flip, `** 2.2` for the six RGB
    tables) into `{ s0: [f32; 25], s: [[f32; 25]; 3], v: [[[[f32; 4]; 25]; 3]; 6] }` with entry 24 = entry 0. Tests: the probe's spot

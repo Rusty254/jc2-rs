@@ -185,6 +185,9 @@ pub(crate) struct LoadedTile {
     pub(crate) resources: Vec<jc2_formats::pickups::ResourceItem>,
     /// The colonels its spawn sets place (`npc.rs` spawns them, `missions.rs` pays).
     pub(crate) colonels: Vec<jc2_formats::missions::Colonel>,
+    /// Its 64 x 64 game zone bytes (8 m cells, row = z), for the light set under the camera
+    /// (`sky_light.rs`); empty when the terrain file did not load.
+    pub(crate) gamezone: Vec<u8>,
 }
 
 /// The tile streamer: what is loaded, and the caches shared between tiles.
@@ -656,6 +659,7 @@ fn load_tile(
                 tile.entities.push(e);
             }
             tile.terrain_triangles = tris;
+            tile.gamezone = terrain.gamezone.clone();
         }
         Err(e) => warn!("{name}: {e}"),
     }
@@ -1190,7 +1194,7 @@ pub(crate) fn setup(
         },
     ));
     commands.insert_resource(ClearColor(SKY));
-    // the sun, the moon and the sky fill light are `sky.rs`'s: they follow the time of day
+    // the sun/moon light and the ambient are `sky.rs`'s (`sky_light.rs`): they follow the time of day
     commands.spawn((
         Text::new("loading…"),
         TextFont::from_font_size(14.0),

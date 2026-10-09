@@ -162,6 +162,8 @@ Long uptime therefore cannot drift this term.
 * Cloud cover reaches the Sun only if the per-hour colour tables (`+0x660 … +0x1dd0`, three
   weather variants) select by weather. Those tables feed `weather+0x204..+0x234` (sun colour
   and ambient). Their writer was **not** traced, so this remains open (§6).
+  > **Correction (JC2-115, implemented in JC2-122):** the writer is traced in `night-light-next.md` section 2: the fields live in the sky object S = W+0x10 and
+  > are written every frame from `gamezone_gradients.bmp` (not from these six tables) through `FUN_0089f9d0`.
 
 ## 5. Other FastTer light constants (separate from clouds; for the terrain work)
 
@@ -179,6 +181,8 @@ Long uptime therefore cannot drift this term.
 
 **Unresolved:** where `weather+0x204..+0x234` come from. They come from the per-hour tables,
 but that writer was not traced. This is still the "per-hour light tables" gap in `weather.md`.
+> **Correction (JC2-115, implemented in JC2-122):** resolved in `night-light-next.md` section 2: S = W+0x10, written by `FUN_0089f9d0` from the `gamezone_gradients.bmp`
+> blend (`FUN_00a5d390`); sun/moon colour = row 0 through the `((x ** (1/2.2)) * 2.2) ** 2.2` transform, `cb0[10]` = row 4, `cb0[11]` = row 5.
 
 ## 6. Verified vs. inferred vs. unresolved
 
@@ -202,7 +206,7 @@ but that writer was not traced. This is still the "per-hour light tables" gap in
 * **Unresolved:**
   * The noise `FUN_004dcb70`.
   * The writer of `weather+0x204..+0x234` (sun colour and ambient tables) and whether the
-    weather variant depends on cover.
+    weather variant depends on cover. *(Writer found: `night-light-next.md`; the variant weights are still open.)*
   * cb0[9], [13], [14] in detail.
   * Compressed archive payloads were not scanned for references.
 

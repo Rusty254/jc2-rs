@@ -20,6 +20,7 @@
 //   struct SunHorizon {
 //       cb0: vec4<f32>,   // cb0[0] = (a, b, c, 1)
 //       sun: vec4<f32>,   // xyz: unit vector towards the Sun (0: none), w: floor cb0[10].w
+//       tilt: vec4<f32>,  // xyz: (sky - ground) / 2 ambient (sky_light.rs); 0 = uniform
 //   }
 //   @group(MATERIAL_BIND_GROUP) @binding(N) var<storage, read> horizon: SunHorizon;
 //
@@ -42,6 +43,15 @@ fn horizon_shadow(t11: vec4<f32>, cb0: vec4<f32>, sun: vec4<f32>) -> f32 {
 // What the Sun's direct term is multiplied by.
 fn sun_factor(t11: vec4<f32>, cb0: vec4<f32>, sun: vec4<f32>) -> f32 {
     return horizon_shadow(t11, cb0, sun) * (t11.x * 0.5 + 0.5);
+}
+
+// The hemisphere part of the ambient that Bevy's uniform AmbientLight lacks. Native:
+// ambient = lerp(cb0[11], cb0[10], N.y / 2 + 1/2) = (sky + ground) / 2 + (sky - ground) / 2 N.y.
+// The uniform AmbientLight carries the first term; this adds `tilt * N.y` on the diffuse
+// colour and the occlusion, like Bevy's own ambient (APPROXIMATION: Bevy scales the diffuse
+// colour by its split-sum term, which is left out here).
+fn ambient_tilt(diffuse: vec3<f32>, n: vec3<f32>, tilt: vec4<f32>, occlusion: vec3<f32>, exposure: f32) -> vec3<f32> {
+    return exposure * diffuse * tilt.xyz * n.y * occlusion;
 }
 
 // True for the directional light that is the Sun (direction compared with the CPU's).

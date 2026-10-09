@@ -75,6 +75,7 @@ mod rbm_loader;
 mod rig;
 mod scenery;
 mod sky;
+mod sky_light;
 mod smoke;
 mod stunts;
 mod sun_horizon;

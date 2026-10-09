@@ -26,7 +26,7 @@
     pbr_bindings,
     mesh_view_bindings::view,
 }
-#import jc2::sun_horizon::{ao_uv, horizon_shadow, is_sun}
+#import jc2::sun_horizon::{ao_uv, horizon_shadow, is_sun, ambient_tilt}
 
 #import bevy_pbr::{
     forward_io::{VertexOutput, FragmentOutput},
@@ -44,6 +44,8 @@
 struct SunHorizon {
     cb0: vec4<f32>,
     sun: vec4<f32>,
+    // xyz: (sky - ground) / 2 ambient, see ambient_tilt in sun_horizon.wgsl
+    tilt: vec4<f32>,
 }
 
 struct GeneralParams {
@@ -186,7 +188,12 @@ fn fragment(
 
     var out: FragmentOutput;
     let lit = apply_pbr_lighting(pbr_input);
-    var rgb = lit.rgb + sun.correction;
+    // the hemisphere part of the native ambient (the uniform AmbientLight is its mean)
+    let diffuse = calculate_diffuse_color(
+        base.rgb, pbr_input.material.metallic, pbr_input.material.specular_transmission,
+        pbr_input.material.diffuse_transmission);
+    var rgb = lit.rgb + sun.correction + ambient_tilt(
+        diffuse, pbr_input.N, horizon.tilt, pbr_input.diffuse_occlusion, view.exposure);
     // MPM B: C (L + B (2 - L)) = C L + B (2 C - C L), over the lit diffuse C L
     rgb = rgb + mpm.b * (2.0 * base.rgb - rgb);
     if (general.flags & SHADER_SPEC_STANDIN) != 0u {

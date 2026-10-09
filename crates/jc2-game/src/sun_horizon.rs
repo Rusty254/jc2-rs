@@ -32,6 +32,7 @@
 
 use crate::atmosphere::AtmosphereState;
 use crate::sky::Sun;
+use crate::sky_light::SkyLighting;
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
@@ -58,6 +59,10 @@ pub struct SunHorizon {
     pub cb0: Vec4,
     /// xyz: unit vector towards the Sun, w: `cb0[10].w`.
     pub sun: Vec4,
+    /// xyz: `(sky - ground) / 2` ambient in Bevy ambient units (`SkyLighting`): the part of the
+    /// native hemisphere ambient `lerp(cb0[11], cb0[10], N.y / 2 + 1/2)` that Bevy's uniform
+    /// `AmbientLight` (the mean of the two) lacks, added as `tilt * N.y`. Zero = uniform.
+    pub tilt: Vec4,
 }
 
 impl SunHorizon {
@@ -84,6 +89,7 @@ impl SunHorizon {
         Self {
             cb0: Vec4::new(a, b, c, 1.0),
             sun: sun_dir.extend(floor),
+            tilt: Vec4::ZERO,
         }
     }
 
@@ -210,6 +216,7 @@ fn clamp_linear() -> ImageSampler {
 pub fn update_horizon(
     horizon: Option<Res<HorizonShadow>>,
     atmosphere: Option<Res<AtmosphereState>>,
+    lighting: Option<Res<SkyLighting>>,
     sun: Query<&Transform, With<Sun>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut last: Local<Option<SunHorizon>>,
@@ -226,6 +233,9 @@ pub fn update_horizon(
         None => light_dir,
     });
     now.sun = light_dir.extend(now.sun.w);
+    if let Some(l) = &lighting {
+        now.tilt = l.bevy().ambient_tilt.extend(0.0);
+    }
     if *last == Some(now) {
         return;
     }

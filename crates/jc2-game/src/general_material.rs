@@ -255,6 +255,7 @@ fn make_fallback(
         buffer: buffers.add(ShaderBuffer::from(SunHorizon {
             cb0: Vec4::new(0.0, 0.0, 1.0, 1.0),
             sun: Vec4::ZERO,
+            tilt: Vec4::ZERO,
         })),
     });
 }

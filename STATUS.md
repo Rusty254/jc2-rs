@@ -1,10 +1,34 @@
 # jc2-rs — status, workflow and next steps
 
-*Updated 8 October 2026. Read this first when picking the work up again.*
+*Updated 9 October 2026. Read this first when picking the work up again.*
 
 > Work resumed in Codex with delegated agents in git worktrees under
 > `.claude/worktrees/` (git-ignored). Builds remain serialized with distinct
 > fingerprints. See "Building with parallel agents".
+
+## Integration, 9 October (claude/orchestrator)
+
+`claude/orchestrator` is the sole reviewer/integrator again (AGENTS.md "Coordinator and review").
+Reviews run the full suite with `JC2_TEST_DIR` set (retail tests skip silently without it).
+Master 29b0718: 492/492 tests, clippy `-D warnings` clean. Accepted today:
+
+- JC2-022 sun/horizon shadow, JC2-045 weapon mounts, JC2-085 General material (earlier today).
+- JC2-046 authored player weapon accuracy and angular scatter (AI/special states still approximate).
+- JC2-111 world locations: every enabled non-city location (start base `keymissions/km01/km01.base`,
+  strongholds, ...) streams its geometry when its native near box overlaps a loaded tile, plus far
+  `.fl.cgd` static geometry for tiles and locations. Actors at those locations are not activated yet.
+- JC2-086 native vegetation model LOD: five `.lod` slots, per-asset scale, 10/25/50/100/500 m x scale
+  breakpoints, hard switches; `--vegetation-lod 0` (default) swaps by camera distance.
+- JC2-100 / JC2-118 `gradients.bmp` hourly tables: cloud card lit colour, point-light day/night scale,
+  single sun/moon directional light. Fog colours parsed but still policy.
+- JC2-115 / JC2-123 / JC2-122 native sun/moon colour and sky/ground ambient from
+  `gamezone_gradients.bmp`, selected by the game-zone byte under the camera (stored in every terrain
+  tile; start base = Arctic). Nights are now dark from native data. Policy: `LUX_PER_UNIT` (noon
+  Default = 9000 lux) until tone map/auto-exposure (JC2-124) are known; no height/underwater/rain/snow
+  branches yet (JC2-132).
+
+Open parity research (board, tags `research` + `parity-gap`): JC2-101..110, 112..117, 119..121,
+124..133. GitHub `Rusty254/jc2-rs` (private) receives only the filtered `public` snapshot.
 
 ## Current integration, 8 October
 

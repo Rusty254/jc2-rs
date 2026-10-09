@@ -319,7 +319,8 @@ colour = (sun + amb + points) × albedo, fog lerp to cb0[13] by exp(−fog), cb0
 
 `ao` multiplies the ambient only; the sun term is plain Lambert (no specular). The
 producers of `cb0[3]` (sun colour), `cb0[10]`/`cb0[11]` (sky/ground ambient), `cb0[0]` and
-`t11` were **not** traced (the per-hour light tables are unrecovered, `weather.md`), so the
+`t11` were **not** traced (the per-hour light tables are unrecovered, `weather.md`; **correction, JC2-115:** `cb0[3]`, `cb0[10]`, `cb0[11]` are
+written every frame from `gamezone_gradients.bmp`, `night-light-next.md` section 2), so the
 runtime keeps Bevy's lights (`apply_pbr_lighting`, roughness 1, metallic 0) and applies the
 native terms it can prove: `ao` as diffuse (ambient-only) occlusion, the native normal and
 the native albedo.
@@ -376,7 +377,7 @@ seam. The sea plane reaches past the fog. Nothing of the global file's tail is u
 
 * Which `rtdisplacement_N.raw` made which atlas tile (the atlas itself is used, above).
 * The producers of the pixel `cb0` lighting registers (`cb0[0]`, `[3]`, `[10]`, `[11]`,
-  `[13]`, `[14]`) and of `t11`; sampler filter of `s1`/`s6` (point is implied for `s6`,
+  `[13]`, `[14]`; `[3]`, `[10]`, `[11]` are resolved in `night-light-next.md`) and of `t11`; sampler filter of `s1`/`s6` (point is implied for `s6`,
   which reads indices; `s1` shares its coordinates). `cb2[2]` is `FUN_00a579d0`'s
 * The Lod2 hollows term (`1 − 0.6 f3 · r3.z`) was not decoded register by register; the
   runtime uses the Lod0 form at every distance.

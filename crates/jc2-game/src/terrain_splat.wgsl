@@ -19,7 +19,7 @@
     pbr_functions::alpha_discard,
     mesh_view_bindings::view,
 }
-#import jc2::sun_horizon::{ao_uv, sun_factor, is_sun}
+#import jc2::sun_horizon::{ao_uv, sun_factor, is_sun, ambient_tilt}
 
 #ifdef PREPASS_PIPELINE
 #import bevy_pbr::{
@@ -47,6 +47,8 @@
 struct SunHorizon {
     cb0: vec4<f32>,
     sun: vec4<f32>,
+    // xyz: (sky - ground) / 2 ambient, see ambient_tilt in sun_horizon.wgsl
+    tilt: vec4<f32>,
 }
 
 struct SplatParams {
@@ -385,6 +387,13 @@ fn fragment(
     // the Sun's direct term times shadow * (AO / 2 + 1/2)
     out.color = vec4<f32>(
         out.color.rgb + sun_correction(pbr_input, sun_factor(t11, horizon.cb0, horizon.sun)), out.color.a);
+    // the hemisphere part of the native ambient (the uniform AmbientLight is its mean)
+    let diffuse = calculate_diffuse_color(
+        pbr_input.material.base_color.rgb, pbr_input.material.metallic,
+        pbr_input.material.specular_transmission, pbr_input.material.diffuse_transmission);
+    out.color = vec4<f32>(
+        out.color.rgb + ambient_tilt(diffuse, pbr_input.N, horizon.tilt, pbr_input.diffuse_occlusion, view.exposure),
+        out.color.a);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
 #endif
     return out;

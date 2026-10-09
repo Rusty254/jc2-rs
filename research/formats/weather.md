@@ -36,6 +36,11 @@ as ad-hoc thresholds.
 sizes and noise parameters (`5.5`, `18.5`, `12000`…), plausibly wind/grass or landscape
 effects; not examined further.
 
+> **Correction (JC2-115, implemented in JC2-122):** this is wrong. `landscape_effects.bin` names `textures\landscape\gamezone_gradients.bmp` and holds the zone ->
+> gradient-set map, the gain 2.2, the height/underwater/rain/snow sets and the smoothing rate: the sun and moon colour and the
+> ambients come from that picture (`night-light-next.md`, `sky_light.rs`). Its `post_effects` block is separate (hour-dependent post
+> parameters, not decoded).
+
 ### The sun and moon
 
 fixed unit vector `a = (0, 1, 1) / √2` is rotated about the axis `b = (0, −1, 0.8) / |…|`
@@ -80,6 +85,11 @@ six per-hour colour tables of 25 entries × 3 weather variants (`+0x660`, `+0xb1
 lerped between the hour and the next (`0x00a50000:2770`, clouds), and filled from
 `gradients.bmp` when present. Nothing in the retail files seems to supply them, so the
 game crate invents the sun's colour and strength (below).
+
+> **Correction (JC2-115, implemented in JC2-122):** "not found" is wrong. The sun colour, moon colour and both ambients are `cb0[3]`, `cb0[10]`, `cb0[11]`, written
+> every frame from `gamezone_gradients.bmp` by hour and game zone. `gradients.bmp` only feeds the cloud card colours, the haze
+> colours, the point-light scalar and the facade scalar. The game crate now uses the native values (JC2-122); only the scale to
+> Bevy lux is project policy.
 
 ## `weathersettings.bin`
 
