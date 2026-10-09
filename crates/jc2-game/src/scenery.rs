@@ -479,13 +479,51 @@ fn place_statics(
     }
 }
 
+/// Which of a location's two containers' `.cgd` statics to place (JC2-144).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StaticsPart {
+    /// Near and far together: terrain tiles' own containers and legacy owners.
+    Both,
+    /// The near `.nl.cgd` only: the near record, started inside the near box.
+    Near,
+    /// The far `.fl.cgd` only: the far record, which also loads alone in the 1000 m ring.
+    Far,
+}
+
 /// Static geometry from the actual owner container, including mission/city extras.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn place_container_statics(
     st: &mut Streamer,
     tile: &mut LoadedTile,
+    xz: (u32, u32),
+    container: &str,
+    assets: &AssetServer,
+    game: &Game,
+    cfg: &WorldConfig,
+) -> jc2_formats::Result<usize> {
+    place_container_statics_part(
+        st,
+        tile,
+        xz,
+        container,
+        StaticsPart::Both,
+        assets,
+        game,
+        cfg,
+    )
+}
+
+/// [`place_container_statics`] for one container of the location. `container` is always
+/// the near (`.nlz`) name: its `.lod` descriptors and full-detail meshes resolve the far
+/// instances' models too (the far container ships only the low LODs), so the far part opens
+/// it read-only without loading its objects.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn place_container_statics_part(
+    st: &mut Streamer,
+    tile: &mut LoadedTile,
     (x, z): (u32, u32),
     container: &str,
+    part: StaticsPart,
     assets: &AssetServer,
     game: &Game,
     cfg: &WorldConfig,
@@ -494,26 +532,31 @@ pub(crate) fn place_container_statics(
         .index
         .container(game, container)
         .ok_or_else(|| jc2_formats::Error::format(format!("{container}: unreadable archive")))?;
+    // (geometry, from the far container)
     let mut geometries = Vec::new();
-    for cgd in local
-        .sarc
-        .entries
-        .iter()
-        .filter(|e| e.name.to_ascii_lowercase().ends_with(".cgd"))
-    {
-        let bytes = local
-            .member(&cgd.name)
-            .ok_or_else(|| jc2_formats::Error::format("unreadable CGD"))?;
-        geometries.push(CompiledGeometry::parse(
-            &jc2_formats::compress::maybe_inflate(bytes)?,
-        )?);
+    if part != StaticsPart::Far {
+        for cgd in local
+            .sarc
+            .entries
+            .iter()
+            .filter(|e| e.name.to_ascii_lowercase().ends_with(".cgd"))
+        {
+            let bytes = local
+                .member(&cgd.name)
+                .ok_or_else(|| jc2_formats::Error::format("unreadable CGD"))?;
+            geometries.push((
+                CompiledGeometry::parse(&jc2_formats::compress::maybe_inflate(bytes)?)?,
+                false,
+            ));
+        }
     }
     // The far companion's `.fl.cgd` (JC2-111): the location's large structures (the
     // start base's key036 towers, the gb223 kit of 31,14...). Its models' descriptors and
     // full-detail meshes are in the near container (the far one ships the low LODs only),
     // so they resolve as the near ones do (near, then the shared sets), then far.
-    let far = world::far_companion(container).and_then(|n| st.index.container(game, &n));
-    let near_count = geometries.len();
+    let far = (part != StaticsPart::Near)
+        .then(|| world::far_companion(container).and_then(|n| st.index.container(game, &n)))
+        .flatten();
     if let Some(far) = &far {
         for cgd in far
             .sarc
@@ -524,20 +567,21 @@ pub(crate) fn place_container_statics(
             let bytes = far
                 .member(&cgd.name)
                 .ok_or_else(|| jc2_formats::Error::format("unreadable far CGD"))?;
-            geometries.push(CompiledGeometry::parse(
-                &jc2_formats::compress::maybe_inflate(bytes)?,
-            )?);
+            geometries.push((
+                CompiledGeometry::parse(&jc2_formats::compress::maybe_inflate(bytes)?)?,
+                true,
+            ));
         }
     }
     let mut placed = 0;
-    for (g, geometry) in geometries.iter().enumerate() {
+    for (geometry, from_far) in &geometries {
         for inst in &geometry.instances {
             let model = geometry.model_of(inst);
             let resolved = st
                 .index
                 .resolve(game, &local, (x, z), model, cfg.lod)
                 .or_else(|| {
-                    let far = far.as_ref().filter(|_| g >= near_count)?;
+                    let far = far.as_ref().filter(|_| *from_far)?;
                     st.index.resolve(game, far, (x, z), model, cfg.lod)
                 });
             let Some((home, rbm)) = resolved else {

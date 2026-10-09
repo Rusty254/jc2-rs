@@ -58,6 +58,7 @@ mod heli;
 mod horizon;
 mod hud;
 mod impostors;
+mod location_activation;
 mod locations;
 mod map;
 mod mission_browser;

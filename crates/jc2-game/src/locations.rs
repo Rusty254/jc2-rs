@@ -1,20 +1,29 @@
 //! Shared location geometry and gameplay source lifetime. Readiness is geometry only;
 //! registry bounds do not certify mission teams, scripts, audio or cutscenes.
 use crate::{
-    Game, scenery,
-    world::{self, LoadedTile, Streamer, WorldConfig},
+    Game,
+    location_activation::{ActivationKey, ActivationState, Step},
+    scenery,
+    world::{self, FlyCamera, LoadedTile, Streamer, WorldConfig},
 };
 use bevy::prelude::*;
-use jc2_formats::location::{LocationRegistry, canonical};
+use jc2_formats::location::{Location, LocationRegistry, RecordKind, canonical};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum LocationOwner {
     Tile((u32, u32)),
-    /// A loaded terrain tile reaching a non-city registry location: geometry only
-    /// (its actors, scripts and events are not activated here; JC2-111).
-    Scenery((u32, u32)),
+    /// The camera-driven activation of one registry record (JC2-144,
+    /// `location_activation.rs`): `location` indexes the registry. `gameplay` is project
+    /// policy: only a city location's near record enables its actors (the old `Tile`
+    /// owner); every other activated record is geometry only (JC2-111: actors, scripts
+    /// and events of non-city locations are not activated).
+    Activated {
+        location: usize,
+        kind: RecordKind,
+        gameplay: bool,
+    },
     ExtraTile((u32, u32)),
     Mission(crate::missions::MissionOwner),
     Giver(u64),
@@ -79,6 +88,12 @@ impl Locations {
             r.owners.remove(&owner);
         }
     }
+    fn release_activated(&mut self) {
+        for r in self.records.values_mut() {
+            r.owners
+                .retain(|o| !matches!(o, LocationOwner::Activated { .. }));
+        }
+    }
     #[allow(dead_code)]
     pub fn state(&self, container: &str, generation: u64) -> Option<&LocationState> {
         self.records
@@ -97,10 +112,12 @@ pub struct LocationsPlugin;
 impl Plugin for LocationsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Locations>()
+            .init_resource::<Activation>()
             .add_systems(Startup, load_registry)
             .add_systems(
                 Update,
-                reconcile
+                (activate, reconcile)
+                    .chain()
                     .in_set(LocationReconciled)
                     .after(world::stream_tiles)
                     .before(world::spawn_models),
@@ -114,6 +131,146 @@ fn load_registry(game: Res<Game>, mut locations: ResMut<Locations>) {
         Ok(registry) => locations.registry = registry,
         Err(e) => warn!("world location registry: {e}"),
     }
+}
+/// The camera-driven activation (JC2-144): the pure model plus what the host tracks
+/// around it.
+#[derive(Resource, Default)]
+pub(crate) struct Activation {
+    state: Option<ActivationState>,
+    /// Records "loaded" without a request of ours because a terrain tile's own container
+    /// list already holds the same container (`ExtraContainers`).
+    skipped: HashSet<ActivationKey>,
+    /// Tests: serve only these registry identities.
+    #[cfg(test)]
+    only: Option<HashSet<String>>,
+}
+impl Activation {
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> Option<&ActivationState> {
+        self.state.as_ref()
+    }
+}
+/// Locations the camera activation serves. `wc/` tile containers stay with the terrain
+/// streamer (it loads a tile's own container with the tile; the streamer is unchanged), and
+/// the city gameplay/settlement containers remain with the gameplay milestone.
+fn camera_activates(loc: &Location) -> bool {
+    if loc.identity.starts_with("wc/") {
+        return false;
+    }
+    !(is_city(loc) && (loc.identity.contains("gameplay") || loc.identity.contains("settlement")))
+}
+fn is_city(loc: &Location) -> bool {
+    loc.identity.starts_with("metropolis/")
+}
+fn owner_of(loc: &Location, key: ActivationKey) -> LocationOwner {
+    LocationOwner::Activated {
+        location: key.location,
+        kind: key.kind,
+        gameplay: is_city(loc) && key.kind == RecordKind::Near,
+    }
+}
+/// One native location-manager pass per frame from the main camera's XZ position
+/// (`0x5df830`): poll the record in flight, unload at most one, else start at most one.
+/// The main camera is the `FlyCamera` entity, the one the terrain streamer follows when
+/// there is no hero (the exe reads `*(CCameraManager + 0x10) + 0x54`, brief section 1).
+fn activate(
+    game: Res<Game>,
+    mut locations: ResMut<Locations>,
+    mut act: ResMut<Activation>,
+    st: Option<Res<Streamer>>,
+    cams: Query<&Transform, With<FlyCamera>>,
+) {
+    let Ok(cam) = cams.single() else { return };
+    let camera = crate::coords::to_engine(cam.translation);
+    let act = &mut *act;
+    if act
+        .state
+        .as_ref()
+        .is_none_or(|s| s.location_count() != locations.registry.0.len())
+    {
+        locations.release_activated();
+        act.skipped.clear();
+        #[cfg(test)]
+        let only = act.only.clone();
+        act.state = Some(ActivationState::new(&locations.registry, |i| {
+            let loc = &locations.registry.0[i];
+            #[cfg(test)]
+            if let Some(only) = &only {
+                return only.contains(&loc.identity);
+            }
+            camera_activates(loc)
+        }));
+    }
+    let Some(state) = act.state.as_mut() else {
+        return;
+    };
+    let container_of = |l: &Locations, key: ActivationKey| {
+        let loc = &l.registry.0[key.location];
+        (owner_of(loc, key), loc.container(key.kind))
+    };
+    // poll (0x520070): the record in flight finishes or fails
+    if let Some(key) = state.in_flight() {
+        let (owner, container) = container_of(&locations, key);
+        if act.skipped.contains(&key) {
+            state.finish_load(key);
+        } else {
+            match locations.records.get(&container).map(|r| &r.state) {
+                Some(LocationState::Ready) => state.finish_load(key),
+                Some(LocationState::Failed(_)) | None => {
+                    state.fail(key);
+                    locations.release(owner);
+                }
+                _ => {}
+            }
+        }
+    }
+    // a pending release completes once our record has left state "unloading"
+    if let Some(key) = state.unloading() {
+        let (owner, container) = container_of(&locations, key);
+        let done = act.skipped.remove(&key)
+            || locations
+                .records
+                .get(&container)
+                .is_none_or(|r| !r.owners.is_empty() && !r.owners.contains(&owner));
+        if done {
+            state.finish_unload();
+        }
+    }
+    match state.step(camera) {
+        Step::Idle => {}
+        Step::Unload(key) => {
+            let (owner, _) = container_of(&locations, key);
+            locations.release(owner);
+        }
+        Step::Load(key) => {
+            let loc = &locations.registry.0[key.location];
+            let container = loc.container(key.kind);
+            let owner = owner_of(loc, key);
+            if !game.fs.contains(&container) {
+                state.fail(key);
+                return;
+            }
+            if st.as_ref().is_some_and(|st| {
+                st.loaded
+                    .values()
+                    .any(|t| t.containers.contains(&container))
+            }) {
+                act.skipped.insert(key);
+                return;
+            }
+            let centre = |i: usize| (loc.lower[i] + loc.upper[i]) * 0.5;
+            let anchor = jc2_formats::terrain::tile_index(centre(0), centre(2))
+                .or_else(|| jc2_formats::terrain::tile_index(camera[0], camera[2]))
+                .unwrap_or((0, 0));
+            locations.request(owner, &container, anchor);
+        }
+    }
+}
+/// The near container name of a far record's (`.flz`) container.
+fn near_of_far(container: &str) -> Option<String> {
+    container
+        .strip_suffix(".flz")
+        .map(|stem| format!("{stem}.nlz"))
 }
 /// Parse all placement/collision/CGD members before beginning object registration.
 /// Existing actor consumers reconcile owned metadata separately. Geometry registration
@@ -179,8 +336,6 @@ fn reconcile(
     extra: Option<Res<world::ExtraContainers>>,
 ) {
     let Some(mut st) = st else { return };
-    // Reconcile registry geometry against already-loaded tiles, with independent
-    // owners for all intersecting tiles. Exact retail near/far margins are unknown.
     let loaded: HashSet<_> = st.loaded.keys().copied().collect();
     let mut extra_wanted = HashSet::new();
     if let Some(extra) = extra {
@@ -199,55 +354,25 @@ fn reconcile(
     }
     for r in locations.records.values_mut() {
         r.owners.retain(|o| match o {
-            LocationOwner::Tile(k) | LocationOwner::Scenery(k) => loaded.contains(k),
+            LocationOwner::Tile(k) => loaded.contains(k),
             LocationOwner::ExtraTile(k) => extra_wanted.contains(&(*k, r.container.clone())),
             _ => true,
         });
     }
-    let mut wanted: Vec<_> = extra_wanted
+    // Registry locations are not requested here any more: `activate` owns them, driven by
+    // the camera (JC2-144), and requests/releases `LocationOwner::Activated` records.
+    let wanted: Vec<_> = extra_wanted
         .into_iter()
         .map(|(k, n)| (LocationOwner::ExtraTile(k), n, k))
         .collect();
-    for loc in &locations.registry.0 {
-        // `wc/` tiles are the terrain streamer's. Every other registry location is a
-        // native world location (`FUN_007c4840` registers all of them, enabled unless
-        // `conditions.bin` says otherwise): key-mission bases such as the start base
-        // `keymissions/km01/km01.base`, strongholds, general interests, roads...
-        // City gameplay/settlement containers remain with the gameplay milestone.
-        if loc.identity.starts_with("wc/") || !loc.enabled_at_start {
-            continue;
-        }
-        let city = loc.identity.starts_with("metropolis/");
-        if city && (loc.identity.contains("gameplay") || loc.identity.contains("settlement")) {
-            continue;
-        }
-        for &key in &loaded {
-            let (x, z) = jc2_formats::terrain::tile_origin(key.0, key.1);
-            if loc.near_intersects_xz(
-                [x, z],
-                [
-                    x + jc2_formats::terrain::TILE_SIZE,
-                    z + jc2_formats::terrain::TILE_SIZE,
-                ],
-            ) {
-                let name = loc.near_container();
-                if st.loaded.values().any(|t| t.containers.contains(&name)) {
-                    continue;
-                }
-                let owner = if city {
-                    LocationOwner::Tile(key)
-                } else {
-                    LocationOwner::Scenery(key)
-                };
-                wanted.push((owner, name, key));
-            }
-        }
-    }
     for (owner, name, key) in wanted {
         locations.request(owner, &name, key);
     }
-    let keys: Vec<_> = locations.records.keys().cloned().collect();
+    // sorted: only one record begins per frame, so HashMap order must not pick it
+    let mut keys: Vec<_> = locations.records.keys().cloned().collect();
+    keys.sort();
     let mut began = false;
+    let mut forget_near = Vec::new();
     for identity in keys {
         let record = locations.records.get_mut(&identity).unwrap();
         if record.owners.is_empty() || record.state == LocationState::Unloading {
@@ -276,6 +401,7 @@ fn reconcile(
                 }
             }
             st.index.forget(&record.container);
+            forget_near.extend(near_of_far(&record.container));
             if record.owners.is_empty() {
                 locations.records.remove(&identity);
             } else {
@@ -289,7 +415,14 @@ fn reconcile(
                 record.state = LocationState::Failed("models disabled".into());
                 continue;
             }
-            if let Err(e) = parse_geometry(&mut st, &game, &record.container) {
+            // A far record (`.flz`) places only its `.fl.cgd` statics: its `.blo` is a
+            // stripped stub and its models resolve through the near container, which is
+            // opened read-only. A near record places its objects and `.nl.cgd` only; the
+            // far container is the separate far record (JC2-144).
+            let far_of = near_of_far(&record.container);
+            if far_of.is_none()
+                && let Err(e) = parse_geometry(&mut st, &game, &record.container)
+            {
                 warn!("location {identity}: {e}");
                 record.state = LocationState::Failed(e.to_string());
                 continue;
@@ -297,22 +430,29 @@ fn reconcile(
             let mut tile = LoadedTile::default();
             tile.source_key = Some(st.next_source());
             tile.source_container = record.container.clone();
-            world::load_container(
-                &mut st,
-                &mut tile,
-                record.anchor.0,
-                record.anchor.1,
-                &record.container,
-                &mut commands,
-                &assets,
-                &game,
-                &cfg,
-            );
-            let result = scenery::place_container_statics(
+            if far_of.is_none() {
+                world::load_container(
+                    &mut st,
+                    &mut tile,
+                    record.anchor.0,
+                    record.anchor.1,
+                    &record.container,
+                    &mut commands,
+                    &assets,
+                    &game,
+                    &cfg,
+                );
+            }
+            let (statics_of, part) = match &far_of {
+                Some(near) => (near.as_str(), scenery::StaticsPart::Far),
+                None => (record.container.as_str(), scenery::StaticsPart::Near),
+            };
+            let result = scenery::place_container_statics_part(
                 &mut st,
                 &mut tile,
                 record.anchor,
-                &record.container,
+                statics_of,
+                part,
                 &assets,
                 &game,
                 &cfg,
@@ -363,10 +503,11 @@ fn reconcile(
             }
         }
         let enable = record.state == LocationState::Ready
-            && record
-                .owners
-                .iter()
-                .any(|o| !matches!(o, LocationOwner::Giver(_) | LocationOwner::Scenery(_)));
+            && record.owners.iter().any(|o| match o {
+                LocationOwner::Giver(_) => false,
+                LocationOwner::Activated { gameplay, .. } => *gameplay,
+                _ => true,
+            });
         let renew = enable
             && st
                 .location_tiles
@@ -403,6 +544,13 @@ fn reconcile(
                 }
             }
             st.index.forget(&record.container);
+            forget_near.extend(near_of_far(&record.container));
+        }
+    }
+    // a far record only reads the near archive: let it go with the last user of it
+    for near in forget_near {
+        if !locations.records.contains_key(&near) {
+            st.index.forget(&near);
         }
     }
 }
@@ -575,32 +723,65 @@ mod tests {
             models
         );
     }
-    /// JC2-111: the start base Kem Gunung Dataran Tinggi is the registry location
-    /// `keymissions/km01/km01.base`, reached by tile 29,18 (no `wc` container there).
-    #[test]
-    fn retail_start_base_streams_as_scenery_geometry() {
-        let mut app = match world::tests::tile_app_with((29, 18), Vec::new(), |_| {}) {
-            Some(app) => app,
-            None => return,
-        };
-        let name = "locations/keymissions/km01/km01.base.nlz";
+    fn move_camera(app: &mut App, x: f32, z: f32) {
+        let mut q = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<FlyCamera>>();
+        let mut t = q.single_mut(app.world_mut()).unwrap();
+        t.translation.x = x;
+        t.translation.z = z;
+    }
+    const BASE_NEAR: &str = "locations/keymissions/km01/km01.base.nlz";
+    const BASE_FAR: &str = "locations/keymissions/km01/km01.base.flz";
+    fn base_state(app: &App, name: &str) -> Option<LocationState> {
+        app.world()
+            .resource::<Locations>()
+            .records
+            .get(name)
+            .map(|r| r.state.clone())
+    }
+    /// Updates until `cond`, checking `each` after every frame (wall-clock bound: the
+    /// models load on other threads).
+    fn pump(app: &mut App, what: &str, mut each: impl FnMut(&App), cond: impl Fn(&App) -> bool) {
         let started = std::time::Instant::now();
-        let generation = loop {
+        loop {
             app.update();
-            let locations = app.world().resource::<Locations>();
-            if let Some(r) = locations.records.get(name) {
-                assert!(r.owners.contains(&LocationOwner::Scenery((29, 18))));
-                break r.generation;
+            each(app);
+            for name in [BASE_NEAR, BASE_FAR] {
+                assert!(
+                    !matches!(base_state(app, name), Some(LocationState::Failed(_))),
+                    "{what}: {name} {:?} {:?}",
+                    base_state(app, name),
+                    app.world().resource::<Streamer>().unresolved
+                );
             }
-            assert!(started.elapsed().as_secs() < 30, "start base not requested");
-        };
-        wait_ready(&mut app, name, generation);
-        let st = app.world().resource::<Streamer>();
-        let tile = &st.location_tiles[name].1;
-        assert_eq!(tile.objects_failed, 0);
-        assert_eq!(tile.unresolved, 0);
-        assert!(!tile.gameplay_enabled, "scenery owners enable no actors");
-        let statics = tile
+            if cond(app) {
+                return;
+            }
+            assert!(started.elapsed().as_secs() < 120, "timed out: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    fn gone(app: &App, name: &str) -> bool {
+        base_state(app, name).is_none()
+            && !app
+                .world()
+                .resource::<Streamer>()
+                .location_tiles
+                .contains_key(name)
+    }
+    fn ready(app: &App, name: &str) -> bool {
+        base_state(app, name) == Some(LocationState::Ready)
+    }
+    fn settle(app: &mut App, frames: usize) {
+        for _ in 0..frames {
+            app.update();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    fn statics(app: &App, name: &str) -> (usize, usize) {
+        let tile = &app.world().resource::<Streamer>().location_tiles[name].1;
+        let n = tile
             .entities
             .iter()
             .filter(|e| {
@@ -609,17 +790,95 @@ mod tests {
                     .is_some_and(|n| n.starts_with("static "))
             })
             .count();
-        eprintln!(
-            "km01.base: {} objects, {} CGD statics",
-            tile.objects_spawned, statics
+        (tile.objects_spawned, n)
+    }
+    /// JC2-111 + JC2-144: the start base Kem Gunung Dataran Tinggi is the registry location
+    /// `keymissions/km01/km01.base` (no `wc` container at tile 29,18). The camera drives
+    /// it: outside the raw box nothing, in the 1000 m ring only the far container, inside the
+    /// near box both (near first), and each unloads when the camera leaves its raw box.
+    #[test]
+    fn retail_start_base_follows_the_camera_through_ring_near_box_and_hysteresis() {
+        let mut app = match world::tests::tile_app_with((29, 18), Vec::new(), |app| {
+            // only the start base competes for the one record that starts at a time
+            app.insert_resource(Activation {
+                only: Some(["keymissions/km01/km01.base".to_string()].into()),
+                ..Default::default()
+            });
+        }) {
+            Some(app) => app,
+            None => return,
+        };
+        let z = -7050.0;
+        // 1. the camera starts inside the near box (tile 29,18): near first, then far
+        pump(
+            &mut app,
+            "near box load",
+            |app| {
+                if base_state(app, BASE_FAR).is_some() {
+                    assert_eq!(
+                        base_state(app, BASE_NEAR),
+                        Some(LocationState::Ready),
+                        "far starts only after the near record finished loading"
+                    );
+                }
+            },
+            |app| ready(app, BASE_NEAR) && ready(app, BASE_FAR),
         );
-        // 280 near + 246 far CGD instances + the 469 visible model placements of the .blo
-        assert_eq!(tile.objects_spawned, 749 + 246);
+        {
+            let st = app.world().resource::<Streamer>();
+            for name in [BASE_NEAR, BASE_FAR] {
+                let tile = &st.location_tiles[name].1;
+                assert_eq!(tile.objects_failed, 0);
+                assert_eq!(tile.unresolved, 0);
+                assert!(!tile.gameplay_enabled, "scenery records enable no actors");
+            }
+        }
+        // the near record: 469 visible .blo models + 280 .nl.cgd; the far one: 246 .fl.cgd
+        assert_eq!(statics(&app, BASE_NEAR), (749, 280));
+        assert_eq!(statics(&app, BASE_FAR), (246, 246));
+        // 2. outside the raw box: both go
+        move_camera(&mut app, -3200.0, z);
+        pump(
+            &mut app,
+            "outside",
+            |_| {},
+            |app| gone(app, BASE_NEAR) && gone(app, BASE_FAR),
+        );
         assert_eq!(
-            statics,
-            280 + 246,
-            "every km01.base.nl.cgd and .fl.cgd instance"
+            app.world()
+                .resource::<Activation>()
+                .state()
+                .unwrap()
+                .loaded()
+                .count(),
+            0
         );
+        // 3. the 1000 m ring (-3170.6 .. -2170.6): the far container alone
+        move_camera(&mut app, -2600.0, z);
+        pump(&mut app, "ring", |_| {}, |app| ready(app, BASE_FAR));
+        settle(&mut app, 30);
+        assert!(gone(&app, BASE_NEAR), "no near container in the ring");
+        assert_eq!(statics(&app, BASE_FAR), (246, 246));
+        let far_generation = app.world().resource::<Locations>().records[BASE_FAR].generation;
+        // 4. the near box (x > -2160.6): the near container joins, the far one stays
+        move_camera(&mut app, -1245.0, z);
+        pump(&mut app, "near box", |_| {}, |app| ready(app, BASE_NEAR));
+        assert_eq!(statics(&app, BASE_NEAR), (749, 280));
+        assert_eq!(
+            far_generation,
+            app.world().resource::<Locations>().records[BASE_FAR].generation,
+            "the far container is not reloaded"
+        );
+        // 5. hysteresis: just past the near edge (-2170.6) the near record leaves, the far
+        // one stays; inside the 10 m band at the far edge nothing unloads, outside it does
+        move_camera(&mut app, -2175.0, z);
+        pump(&mut app, "near leaves", |_| {}, |app| gone(app, BASE_NEAR));
+        assert!(ready(&app, BASE_FAR));
+        move_camera(&mut app, -3165.0, z);
+        settle(&mut app, 30);
+        assert!(ready(&app, BASE_FAR), "kept inside the 10 m band");
+        move_camera(&mut app, -3175.0, z);
+        pump(&mut app, "far leaves", |_| {}, |app| gone(app, BASE_FAR));
     }
     #[test]
     fn missing_location_fails_instead_of_acknowledging_loaded_terrain() {
