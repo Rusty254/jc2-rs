@@ -8,6 +8,25 @@ Steam install, in the tradition of OpenMW, OpenRCT2 and re3. Nothing from the or
 executable is copied: file formats and game logic are worked out from the
 reverse-engineering notes in `research/` and rewritten in Rust.
 
+## Vision
+
+The goal is to rewrite Just Cause 2, then take it further than the original could go:
+
+1. **A faithful rewrite first.** Graphics and gameplay at 1:1 parity with the original,
+   or as close as the evidence allows. Every constant comes from the game's own data or
+   code. Anything not yet recovered is listed as an open gap rather than guessed.
+2. **Modern feature support.** Once the original runs as it should, add the features a
+   game released today would have, on top of a modern engine (Bevy, rendering through
+   Vulkan, DirectX 12 or Metal).
+3. **Modding made accessible.** Open source code, documented file formats
+   (`research/formats/`), and tools for reading and browsing the game's assets
+   (`jc2tool`, `jc2 --browse`). Changing the game should not require
+   reverse-engineering an executable.
+4. **Later, possibly:** bring the graphics and gameplay of newer titles into this one.
+
+**Inspiration:** chasm's video
+[The Modern Warfare 2 Rust Rewrite is Here...](https://www.youtube.com/watch?v=9UbADrcEW5w).
+
 **Status: milestone 5.** The archives mount, every file the engine can see is listed
 with its real name, containers and compression are transparent, both property-file
 layouts decode, and a Bevy app renders textures and **models** straight out of the
