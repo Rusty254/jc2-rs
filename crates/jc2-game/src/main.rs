@@ -64,6 +64,7 @@ mod map;
 mod mission_browser;
 mod missions;
 mod music;
+mod native_units;
 mod npc;
 mod parachute;
 mod particle_fixture;

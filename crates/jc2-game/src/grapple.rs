@@ -1145,7 +1145,11 @@ pub(crate) fn draw_cables(
             (
                 meshes.add(Cylinder::new(1.0, 1.0)),
                 materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.95, 0.95, 0.93),
+                    // unlit: native scene unit from a display value (policy)
+                    base_color: crate::native_units::native_colour(
+                        Vec3::new(0.95, 0.95, 0.93),
+                        1.0,
+                    ),
                     unlit: true,
                     ..default()
                 }),

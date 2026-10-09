@@ -52,8 +52,10 @@
 //! native brightness. **The identity is native; the camera's `e0` is Bevy's own choice and any
 //! value gives the same picture as long as the lights use this scale.** What it does not give
 //! by itself: the clamp at 1.0 and the `sqrt` encode (the post pass, `post_effects.rs`), the
-//! tint and saturation blocks, and `A` (auto-exposure, JC2-134 phase 2). Point lights
-//! (`PointLightBase`), the fog and the sky colour keep their project-tuned (non-native) units.
+//! tint and saturation blocks, and `A` (auto-exposure, JC2-134 phase 2). JC2-139 carries the other
+//! consumers through the same `e0` (`native_units.rs`: point lights `4 pi * lux_per_unit` lumens per
+//! unit at 1 m, lit emissive `1 / e0`, unlit/fog/clear colours 1:1); their *values* stay policy
+//! where no native number exists.
 
 use crate::Game;
 use crate::sky::TimeOfDay;

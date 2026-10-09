@@ -115,13 +115,13 @@ fn setup_fx(
         sphere: meshes.add(Sphere::new(1.0).mesh().ico(3).unwrap()),
         rocket: meshes.add(Capsule3d::new(0.06, 0.5)),
         rocket_material: materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.7, 0.35),
-            emissive: LinearRgba::rgb(12.0, 6.0, 2.0),
+            // unlit: `base_color` is what shows (native scene unit from a display value, policy)
+            base_color: crate::native_units::native_colour(Vec3::new(1.0, 0.7, 0.35), 1.0),
             unlit: true,
             ..default()
         }),
         smoke: materials.add(StandardMaterial {
-            base_color: Color::srgba(0.08, 0.07, 0.07, 0.45),
+            base_color: crate::native_units::native_colour(Vec3::new(0.08, 0.07, 0.07), 0.45),
             alpha_mode: AlphaMode::Blend,
             unlit: true,
             ..default()
@@ -239,8 +239,7 @@ pub(crate) fn detonate(
         }
         // the fireball and its flash
         let material = materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 0.55, 0.15, 0.9),
-            emissive: LinearRgba::rgb(30.0, 12.0, 2.0),
+            base_color: crate::native_units::native_colour(Vec3::new(1.0, 0.55, 0.15), 0.9),
             alpha_mode: AlphaMode::Blend,
             unlit: true,
             ..default()
@@ -256,7 +255,7 @@ pub(crate) fn detonate(
             },
             PointLight {
                 color: Color::srgb(1.0, 0.6, 0.25),
-                intensity: 4.0e7,
+                intensity: explosion_lumens(),
                 range: b.radius * 8.0,
                 shadow_maps_enabled: false,
                 ..default()
@@ -264,6 +263,16 @@ pub(crate) fn detonate(
             Name::new("explosion"),
         ));
     }
+}
+
+/// Explosion light strength in native colour units at 1 m (`native_units::point_lumens`).
+/// **Policy value** (the earlier 4.0e7 lm tuning is 1,015 units; the exe caps a point-light
+/// colour channel at 8 with its own radius fall-off, which is not decoded, so this
+/// inverse-square stand-in is not a native intensity).
+const EXPLOSION_NATIVE: f32 = 1_000.0;
+
+fn explosion_lumens() -> f32 {
+    crate::native_units::point_lumens(EXPLOSION_NATIVE)
 }
 
 fn fireballs(
@@ -280,10 +289,9 @@ fn fireballs(
         // native point-light colour scale S (1.0 at night, 0.25 by day); the unknown
         // CRenderEngine+0x830 factor is taken as 1 (atmosphere.rs)
         let scale = atmosphere.as_ref().map_or(1.0, |a| a.point_light_factor());
-        light.intensity = 4.0e7 * (1.0 - t).powi(2) * scale;
+        light.intensity = explosion_lumens() * (1.0 - t).powi(2) * scale;
         if let Some(mut m) = materials.get_mut(&f.material) {
             m.base_color.set_alpha(0.9 * (1.0 - t));
-            m.emissive = LinearRgba::rgb(30.0, 12.0, 2.0) * (1.0 - t);
         }
         if t >= 1.0 {
             commands.entity(e).despawn();
@@ -425,6 +433,13 @@ fn puffs(
 
 #[cfg(test)]
 mod tests {
+    /// The explosion light keeps its tuned strength (4.0e7 lm) in native colour units.
+    #[test]
+    fn the_explosion_light_keeps_its_tuned_strength_in_native_units() {
+        let lm = explosion_lumens();
+        assert!((lm / 4.0e7 - 1.0).abs() < 0.03, "{lm}");
+    }
+
     use super::*;
 
     #[test]

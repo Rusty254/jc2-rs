@@ -25,6 +25,17 @@
 //! * Still **non-native** policy here: the sky/fog colour, the fog distances, the fog's
 //!   sun-scatter colour, the discs, and the sun colour / moon strength the cloud tint reads
 //!   ([`SkyState::sun_colour`], [`SkyState::moon_lux`]; `clouds.rs`).
+//! * **Units (JC2-139).** The world camera shows `sqrt(clamp01(scene) * A * tint)`, so the
+//!   clear colour and the fog colour (a scene colour: Bevy mixes fog into the already exposed
+//!   pixel) are written in native scene units. The project's sky/fog colours are *authored as
+//!   display values* (`NOON_SKY` is what the player should see at `A = 1`) and converted by
+//!   `c = d^2` (`native_units::display_native`), the inverse of the chain's `sqrt`: **policy
+//!   colours in native units**, no native value. The haze colours `cb0[13]`/`cb0[14]` come from
+//!   the haze object's static presets plus tables `A`/`B`/`E`/`F` (`atmosphere.rs`); the
+//!   presets are unresolved (brief `light-tables-next.md` G2), so the tables alone are not a
+//!   fog colour (noon `E` = (0.008, 0.130, 0.130) is a dark teal, not the horizon haze) and
+//!   stay unused. The fog *coefficients* of `FogFalloff::from_visibility_colors` are unit-free
+//!   rates, not scene colours, and are unchanged.
 
 use crate::Game;
 use crate::atmosphere::{
@@ -200,8 +211,16 @@ impl SkyState {
     }
 }
 
-fn colour(v: Vec3) -> Color {
+/// A fog **coefficient** colour (`FogFalloff::from_visibility_colors`): a unit-free
+/// per-channel transmittance/in-scatter rate, not a scene colour, so it stays as authored.
+fn coefficient(v: Vec3) -> Color {
     Color::srgb(v.x, v.y, v.z)
+}
+
+/// A scene colour (clear colour, fog colour at infinity) from a project colour authored as a
+/// display value: native units `d^2` (`native_units.rs`). **Policy colour, native unit.**
+fn colour(v: Vec3) -> Color {
+    crate::native_units::native_colour(v, 1.0)
 }
 
 pub struct SkyPlugin {
@@ -327,13 +346,21 @@ fn spawn_sky(
         commands.spawn((
             SunDisc,
             Name::new("sun disc"),
-            disc(440.0, Color::srgb(1.0, 0.95, 0.80), false),
+            disc(
+                440.0,
+                crate::native_units::native_colour(Vec3::new(1.0, 0.95, 0.80), 1.0),
+                false,
+            ),
             Transform::from_translation(st.sun_dir * DISC_DISTANCE),
         ));
         commands.spawn((
             MoonDisc,
             Name::new("moon disc"),
-            disc(380.0, Color::srgba(0.86, 0.89, 0.96, 1.0), true),
+            disc(
+                380.0,
+                crate::native_units::native_colour(Vec3::new(0.86, 0.89, 0.96), 1.0),
+                true,
+            ),
             Transform::from_translation(st.moon_dir * DISC_DISTANCE),
         ));
     }
@@ -372,6 +399,7 @@ fn apply_sky(
         l.color = lights.sun_color;
         *tf = Transform::default().looking_to(-st.light_dir, Vec3::Y);
     }
+    // policy colours (`st.sky`, authored as display values) in native scene units
     clear.0 = colour(st.sky);
     for (mut amb, mut fog) in &mut cams {
         amb.color = lights.ambient_color;
@@ -385,8 +413,8 @@ fn apply_sky(
         );
         fog.falloff = FogFalloff::from_visibility_colors(
             st.fog_visibility,
-            colour(st.fog_extinction),
-            colour(st.fog_inscatter),
+            coefficient(st.fog_extinction),
+            coefficient(st.fog_inscatter),
         );
     }
 }
@@ -431,7 +459,10 @@ fn follow_camera(
         };
         if let Some(mut m) = materials.as_mut().and_then(|a| a.get_mut(&mat.0)) {
             // faint in daylight, full at night
-            m.base_color = Color::srgba(0.86, 0.89, 0.96, 0.12 + 0.88 * (1.0 - st.daylight));
+            m.base_color = crate::native_units::native_colour(
+                Vec3::new(0.86, 0.89, 0.96),
+                0.12 + 0.88 * (1.0 - st.daylight),
+            );
         }
     }
 }
@@ -501,12 +532,13 @@ mod tests {
         let sun_up = -sun_tf.forward().y;
         let sun_lux = sun_l.illuminance;
         let ambient = w.query::<&AmbientLight>().single(w).unwrap().brightness;
-        let c = w.resource::<ClearColor>().0.to_srgba();
+        // the clear colour is a native scene colour; the test reads its display value
+        let c = w.resource::<ClearColor>().0.to_linear();
         Look {
             sun_up,
             sun_lux,
             ambient,
-            clear: Vec3::new(c.red, c.green, c.blue),
+            clear: crate::native_units::native_display(Vec3::new(c.red, c.green, c.blue)),
         }
     }
 

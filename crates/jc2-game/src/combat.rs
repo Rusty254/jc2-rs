@@ -583,9 +583,11 @@ fn setup_arsenal(
         hero_health,
         vehicle_health.len()
     );
-    let unlit = |c: Color| StandardMaterial {
-        base_color: c,
-        emissive: c.to_linear() * 8.0,
+    // unlit: the material shows `base_color` only (Bevy ignores `emissive` on unlit
+    // materials), so the colour is a native scene colour; authored as a display value
+    // (policy, `native_units.rs`)
+    let unlit = |d: Vec3| StandardMaterial {
+        base_color: crate::native_units::native_colour(d, 1.0),
         unlit: true,
         ..default()
     };
@@ -620,12 +622,11 @@ fn setup_arsenal(
             .unwrap_or(0.5),
         shot_random: ShotRandom::default(),
         tracer_mesh: meshes.add(Cylinder::new(1.0, 1.0)),
-        tracer_hot: materials.add(unlit(Color::srgb(1.0, 0.85, 0.4))),
-        tracer_enemy: materials.add(unlit(Color::srgb(1.0, 0.45, 0.3))),
+        tracer_hot: materials.add(unlit(Vec3::new(1.0, 0.85, 0.4))),
+        tracer_enemy: materials.add(unlit(Vec3::new(1.0, 0.45, 0.3))),
         flash_mesh: meshes.add(flash_mesh()),
         flash_material: materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 0.8, 0.45, 0.9),
-            emissive: LinearRgba::rgb(14.0, 8.0, 2.5),
+            base_color: crate::native_units::native_colour(Vec3::new(1.0, 0.8, 0.45), 0.9),
             unlit: true,
             alpha_mode: AlphaMode::Add,
             cull_mode: None,
@@ -987,13 +988,13 @@ fn spawn_flash(
         .with_child((
             PointLight {
                 color: Color::srgb(1.0, 0.75, 0.4),
-                intensity: 40_000.0,
+                intensity: muzzle_flash_lumens(),
                 range: 8.0,
                 shadow_maps_enabled: false,
                 ..default()
             },
             // scaled each frame by the native per-hour point-light factor (atmosphere.rs)
-            crate::atmosphere::PointLightBase(40_000.0),
+            crate::atmosphere::PointLightBase(muzzle_flash_lumens()),
         ))
         .id();
     if let Some((gun, _)) = mount {
@@ -1002,6 +1003,15 @@ fn spawn_flash(
 }
 
 const FLASH_SECONDS: f32 = 0.05;
+
+/// Muzzle-flash light strength in native colour units at 1 m (`native_units::point_lumens`:
+/// 1.0 lights a white surface to 1.0 at 1 m before the per-hour scale `S`). **Policy value**
+/// (kept from the earlier 40,000 lm tuning, 1.015 units); the exe's flash colour and radius
+/// are not decoded (`light_info` files).
+const MUZZLE_FLASH_NATIVE: f32 = 1.0;
+fn muzzle_flash_lumens() -> f32 {
+    crate::native_units::point_lumens(MUZZLE_FLASH_NATIVE)
+}
 
 /// The muzzle of the gun in Rico's hand and the way its barrel points, when its model
 /// is there.
@@ -1834,6 +1844,14 @@ fn combat_hud(
 
 #[cfg(test)]
 mod tests {
+    /// The muzzle-flash light keeps the strength it was tuned to (40,000 lm) when expressed in
+    /// native colour units at 1 m (`native_units.rs`).
+    #[test]
+    fn the_muzzle_flash_light_is_one_native_unit_at_a_metre() {
+        let lm = muzzle_flash_lumens();
+        assert!((lm / 40_000.0 - 1.0).abs() < 0.03, "{lm}");
+    }
+
     use super::*;
 
     mod downed;

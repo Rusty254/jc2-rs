@@ -881,8 +881,8 @@ fn heli_guns(
         *tracer = Some((
             m.add(Cylinder::new(1.0, 1.0)),
             s.add(StandardMaterial {
-                base_color: Color::srgb(1.0, 0.7, 0.2),
-                emissive: LinearRgba::rgb(4.0, 2.0, 0.4),
+                // unlit: native scene unit from a display value (policy, `native_units.rs`)
+                base_color: crate::native_units::native_colour(Vec3::new(1.0, 0.7, 0.2), 1.0),
                 unlit: true,
                 ..default()
             }),

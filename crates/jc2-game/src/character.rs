@@ -394,7 +394,8 @@ fn spawn_hero(
         ..default()
     });
     let line_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.85, 0.85, 0.8),
+        // unlit: native scene unit from a display value (policy, `native_units.rs`)
+        base_color: crate::native_units::native_colour(Vec3::new(0.85, 0.85, 0.8), 1.0),
         unlit: true,
         ..default()
     });

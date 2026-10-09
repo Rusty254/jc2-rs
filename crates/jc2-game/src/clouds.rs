@@ -15,6 +15,18 @@
 //!   day, orange at dusk, dark blue by night). The high **cirrus** is `cirrus_clouds_dif.dds`
 //!   (three pictures) on a few huge cards at 9 km.
 //!
+//! **Units (JC2-139).** The dome, the moon and the unlit sprites are written in native scene units
+//! (a colour `c` shows as `sqrt(c * A * tint)`): the dome and moon are project colours authored
+//! as display values and converted by `native_units::display_native` (policy); the stars and the
+//! sun glow are additive linear values already (policy). The cloud and cirrus cards go through
+//! Bevy's lighting in `sky_sprite.wgsl` (as before): the cumulus colour is the native table `C`
+//! (lit colour) and the cirrus a policy tint, both **multiplied by Bevy's sun and ambient**, which
+//! is not what the exe does (it has no second lighting of a lit colour) but is what reproduces the
+//! bright white cards of the reference frames (`reference/world/daylight-*clouds*`): drawing `C`
+//! unlit (tried, JC2-139) gave dark grey cards. The native card shader is not decoded (gap). The
+//! native sun/moon sprite tint constants (2.0 / 0.4 of `FUN_00a594e0`) are not applied for the
+//! same reason.
+//!
 //! `--no-clouds` leaves the clouds and cirrus out, `--cloud-cover 0.8` sets how many of the
 //! 555 cards are drawn (the game's default is the file's 0.42), `--no-stars` leaves the stars.
 
@@ -227,13 +239,9 @@ pub fn dome_colours(mesh: &Mesh, st: &SkyState, zenith: Vec3) -> Vec<[f32; 4]> {
             let towards_sun = d.dot(st.sun_dir).max(0.0);
             let glow = towards_sun.powf(6.0) * low_sun * sun_set * (1.0 - 0.6 * e);
             c += Vec3::new(1.0, 0.55, 0.25) * glow * 0.45;
-            let lc = Color::srgb(
-                c.x.clamp(0.0, 1.0),
-                c.y.clamp(0.0, 1.0),
-                c.z.clamp(0.0, 1.0),
-            )
-            .to_linear();
-            [lc.red, lc.green, lc.blue, 1.0]
+            // display-authored policy colour -> native scene unit (`native_units.rs`)
+            let n = crate::native_units::display_native(c.clamp(Vec3::ZERO, Vec3::ONE));
+            [n.x, n.y, n.z, 1.0]
         })
         .collect()
 }
@@ -586,7 +594,10 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
 /// Tint of the clouds at an hour (sRGB): white by day, the sun's colour when it is low,
 /// a dark blue by night; and how bright the cirrus is. **Non-native** project policy: used
 /// for the cirrus layer always, and for the cumulus cards only when `gradients.bmp` could not
-/// be read (otherwise their tint is the native lit colour, table `C`, `atmosphere.rs`).
+/// be read (otherwise their tint is the native lit colour, table `C`, `atmosphere.rs`). These
+/// are factors of the cards' Bevy lighting (`sky_sprite.wgsl` lights them), values above 1
+/// included, not display colours; they were tuned against the sun and ambient of the exposure
+/// identity and are kept (a native card shader is not decoded, see the module comment).
 pub fn cloud_tint(st: &SkyState, cirrus: bool) -> Vec3 {
     let day = st.daylight;
     let low = 1.0 - smoothstep(4.0, 26.0, st.sun_elevation);
@@ -701,7 +712,12 @@ fn update_sky(
         // faint in daylight, full at night; reddish when it is low
         let low = 1.0 - smoothstep(0.0, 14.0, moon_up);
         let a = 0.10 + 0.90 * (1.0 - st.daylight);
-        m.base_color = Color::srgba(1.0, 1.0 - 0.18 * low, 1.0 - 0.38 * low, a);
+        // policy display colour -> native unit (the native sprite tint constants, sun 2.0 and
+        // moon 0.4 of `FUN_00a594e0`, are proven but how the sprite shader combines them is not)
+        m.base_color = crate::native_units::native_colour(
+            Vec3::new(1.0, 1.0 - 0.18 * low, 1.0 - 0.38 * low),
+            a,
+        );
     }
     // the sun's glow: additive, strongest when the sun is low
     for (mut tf, mut vis) in &mut glow {
@@ -772,10 +788,7 @@ mod tests {
             .attribute(Mesh::ATTRIBUTE_POSITION)
             .and_then(|a| a.as_float3())
             .unwrap();
-        let lin = |v: Vec3| {
-            let c = Color::srgb(v.x, v.y, v.z).to_linear();
-            Vec3::new(c.red, c.green, c.blue)
-        };
+        let lin = crate::native_units::display_native;
         // the top vertex is the zenith colour, one on the horizon the sky colour
         let top = positions
             .iter()

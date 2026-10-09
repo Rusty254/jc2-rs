@@ -30,6 +30,18 @@
 //!   pin this. The HUD is drawn after the post pass (`bevy_ui_render` runs after
 //!   `Core3dSystems::PostProcess`), as native HUD is.
 //!
+//! **Which cameras share the chain (JC2-139 decision).** The world camera (`world.rs`) is the
+//! one entity for the hero chase camera and the free fly camera (`--no-hero`, the capture
+//! mode), so the free camera matches the game camera by construction: same `PostPass`, the
+//! same no-HDR / `Tonemapping::None` / `Exposure::BLENDER` components. The model viewer
+//! (`viewer.rs`), the mission-browser 3D model pane (`browser/model3d.rs`) and the foliage and
+//! particle fixtures keep Bevy's default display (tone-mapped, sRGB encode) on purpose: they
+//! are inspection tools whose project lights (a fixed 8,000 lux key, ambient 300) and the
+//! stored GPU material/particle captures they are validated against (STATUS 8 October) would
+//! all change under the native chain; none has a game zone, a clock or a scene to meter
+//! (`A` would be 1), and `PostEffectPlugin` is only added to the world app. This is a
+//! project choice, not a native fact (the exe has one render path).
+//!
 //! Gaps (not implemented, not guessed): the auto-exposure meter geometry and `dt` source are
 //! inferred (see `auto_exposure.rs`), blur mix, overlay S2/S3, depth of field S5/S25, heat haze S26, underwater/height/rain/snow sets, smoothing of the settings,
 //! and the cutscene overrides (brief Gaps 1, 2, 5..9).

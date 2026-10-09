@@ -299,3 +299,18 @@ vector `(S8, S9, S10, dt)`; the composite multiplies by `applied + S7 - 1`).
 * **Capture check** (`_extract/jc2-137/`, start base tile 29,18, 1280x720, converged after 40 s): noon (Arctic, y 0.04) measured
   `A` = 1.065 (median of after^2 / before^2) against 1.063 from the CPU meter on the phase-1 capture; 22:00 measured 1.733 against 1.757
   (the proxy uses display values after saturation and tint, so about 1.5 % off is expected).
+
+## 11. Implementation status (JC2-139, other consumers in native colour units, on branch)
+
+`native_units.rs` carries the remaining consumers through the same `e0` identity. Native identities (tested against a CPU
+copy of Bevy 0.19.1's maths): point light `lumens = 4 pi * (pi / e0) * c` for a colour `c` at 1 m (Bevy stores `lumens / 4 pi`
+candela, `albedo / pi * cd / d^2 * e0`), lit emissive `1 / e0`, and unlit/fog/clear colours 1:1 (Bevy ignores `emissive`
+on unlit materials, fog is mixed into the exposed pixel). **No new native value was found**: fog colour `cb0[13]` needs the haze
+presets (G2 of `light-tables-next.md`; tables `E`/`F` alone are a dark teal), the sky dome shader (`SkyGradient`) and the card
+shader are not decoded, point-light colours/radii of muzzle flashes and explosions are not decoded. So the project colours
+(clear, fog, dome, moon, discs, tracers, rope lines, fireball, smoke) are authored as display values and converted by
+`c = d^2` (policy, inverse of the final `sqrt`), the two point lights are policy strengths in native units (1.0 and
+1,000 at 1 m, i.e. the old 40,000 lm / 4.0e7 lm). Cloud cards stay Bevy-lit (an unlit `C` was tried and was far darker than the
+reference frames). Other cameras: the world camera is also the free camera; viewer, browser model pane and the fixtures keep
+Bevy's default display (rationale in `post_effects.rs`). Captures: `_extract/jc2-139/` before/after at noon, 19:00, 22:00 and
+two sky-in-view frames.

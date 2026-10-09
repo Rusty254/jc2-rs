@@ -30,6 +30,10 @@ Master e368688: 507/507 tests, clippy `-D warnings` clean. Accepted today:
   night/day post blocks (saturation clamp, tint), sqrt (gamma 2.0) encode, exposure identity
   `lux_per_unit = pi/e0` replacing the policy scale. Auto-exposure (JC2-137): a GPU luminance chain 64 -> 16 -> 4 -> 1 adapts `A` (one frame late, inferred tap geometry and dt, see brief section 10).
 
+- JC2-139 (on branch): `native_units.rs` expresses the remaining consumers in native colour units through the exposure
+  identity (point lights, unlit/fog/clear colours); values without native evidence stay labelled policy
+  (display-authored, `c = d^2`). See `night-exposure-next.md` section 11.
+
 Open parity research (board, tags `research` + `parity-gap`): JC2-101..110, 112..117, 119..121,
 125..139 (124 done). GitHub `Rusty254/jc2-rs` (private) receives only the filtered `public` snapshot.
 
