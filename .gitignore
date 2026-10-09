@@ -1,0 +1,36 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# research artefacts that are large or regenerable
+research/ghidra/*.gzf
+research/ghidra/*.rep/
+research/ghidra/*.gpr
+research/analysis/pseudo/
+research/analysis/calls.csv
+research/tools/ghidra_*.zip
+research/tools/__pycache__/
+research/_to_delete/
+
+# never commit game files
+*.exe
+*.dll
+*.arc
+*.tab
+
+# agents' scratch extractions from the game data
+_extract/
+_incoming/
+
+# agent worktrees
+.claude/
+
+# reference screenshots of the original game (never commit game imagery)
+/reference/
+
+# build-lock state for parallel agents
+scripts/.lock/
+
+# shared task-board transaction files
+notes/task-board.json.lock
+notes/task-board.json.*.tmp

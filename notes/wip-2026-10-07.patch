@@ -1,0 +1,444 @@
+From f63c7bbf6812b20b48450b19176c7b6e9849f240 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 16:24:41 +0200
+Subject: [PATCH] wip: chute pose and canopy culling, standing still on slopes,
+ no sleeping (avian wake crash), map icon formats, deps without debug info
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WcPmdqERqBaj9hqqV7zgoi
+---
+ Cargo.toml                       |   2 +
+ crates/jc2-formats/src/icons.rs  | 153 +++++++++++++++++++++++++++++++
+ crates/jc2-formats/src/lib.rs    |   1 +
+ crates/jc2-game/src/audio.rs     |  41 +++++----
+ crates/jc2-game/src/character.rs |  81 ++++++++++++++--
+ crates/jc2-game/src/parachute.rs |   3 +
+ crates/jc2-game/src/physics.rs   |   9 ++
+ crates/jc2-game/src/rig.rs       |  10 +-
+ 8 files changed, 273 insertions(+), 27 deletions(-)
+ create mode 100644 crates/jc2-formats/src/icons.rs
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 2a67341..f23a0e7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,7 +21,9 @@ bevy = "0.19"
+ avian3d = "0.7"
+ 
+ # Fast iteration: optimise dependencies even in debug, keep our crates debuggable.
++# Dependencies carry no debug info: it was most of a 20 GB target folder.
+ [profile.dev]
+ opt-level = 1
+ [profile.dev.package."*"]
+ opt-level = 3
++debug = false
+diff --git a/crates/jc2-formats/src/icons.rs b/crates/jc2-formats/src/icons.rs
+new file mode 100644
+index 0000000..ca0da72
+--- /dev/null
++++ b/crates/jc2-formats/src/icons.rs
+@@ -0,0 +1,153 @@
++//! The map's icons. `settings\icon_types.bin` lists the icon kinds — `type` (a number),
++//! `faction`, and `#3acab26e` the texture (`gui\MiniMapIcons\hud_icon_s_u_village_dif.dds`);
++//! `settings\icons_global.bin` places 899 icons — `id`, `#01dfc541` the position (engine
++//! axes), `#c9f36d94` a kind (collectables 8/9/10, challenges 17, …; 0 on the settlements,
++//! whose kind is in the next file), `visible`, `enabled` and their events;
++//! `settings\settlements.bin` names the settlements — `id` (the icon's: `31x14`,
++//! `14x50base`, `dcs40`), `#4c4b2806` their icon kind (24 military base, 26/28
++//! harbours, 27 airfield, 29 city, 30 village) and `text`, the key of their name in the
++//! text database.
++//!
++//! The PDA's map (`pda_map_dif.dds`, 2048² DXT1) covers the whole world at 16 m a pixel,
++//! north up: pixel `((x + 16384) / 16, (z + 16384) / 16)` for engine `(x, z)`.
++
++use crate::property::{Node, PropertyFile, Variant};
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct IconType {
++    pub id: String,
++    pub kind: i32,
++    pub faction: i32,
++    /// The texture's file name, lower case (`hud_icon_s_u_village_dif.dds`).
++    pub texture: String,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct MapIcon {
++    pub id: String,
++    pub position: [f32; 3],
++    pub kind: i32,
++    pub visible: bool,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct Settlement {
++    pub id: String,
++    pub kind: i32,
++    pub text: String,
++}
++
++/// The kinds settlements use, with what they are.
++pub const SETTLEMENT_KINDS: [(i32, &str); 7] = [
++    (24, "military base"),
++    (25, "military airfield"),
++    (26, "military harbour"),
++    (27, "airfield"),
++    (28, "harbour"),
++    (29, "city"),
++    (30, "village"),
++];
++
++const TEXTURE: u32 = 0x3aca_b26e;
++const POSITION: u32 = 0x01df_c541;
++const ICON_KIND: u32 = 0xc9f3_6d94;
++const SETTLEMENT_KIND: u32 = 0x4c4b_2806;
++
++fn int(n: &Node, h: u32) -> Option<i32> {
++    match n.value_hash(h)? {
++        Variant::Int(i) => Some(*i),
++        Variant::Float(f) => Some(*f as i32),
++        _ => None,
++    }
++}
++
++fn each(data: &[u8], mut f: impl FnMut(&Node)) -> crate::Result<()> {
++    let file = PropertyFile::parse_any(data)?;
++    for root in &file.nodes {
++        root.walk(&mut |n| f(n));
++    }
++    Ok(())
++}
++
++pub fn icon_types(data: &[u8]) -> crate::Result<Vec<IconType>> {
++    let mut out = Vec::new();
++    each(data, |n| {
++        if let (Some(id), Some(Variant::Str(t))) = (n.str("id"), n.value_hash(TEXTURE)) {
++            out.push(IconType {
++                id: id.to_string(),
++                kind: n.int("type").unwrap_or(-1),
++                faction: n.int("faction").unwrap_or(0),
++                texture: crate::placement::bare_name(t).to_ascii_lowercase(),
++            });
++        }
++    })?;
++    Ok(out)
++}
++
++pub fn map_icons(data: &[u8]) -> crate::Result<Vec<MapIcon>> {
++    let mut out = Vec::new();
++    each(data, |n| {
++        if let (Some(id), Some(Variant::Vec3(p))) = (n.str("id"), n.value_hash(POSITION)) {
++            out.push(MapIcon {
++                id: id.to_string(),
++                position: *p,
++                kind: int(n, ICON_KIND).unwrap_or(0),
++                visible: n.int("visible").is_none_or(|v| v != 0),
++            });
++        }
++    })?;
++    Ok(out)
++}
++
++pub fn settlements(data: &[u8]) -> crate::Result<Vec<Settlement>> {
++    let mut out = Vec::new();
++    each(data, |n| {
++        if let (Some(id), Some(kind)) = (n.str("id"), int(n, SETTLEMENT_KIND)) {
++            out.push(Settlement {
++                id: id.to_string(),
++                kind,
++                text: n.str("text").unwrap_or("").to_string(),
++            });
++        }
++    })?;
++    Ok(out)
++}
++
++/// The map pixel (0..1 on each axis, north up) of an engine position.
++pub fn map_uv(x: f32, z: f32) -> (f32, f32) {
++    ((x + 16384.0) / 32768.0, (z + 16384.0) / 32768.0)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Needs JC2_TEST_DIR with the three settings files.
++    #[test]
++    fn the_villages_are_on_the_map() {
++        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
++            return;
++        };
++        let fs = crate::GameFs::open(dir).unwrap();
++        let (Ok(t), Ok(i), Ok(s)) = (
++            fs.read_inflated("icon_types.bin"),
++            fs.read_inflated("icons_global.bin"),
++            fs.read_inflated("settlements.bin"),
++        ) else {
++            return;
++        };
++        let types = icon_types(&t).unwrap();
++        let village = types.iter().find(|t| t.kind == 30).unwrap();
++        assert!(village.texture.starts_with("hud_icon_s_u_village"));
++        let icons = map_icons(&i).unwrap();
++        assert_eq!(icons.len(), 899);
++        let set = settlements(&s).unwrap();
++        assert!(set.len() > 300, "{}", set.len());
++        // the start "village" is a military base, its icon on tile 31,14
++        let ours = set.iter().find(|s| s.id == "31x14").unwrap();
++        assert_eq!(ours.kind, 24);
++        let icon = icons.iter().find(|i| i.id == "31x14").unwrap();
++        let (u, v) = map_uv(icon.position[0], icon.position[2]);
++        assert_eq!(((u * 64.0) as u32, (v * 64.0) as u32), (31, 14));
++    }
++}
+diff --git a/crates/jc2-formats/src/lib.rs b/crates/jc2-formats/src/lib.rs
+index ba99db6..f7adb4a 100644
+--- a/crates/jc2-formats/src/lib.rs
++++ b/crates/jc2-formats/src/lib.rs
+@@ -41,6 +41,7 @@ pub mod error;
+ pub mod fsb;
+ pub mod hash;
+ pub mod havok;
++pub mod icons;
+ pub mod landscape;
+ pub mod lod;
+ pub mod names;
+diff --git a/crates/jc2-game/src/audio.rs b/crates/jc2-game/src/audio.rs
+index 09916c2..adef34b 100644
+--- a/crates/jc2-game/src/audio.rs
++++ b/crates/jc2-game/src/audio.rs
+@@ -500,26 +500,29 @@ mod tests {
+                 let b = SoundBank::parse(&d).unwrap();
+                 (d, b)
+             });
+-            let i = b
+-                .find(name)
+-                .or_else(|| b.starting_with(name).next())
+-                .unwrap_or_else(|| panic!("{key}: {name} not in {bank}"));
+-            let src = AudioSource {
+-                bytes: b.mpeg(data, i).unwrap().into(),
++            let picks: Vec<usize> = match b.find(name) {
++                Some(i) => vec![i],
++                None => b.starting_with(name).collect(),
+             };
+-            let dec = src.decoder();
+-            let rate = bevy::audio::Source::sample_rate(&dec);
+-            let channels = bevy::audio::Source::channels(&dec);
+-            let n = dec.count();
+-            let s = &b.samples[i];
+-            assert_eq!(rate.get(), s.frequency, "{key}");
+-            assert_eq!(channels.get(), s.channels, "{key}");
+-            // the decoder gives back (about) the length the bank states
+-            let want = s.length_samples as usize * s.channels as usize;
+-            assert!(
+-                n + 2304 * 2 >= want && n <= want + 2304 * 2,
+-                "{key}: {n} of {want}"
+-            );
++            assert!(!picks.is_empty(), "{key}: {name} not in {bank}");
++            for i in picks {
++                let src = AudioSource {
++                    bytes: b.mpeg(data, i).unwrap().into(),
++                };
++                let dec = src.decoder();
++                let rate = bevy::audio::Source::sample_rate(&dec);
++                let channels = bevy::audio::Source::channels(&dec);
++                let n = dec.count();
++                let s = &b.samples[i];
++                assert_eq!(rate.get(), s.frequency, "{key}");
++                assert_eq!(channels.get(), s.channels, "{key}");
++                // the decoder gives back (about) the length the bank states
++                let want = s.length_samples as usize * s.channels as usize;
++                assert!(
++                    n + 2304 * 2 >= want && n <= want + 2304 * 2,
++                    "{key}: {n} of {want}"
++                );
++            }
+         }
+     }
+ }
+diff --git a/crates/jc2-game/src/character.rs b/crates/jc2-game/src/character.rs
+index fc91e1c..ec8aefa 100644
+--- a/crates/jc2-game/src/character.rs
++++ b/crates/jc2-game/src/character.rs
+@@ -871,12 +871,20 @@ fn hero_physics(
+         };
+         v.x += change.x;
+         v.z += change.z;
+-        // stick to the slope; stop falling through the gap
+-        v.y = if gap > 0.02 {
+-            -2.0
++        // stick to the slope; stop falling through the gap. Standing on it, follow the
++        // slope exactly and cancel the step's gravity: pressed into a frictionless
++        // capsule's contact, gravity would push him sideways and he slid downhill.
++        if gap > 0.02 {
++            v.y = -2.0;
+         } else {
+-            (-0.5f32).max(v.y.min(0.0))
+-        };
++            let flat = Vec2::new(along.x, along.z).length();
++            let slope_y = if speed > 0.0 && flat > 1e-3 {
++                along.y / flat * Vec3::new(v.x, 0.0, v.z).length()
++            } else {
++                0.0
++            };
++            v.y = slope_y + 9.81 * dt;
++        }
+         if input.jump {
+             v.y = JUMP_SPEED;
+             hero.grounded = false;
+@@ -988,7 +996,7 @@ fn hero_animation(
+             if landing && an.time < duration(an.clip) - 0.05 && hero.speed < 1.0 {
+                 continue;
+             }
+-            if !landing && matches!(an.clip, Clip::Fall | Clip::Jump) {
++            if !landing && matches!(an.clip, Clip::Fall | Clip::Jump | Clip::Dive) {
+                 an.rate = 1.0;
+                 an.play(Clip::Land);
+                 continue;
+@@ -1014,6 +1022,8 @@ fn hero_animation(
+         } else if !hero.grounded {
+             if hero.air_time < 0.35 && lin.y > 0.5 {
+                 Clip::Jump
++            } else if hero.air_time > 1.5 && lin.y < -12.0 && rig.clips.contains_key(&Clip::Dive) {
++                Clip::Dive
+             } else {
+                 Clip::Fall
+             }
+@@ -1236,6 +1246,65 @@ mod tests {
+         (h.clone(), t.translation, v.0)
+     }
+ 
++    /// Headless: standing still on a 20° slope he stays put (he slid down it: gravity
++    /// pressed the frictionless capsule into the slope). Needs Rico's model.
++    #[test]
++    fn rico_stands_on_a_slope() {
++        let Some((mut app, _, spawn)) =
++            crate::fleet::testing::app(&["mc01_lod1-rico.rbm"], |app| {
++                app.init_resource::<ButtonInput<MouseButton>>()
++                    .init_resource::<AccumulatedMouseMotion>()
++                    .add_plugins(CharacterPlugin);
++            })
++        else {
++            return;
++        };
++        // a slab tilted 20° about x through the start, its top a few metres up
++        let tilt = Quat::from_rotation_x(0.35);
++        app.world_mut().spawn((
++            RigidBody::Static,
++            Collider::cuboid(60.0, 2.0, 60.0),
++            Transform::from_translation(spawn + Vec3::Y * 3.0 - tilt * Vec3::Y).with_rotation(tilt),
++        ));
++        app.world_mut().spawn((
++            Transform::from_translation(spawn + Vec3::new(0.0, 4.0, 8.0)),
++            FlyCamera {
++                yaw: 0.0,
++                pitch: 0.0,
++                speed: 1.0,
++            },
++        ));
++        for _ in 0..600 {
++            step(&mut app, 1);
++            let mut q = app.world_mut().query::<&Hero>();
++            if q.single(app.world()).is_ok_and(|h| h.grounded) {
++                break;
++            }
++            std::thread::sleep(std::time::Duration::from_millis(2));
++        }
++        // drop him onto the slab
++        let mut q = app.world_mut().query_filtered::<Entity, With<Hero>>();
++        let e = q.single(app.world()).unwrap();
++        let above = spawn + Vec3::Y * 5.0;
++        app.world_mut().entity_mut(e).insert((
++            Transform::from_translation(above),
++            Position(above),
++            LinearVelocity::ZERO,
++        ));
++        step(&mut app, 120);
++        let (h, start, _) = hero(&mut app);
++        assert!(h.grounded, "on the slope");
++        assert!(
++            h.ground_normal.y < 0.97,
++            "the slab is tilted: {:?}",
++            h.ground_normal
++        );
++        step(&mut app, 64 * 3);
++        let (_, end, _) = hero(&mut app);
++        let moved = (end - start).length();
++        assert!(moved < 0.1, "slid {moved:.2} m");
++    }
++
+     /// Headless: Rico lands on a flat tile, walks when W is held, jumps, flies the
+     /// parachute at its glide speed from 80 m up, and gets pulled along the wire.
+     /// Needs JC2_TEST_DIR with `mc01_lod1-rico.rbm` and `general.blz` reachable.
+diff --git a/crates/jc2-game/src/parachute.rs b/crates/jc2-game/src/parachute.rs
+index c095d29..b505079 100644
+--- a/crates/jc2-game/src/parachute.rs
++++ b/crates/jc2-game/src/parachute.rs
+@@ -188,6 +188,9 @@ pub fn spawn_canopy(
+             Mesh3d(mesh.clone()),
+             MeshMaterial3d(canopy_material),
+             Transform::IDENTITY,
++            // the mesh is rebuilt every frame from an empty one: its bounding box from
++            // spawn time is a point, and the camera would cull the whole canopy
++            bevy::camera::visibility::NoFrustumCulling,
+             Name::new("canopy"),
+         ))
+         .id();
+diff --git a/crates/jc2-game/src/physics.rs b/crates/jc2-game/src/physics.rs
+index 36b910c..39593af 100644
+--- a/crates/jc2-game/src/physics.rs
++++ b/crates/jc2-game/src/physics.rs
+@@ -19,10 +19,19 @@ impl Plugin for JcPhysicsPlugin {
+     fn build(&self, app: &mut App) {
+         app.add_plugins(PhysicsPlugins::default())
+             .insert_resource(Gravity(Vec3::NEG_Y * 9.81))
++            .add_observer(never_sleep)
+             .add_systems(Update, drop_ball);
+     }
+ }
+ 
++/// No body ever sleeps. Avian 0.7.0's island wake-up can register a contact's
++/// manifolds with the solver twice; the solver then indexes past the end of the
++/// manifold list (`solver/plugin.rs:398`, "index out of bounds: the len is 2 but the
++/// index is 2") — it crashed when Rico landed on a tile that had just streamed in.
++fn never_sleep(add: On<Add, RigidBody>, mut commands: Commands) {
++    commands.entity(add.entity).insert(SleepingDisabled);
++}
++
+ /// Marker for the terrain's static bodies.
+ #[derive(Component)]
+ pub struct TerrainBody;
+diff --git a/crates/jc2-game/src/rig.rs b/crates/jc2-game/src/rig.rs
+index 624663b..2b86d1a 100644
+--- a/crates/jc2-game/src/rig.rs
++++ b/crates/jc2-game/src/rig.rs
+@@ -26,10 +26,13 @@ pub enum Clip {
+     SwimIdle,
+     Swim,
+     Walk,
++    /// Free fall: the spread-eagle skydive (`parachute_dash`).
++    Dive,
+ }
+ 
+ impl Clip {
+-    pub const ALL: [Clip; 11] = [
++    pub const ALL: [Clip; 12] = [
++        Clip::Dive,
+         Clip::Walk,
+         Clip::Idle,
+         Clip::Run,
+@@ -51,7 +54,10 @@ impl Clip {
+             Clip::Fall => "fall.ban",
+             Clip::Land => "run_jump_land.ban",
+             Clip::Hang => "grpl_hang.ban",
+-            Clip::Chute => "parachute_dash.ban",
++            // under the canopy he hangs from the handles: the grapple hang's arms-up pose
++            // (`parachute_dash` is the free-fall skydive — he lies flat in it)
++            Clip::Chute => "grpl_hang.ban",
++            Clip::Dive => "parachute_dash.ban",
+             Clip::ChuteLand => "land_chute.ban",
+             Clip::SwimIdle => "swim_idle.ban",
+             Clip::Swim => "swim_fwd.ban",
+-- 
+2.43.0
+

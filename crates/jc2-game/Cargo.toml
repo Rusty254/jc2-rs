@@ -1,0 +1,30 @@
+[package]
+name = "jc2-game"
+description = "Just Cause 2 reimplementation on Bevy (work in progress)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "jc2"
+path = "src/main.rs"
+
+[dependencies]
+jc2-formats.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+bevy = { workspace = true, features = ["dds", "ktx2", "png", "file_watcher", "mp3"] }
+avian3d = { workspace = true, features = ["collider-from-mesh"] }
+bevy_egui = { version = "0.42", default-features = false, features = ["render", "default_fonts", "manage_clipboard"] }
+
+[dev-dependencies]
+# validates terrain_splat.wgsl offline (the same naga wgpu already builds)
+naga = { version = "29", features = ["wgsl-in"] }
+
+[features]
+default = []
+# `cargo run -F dynamic` for faster incremental link times while developing
+dynamic = ["bevy/dynamic_linking"]

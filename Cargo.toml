@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/jc2-formats", "crates/jc2-tool", "crates/jc2-game"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+jc2-formats = { path = "crates/jc2-formats" }
+thiserror = "2"
+flate2 = "1"
+memmap2 = "0.9"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bevy = "0.19"
+avian3d = "0.7"
+
+# Fast iteration: optimise dependencies even in debug, keep our crates debuggable.
+# Dependencies carry no debug info: it was most of a 20 GB target folder.
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
