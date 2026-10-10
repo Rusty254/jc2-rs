@@ -74,3 +74,14 @@ derived from JustCause2.exe (research/analysis, probes, decompiler excerpts). Th
 - In committed documents cite native addresses and describe behaviour in prose; keep raw
   decompiler output out of code blocks where possible (the publisher strips it anyway).
 
+## GitHub issues and outside pull requests (from 10 October 2026)
+
+The repo is public again. Every `ready` board task is mirrored as a GitHub issue (board tag
+`gh-<issue number>`), written in prose with native addresses only (no decompiler names), so
+outside contributors can pick work up. Only `claude/orchestrator` exports or closes issues:
+- Before claiming a board task that has a `gh-N` tag, check the issue for someone already on it.
+- When the task is accepted and done, close its issue with the merge commit.
+- Outside pull requests land on the public `main` snapshot, not on `master`. The orchestrator
+  reviews them like any hand-in, brings accepted changes into `master`, then republishes;
+  otherwise the next snapshot would undo them. The README text above the title is the
+  author's own and is kept verbatim.
