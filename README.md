@@ -1,3 +1,14 @@
+Ever since I first played Just Cause 2 when it released I loved the game. 
+When Just Cause 3 released, it had way better tech, but it's mission structure and Far Cry like takeover the base mechanics never sat right with me. 
+The Chaos system in Just Cause 2 always gave me a reason to screw around in the world, where Just Cause 3 (and 4) didn't. 
+I always thought that was a shame, but after watching some of chasm's videos I've gotten the idea to vibe my way to the game I always wanted.
+So that's what this project will be for. 
+
+Progress will be slow, since I only have so many tokens to spend to get everything where it needs to be. 
+Help would be appreciated whether that be getting your own agents to or donating so that I can buy more tokens to speed up the progress.
+
+Everything after from here on will be written by AI:
+
 # jc2-rs — Just Cause 2, reimplemented in Rust on Bevy
 
 Agent coordination: read [AGENTS.md](AGENTS.md) and the shared
