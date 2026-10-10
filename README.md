@@ -5,7 +5,7 @@ I always thought that was a shame, but after watching some of chasm's videos I'v
 So that's what this project will be for. 
 
 Progress will be slow, since I only have so many tokens to spend to get everything where it needs to be. 
-Help would be appreciated whether that be getting your own agents to or donating so that I can buy more tokens to speed up the progress.
+Help would be appreciated by sending PRs my way.
 
 Everything after from here on will be written by AI:
 
