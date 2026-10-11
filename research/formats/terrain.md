@@ -373,6 +373,16 @@ four tiles are loaded in detail; otherwise it sits up to 18 m low (fading to 0 a
 shore, so the coastline does not move) so that a detailed neighbour draws over the
 seam. The sea plane reaches past the fog. Nothing of the global file's tail is used.
 
+Since JC2-157 the chunks are coloured like the native far terrain (`FastTerrainShader_Global`,
+`terrain-terms-next.md`): the terrain splat material in its `TERRAIN_GLOBAL` mode, with the global
+layers (`globalmetamaterials` A4R4G4B4 1024^2 repacked to slot integers R, G, B, A = slots 0..3,
+point; `globalmetaweights` and `globalslopes` BC1 1024^2, linear, 4th weight = 1 - saturate(r + g + b);
+`texturezonemap` 64^2, point, selecting the table half) at `uv = world.xz / 32768 + 0.5`, `t0 = t1 = 0`
+(colour table only), displacement, normal bend, hollows, sun/AO/ambient and the haze fog kept. Corrections to
+the older text: the global layers are 1024^2 BC1 / A4R4G4B4 (not 512^2 16-bit); the colour table sampler `s1` is
+point/clamp; the Lod2 hollows term equals the Lod0 term (ambient only), so that "unknown" is closed. The
+forest canopy layer that makes the reference's far slopes dark green is not drawn yet (JC2-160).
+
 ## Still unknown
 
 * Which `rtdisplacement_N.raw` made which atlas tile (the atlas itself is used, above).

@@ -7,10 +7,17 @@
 //! all loaded in detail is hidden; the others sit [`SINK`] metres low so a detailed tile
 //! next to them draws over the seam instead of fighting it. Chunks that are all sea are
 //! not built (the sea plane covers them). No colliders: nothing reaches them.
+//!
+//! The chunks are drawn like the native far terrain (`FastTerrainShader_Global`, JC2-157): the
+//! terrain splat material in its global mode ([`GlobalTerrainMaterial`], `terrain_splat.wgsl`
+//! under the `TERRAIN_GLOBAL` shader def) colours every pixel from the game's global material
+//! layers, so the mesh carries only positions and normals. Without those layers in the data
+//! (or with `--flat-terrain`) no chunk is built: there is no invented stand-in colour.
 
 use crate::Game;
 use crate::coords::{bevy_xyz, engine_xz, to_bevy};
-use crate::world::{FlyCamera, SEA_LEVEL, Streamer, terrain_colour};
+use crate::terrain_material::GlobalTerrainMaterial;
+use crate::world::{FlyCamera, SEA_LEVEL, Streamer};
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
@@ -41,7 +48,6 @@ pub struct Horizon {
     pub chunks: HashMap<(i32, i32), (Entity, usize)>,
     /// Chunks known to be all sea.
     pub sea_only: HashSet<(i32, i32)>,
-    material: Handle<StandardMaterial>,
     pub built: usize,
 }
 
@@ -57,11 +63,7 @@ impl Plugin for HorizonPlugin {
     }
 }
 
-fn setup_horizon(
-    mut commands: Commands,
-    game: Res<Game>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+fn setup_horizon(mut commands: Commands, game: Res<Game>) {
     let map = match game
         .fs
         .read_inflated("terrain_win32.dat")
@@ -74,17 +76,10 @@ fn setup_horizon(
             return;
         }
     };
-    let material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 1.0,
-        reflectance: 0.08,
-        ..default()
-    });
     commands.insert_resource(Horizon {
         map,
         chunks: HashMap::new(),
         sea_only: HashSet::new(),
-        material,
         built: 0,
     });
 }
@@ -112,7 +107,6 @@ pub fn chunk_mesh(map: &GlobalTerrain, c: (i32, i32), step: usize) -> Option<Mes
     let mut highest = f32::MIN;
     let mut positions = Vec::with_capacity(n * n);
     let mut normals = Vec::with_capacity(n * n);
-    let mut colours = Vec::with_capacity(n * n);
     for j in 0..n {
         for i in 0..n {
             let (x, z) = (x0 + i as f32 * cell, z0 + j as f32 * cell);
@@ -123,7 +117,6 @@ pub fn chunk_mesh(map: &GlobalTerrain, c: (i32, i32), step: usize) -> Option<Mes
             let normal = to_bevy([-dx, 1.0, -dz]).normalize();
             positions.push(bevy_xyz(x, y - sink(y), z).to_array());
             normals.push(normal.to_array());
-            colours.push(terrain_colour(y, normal.y));
         }
     }
     if highest < SEA_LEVEL - 4.0 {
@@ -146,7 +139,6 @@ pub fn chunk_mesh(map: &GlobalTerrain, c: (i32, i32), step: usize) -> Option<Mes
     );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
     mesh.insert_indices(Indices::U32(indices));
     Some(mesh)
 }
@@ -163,11 +155,14 @@ fn stream_horizon(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     horizon: Option<ResMut<Horizon>>,
+    material: Option<Res<GlobalTerrainMaterial>>,
     heroes: Query<&Transform, (With<crate::character::Hero>, Without<HorizonChunk>)>,
     players: Query<&Transform, (With<crate::vehicle::Occupied>, Without<HorizonChunk>)>,
     cams: Query<&Transform, (With<FlyCamera>, Without<HorizonChunk>)>,
 ) {
     let Some(mut hz) = horizon else { return };
+    // the chunks are drawn from the global layers only (no stand-in colour)
+    let Some(material) = material else { return };
     let Some(p) = heroes
         .single()
         .ok()
@@ -223,7 +218,7 @@ fn stream_horizon(
         let e = commands
             .spawn((
                 Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(hz.material.clone()),
+                MeshMaterial3d(material.0.clone()),
                 Transform::IDENTITY,
                 HorizonChunk(c),
                 Name::new(format!("horizon {},{}", c.0, c.1)),

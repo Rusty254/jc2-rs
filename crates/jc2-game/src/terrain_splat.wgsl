@@ -13,6 +13,13 @@
 // camera FOV) mix in the 21.3 m repeat and then the colour table. The normal atlas bends
 // the slope normal in the game's frame: N' = N (1 + n.z) + 4 n.x T + 4 n.y B with
 // T = (Ny, -Nx, 0) and B = (0, Nz, -Ny) in engine coordinates.
+//
+// With the shader def TERRAIN_GLOBAL (the horizon chunks, JC2-157) the same maths runs on the
+// game's global layers, the way FastTerrainShader_Global does (research/formats/
+// terrain-terms-next.md): the layers are 1024 x 1024 textures over the whole world at
+// uv = world.xz / 32768 + 0.5 (slots point-sampled, weights and gradient linear), the table
+// half comes from the texture zone map at the same uv, and t0 = t1 = 0 so only the colour
+// table (Lod2) colour is used.
 
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
@@ -62,11 +69,12 @@ struct SplatParams {
     // the gradient that counts as 1 in the slope measure, the number of slope bands,
     // the normal-map strength (0: no normal atlas), the displacement (0: none, 1: on)
     slope: vec4<f32>,
-    // table[slot * 16 + band] = atlas texture index | displacement tile << 8 |
-    // undefined << 16 | f2 << 17 | f3 << 25 (see entry_tile)
-    table: array<vec4<u32>, 64>,
+    // table[zone * 256 + slot * 16 + band] = atlas texture index | displacement tile << 8 |
+    // undefined << 16 | f2 << 17 | f3 << 25 (see entry_tile); a tile fills zone 0 only,
+    // the global mode both texture zones
+    table: array<vec4<u32>, 128>,
     // the game's colour table for the same entries (sRGB RGBA8, MetaMaterialColors)
-    colours: array<vec4<u32>, 64>,
+    colours: array<vec4<u32>, 128>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> splat: SplatParams;
@@ -85,9 +93,17 @@ struct SplatParams {
 // horizon constants (sun_horizon.rs)
 @group(#{MATERIAL_BIND_GROUP}) @binding(112) var ao_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(113) var<storage, read> horizon: SunHorizon;
+// the texture zone (R8Uint) of every tile, 64 x 64; read in the global mode only
+@group(#{MATERIAL_BIND_GROUP}) @binding(114) var zone_tex: texture_2d<u32>;
 
 const CELL: f32 = 4.0;
 const CELLS: f32 = 128.0;
+// the global layers: the world edge in metres (32768) and the layers' size in texels
+const GLOBAL_EXTENT: f32 = 32768.0;
+const GLOBAL_TEXELS: f32 = 1024.0;
+const ZONE_TEXELS: f32 = 64.0;
+// entries per texture zone in the slot x band tables
+const ZONE_ENTRIES: u32 = 256u;
 // the game's LOD blend (terrain_material::LOD0_RADIUS ..., FUN_00a60d30 / FUN_00a61220):
 // radii before the FOV scale, blend widths, the scale's clamp
 const LOD0_RADIUS: f32 = 25.0;
@@ -107,8 +123,8 @@ fn pick_word(v: vec4<u32>, i: u32) -> u32 {
     }
 }
 
-fn table_entry(slot: u32, band: u32) -> u32 {
-    let i = slot * 16u + min(band, 15u);
+fn table_entry(zone: u32, slot: u32, band: u32) -> u32 {
+    let i = zone * ZONE_ENTRIES + slot * 16u + min(band, 15u);
     return pick_word(splat.table[i / 4u], i);
 }
 
@@ -119,8 +135,8 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 }
 
 // FastTer_Lod2's colour: the colour table entry of (slot, band), linear.
-fn table_colour(slot: u32, band: u32) -> vec3<f32> {
-    let i = slot * 16u + min(band, 15u);
+fn table_colour(zone: u32, slot: u32, band: u32) -> vec3<f32> {
+    let i = zone * ZONE_ENTRIES + slot * 16u + min(band, 15u);
     return srgb_to_linear(unpack4x8unorm(pick_word(splat.colours[i / 4u], i)).rgb);
 }
 
@@ -142,7 +158,7 @@ struct Pick {
 
 // Four candidates: both slots at this slope band and at the next, split by the fraction;
 // the two heaviest are kept and renormalised (FastTer_Lod0's selection).
-fn pick_layers(sa: u32, sb: u32, wa: f32, wb: f32, s: f32) -> Pick {
+fn pick_layers(zone: u32, sa: u32, sb: u32, wa: f32, wb: f32, s: f32) -> Pick {
     let band = u32(floor(s));
     let f = s - floor(s);
     let cand_w = vec4<f32>(wa * (1.0 - f), wb * (1.0 - f), wa * f, wb * f);
@@ -163,10 +179,10 @@ fn pick_layers(sa: u32, sb: u32, wa: f32, wb: f32, s: f32) -> Pick {
     var p: Pick;
     p.w1 = w1 / total2;
     p.w2 = w2 / total2;
-    p.e1 = table_entry(cand_s[i1], cand_b[i1]);
-    p.e2 = table_entry(cand_s[i2], cand_b[i2]);
-    p.c1 = table_colour(cand_s[i1], cand_b[i1]);
-    p.c2 = table_colour(cand_s[i2], cand_b[i2]);
+    p.e1 = table_entry(zone, cand_s[i1], cand_b[i1]);
+    p.e2 = table_entry(zone, cand_s[i2], cand_b[i2]);
+    p.c1 = table_colour(zone, cand_s[i1], cand_b[i1]);
+    p.c2 = table_colour(zone, cand_s[i2], cand_b[i2]);
     return p;
 }
 
@@ -285,6 +301,20 @@ fn fragment(
 
     // engine coordinates: x east, z south, the same as Bevy's (`coords.rs`)
     let world_xz = in.world_position.xz;
+#ifdef TERRAIN_GLOBAL
+    // the global layers (FastTerrainShader_Global): world.xz / 32768 + 0.5 into 1024 x 1024
+    // textures; the slots are point-sampled (R, G, B, A nibble = slot 0..3), the weights
+    // are the BC1 layer's r, g, b with the fourth rebuilt as 1 - saturate(r + g + b), the
+    // gradient is its .rg, and the texture zone map (point) says which table half applies
+    let uv = world_xz / GLOBAL_EXTENT + vec2<f32>(0.5, 0.5);
+    let tc = clamp(vec2<i32>(floor(uv * GLOBAL_TEXELS)), vec2<i32>(0), vec2<i32>(1023));
+    let slots = textureLoad(slot_tex, tc, 0);
+    let w3 = textureSample(weight_tex, weight_sampler, uv).rgb;
+    let w = vec4<f32>(w3, 1.0 - saturate(w3.x + w3.y + w3.z));
+    let g = textureSample(gradient_tex, gradient_sampler, uv).rg * 2.0 - 1.0;
+    let zc = clamp(vec2<i32>(floor(uv * ZONE_TEXELS)), vec2<i32>(0), vec2<i32>(63));
+    let zone = textureLoad(zone_tex, zc, 0).r;
+#else
     let local = world_xz - splat.origin.xy;
     // texel (r, c) sits on height sample (r + 2, c + 2) = local (4c, 4r)
     let texel = local / CELL + vec2<f32>(0.5, 0.5);
@@ -293,6 +323,9 @@ fn fragment(
     let w = textureSample(weight_tex, weight_sampler, texel / CELLS);
     // the game's gradient layer (A8L8: L = dh/dx, A = dh/dz in units of the slope unit)
     let g = textureSample(gradient_tex, gradient_sampler, texel / CELLS).rg * 2.0 - 1.0;
+    // a tile fills table half 0 only
+    let zone = 0u;
+#endif
     // explicit mips from the screen derivatives of world x, z, taken where the control
     // flow is uniform: D = 0.5 log2(|d/dX|^2 + |d/dY|^2)
     let dx = dpdx(world_xz);
@@ -324,6 +357,11 @@ fn fragment(
     let sa = slots[ia];
     let sb = slots[ib];
 
+#ifdef TERRAIN_GLOBAL
+    // the global shader has no atlas branches: only the colour table (Lod2)
+    let t0 = 0.0;
+    let t1 = 0.0;
+#else
     // the game's LOD weights: Chebyshev distance from the camera against the radii
     // scaled by min(1 / fov^2, 999.99994), fov the vertical field of view
     let rel = abs(in.world_position.xyz - view.world_position);
@@ -332,10 +370,11 @@ fn fragment(
     let k = min(1.0 / (fov * fov), LOD_SCALE_MAX);
     let t0 = 1.0 - saturate((cheb - LOD0_RADIUS * k) / LOD0_WIDTH);
     let t1 = 1.0 - saturate((cheb - LOD1_RADIUS * k) / LOD1_WIDTH);
+#endif
 
     // first pass: the bands the gradient picks; they say which displacement tiles bend
     // the gradient and how far (f2), and how far the lighting normal bends (f3)
-    let p1 = pick_layers(sa, sb, wa, wb, s);
+    let p1 = pick_layers(zone, sa, sb, wa, wb, s);
     var d = vec3<f32>(0.0, 0.0, 0.0);
     var f2 = 0.0;
     var f3 = 0.0;
@@ -348,7 +387,7 @@ fn fragment(
     // second pass: the bent gradient chooses the bands again
     let gv = -g + f2 * dv;
     let s2 = min(length(gv), 1.0) * splat.slope.y;
-    let p2 = pick_layers(sa, sb, wa, wb, s2);
+    let p2 = pick_layers(zone, sa, sb, wa, wb, s2);
 
     // Lod0 (near repeat), Lod1 (far repeat), Lod2 (colour table), mixed by t0 and t1;
     // the atlas samples are skipped where their weight is 0

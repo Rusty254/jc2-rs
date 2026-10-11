@@ -21,6 +21,12 @@
 //!   by its own blend ([`lod_blend`]): the 21.3 m repeat (`Lod1`, no normal atlas), then
 //!   the per-texture colour table (`Lod2`).
 //!
+//! **Global mode** (JC2-157): the horizon chunks beyond the streamed tiles use the same
+//! material with the shader def `TERRAIN_GLOBAL` ([`SplatContext::global_material`]): the
+//! game's `FastTerrainShader_Global` is the Lod2 maths on the global layers
+//! (`globalmetamaterials` slots, `globalmetaweights`, `globalslopes`, `texturezonemap`), see
+//! `research/formats/terrain-terms-next.md`.
+//!
 //! The slope comes from the tile's A8L8 gradient layer ([`gradient_image`]), not the
 //! mesh. The displacement atlas (`globaldisplaceatlas.dds`) bends the slope before the
 //! second band selection and the lighting normal, as the game's shader does (terrain.md,
@@ -40,6 +46,7 @@ use bevy::render::render_resource::{
 use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use jc2_formats::dds::{DdsFormat, DdsImage};
+use jc2_formats::landscape::ZoneMaps;
 use jc2_formats::landscape::{
     ATLAS_COLUMNS, ATLAS_REPEAT_FAR, ATLAS_REPEAT_NEAR, ATLAS_ROWS, ATLAS_TEXTURES, Landscape,
     META_SLOTS, SLOPE_SLOTS, SLOPE_UNIT, diffuse_atlas_name, gradient_from_up, normal_atlas_name,
@@ -181,22 +188,51 @@ pub type TerrainSplatMaterial = ExtendedMaterial<StandardMaterial, TerrainSplat>
 pub struct SplatParams {
     pub origin: Vec4,
     pub slope: Vec4,
-    pub table: [UVec4; META_SLOTS * SLOPE_SLOTS / 4],
-    pub colours: [UVec4; META_SLOTS * SLOPE_SLOTS / 4],
+    pub table: [UVec4; TABLE_VEC4],
+    pub colours: [UVec4; TABLE_VEC4],
+}
+
+/// Texture zones the tables carry (Jungle / Arctic use zone 0, DesertCity zone 1, JC2-101:
+/// `Landscape::texture_zone_count`); a tile fills the first half of the uniform tables with
+/// its own zone, the global mode fills both.
+pub const TABLE_ZONES: usize = 2;
+/// Entries in one zone's slot x band table.
+const ZONE_ENTRIES: usize = META_SLOTS * SLOPE_SLOTS;
+/// `vec4`s in the uniform tables.
+pub const TABLE_VEC4: usize = ZONE_ENTRIES * TABLE_ZONES / 4;
+/// `vec4`s in one zone's table.
+const ZONE_VEC4: usize = ZONE_ENTRIES / 4;
+
+/// The uniform's tables: `first` in the first half, `second` (or zeros) in the second.
+fn join_zones(
+    first: [UVec4; ZONE_VEC4],
+    second: Option<[UVec4; ZONE_VEC4]>,
+) -> [UVec4; TABLE_VEC4] {
+    let mut out = [UVec4::ZERO; TABLE_VEC4];
+    out[..ZONE_VEC4].copy_from_slice(&first);
+    if let Some(second) = second {
+        out[ZONE_VEC4..].copy_from_slice(&second);
+    }
+    out
 }
 
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+#[bind_group_data(TerrainSplatKey)]
 pub struct TerrainSplat {
+    /// The global layers (horizon chunks) instead of a tile's: selects the
+    /// `TERRAIN_GLOBAL` shader def, see [`TerrainSplatKey`].
+    pub global: bool,
     #[uniform(100)]
     pub params: SplatParams,
     /// The zone's diffuse atlas as 32 layers.
     #[texture(101, dimension = "2d_array")]
     #[sampler(102)]
     pub atlas: Handle<Image>,
-    /// 128 × 128 `Rgba8Uint`: the four slots of every cell.
+    /// 128 × 128 `Rgba8Uint`: the four slots of every cell (global mode: 1024 × 1024, the
+    /// `globalmetamaterials` nibbles R, G, B, A = slot 0..3).
     #[texture(103, sample_type = "u_int")]
     pub slots: Handle<Image>,
-    /// 128 × 128 `Rgba8Unorm`: their weights.
+    /// 128 × 128 `Rgba8Unorm`: their weights (global mode: the BC1 `globalmetaweights`).
     #[texture(104)]
     #[sampler(105)]
     pub weights: Handle<Image>,
@@ -212,7 +248,7 @@ pub struct TerrainSplat {
     #[sampler(109)]
     pub displace: Handle<Image>,
     /// 128 x 128 `Rg8Unorm` with mips: the tile's A8L8 gradient layer (L, A), the slope
-    /// the game's shader reads (`t5`, `x 2 - 1`).
+    /// the game's shader reads (`t5`, `x 2 - 1`); global mode: the BC1 `globalslopes`.
     #[texture(110)]
     #[sampler(111)]
     pub gradient: Handle<Image>,
@@ -223,13 +259,51 @@ pub struct TerrainSplat {
     /// The per-frame horizon constants (one `SunHorizon`), shared.
     #[storage(113, read_only)]
     pub sun_horizon: Handle<ShaderBuffer>,
+    /// 64 × 64 `R8Uint`: the texture zone of every tile (`texturezonemap.dds`, point); only
+    /// the global mode reads it.
+    #[texture(114, sample_type = "u_int")]
+    pub zones: Handle<Image>,
 }
+
+/// The pipeline key of [`TerrainSplat`]: tile or global mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TerrainSplatKey {
+    pub global: bool,
+}
+
+impl From<&TerrainSplat> for TerrainSplatKey {
+    fn from(m: &TerrainSplat) -> Self {
+        Self { global: m.global }
+    }
+}
+
+/// The splat material in global mode, shared by every horizon chunk (inserted by
+/// `world::setup` when the data has the global layers).
+#[derive(Resource, Clone)]
+pub struct GlobalTerrainMaterial(pub Handle<TerrainSplatMaterial>);
+
+/// The shader def of the global mode.
+pub const TERRAIN_GLOBAL_DEF: &str = "TERRAIN_GLOBAL";
 
 impl MaterialExtension for TerrainSplat {
     fn fragment_shader() -> ShaderRef {
         ShaderRef::Path(
             AssetPath::from_path_buf(embedded_path!("terrain_splat.wgsl")).with_source("embedded"),
         )
+    }
+
+    fn specialize(
+        _pipeline: &bevy::pbr::MaterialExtensionPipeline,
+        descriptor: &mut bevy::render::render_resource::RenderPipelineDescriptor,
+        _layout: &bevy::mesh::MeshVertexBufferLayoutRef,
+        key: bevy::pbr::MaterialExtensionKey<Self>,
+    ) -> Result<(), bevy::render::render_resource::SpecializedMeshPipelineError> {
+        if key.bind_group_data.global
+            && let Some(fragment) = descriptor.fragment.as_mut()
+        {
+            fragment.shader_defs.push(TERRAIN_GLOBAL_DEF.into());
+        }
+        Ok(())
     }
 }
 
@@ -278,6 +352,23 @@ pub struct SplatContext {
     pub blank: Handle<Image>,
     /// The horizon / AO map and constants every tile's material binds.
     pub horizon: HorizonShadow,
+    /// The texture zone map as a GPU texture (bound by every material; the global mode
+    /// reads it).
+    pub zones: Handle<Image>,
+    /// The global layers of the horizon chunks, when all of them are in the data.
+    pub global: Option<GlobalLayers>,
+}
+
+/// The game's global material layers as GPU textures (JC2-157): what the far terrain
+/// shader `FastTerrainShader_Global` reads (`terrain-terms-next.md`).
+#[derive(Clone, Debug)]
+pub struct GlobalLayers {
+    /// `globalmetamaterials.dds`, repacked by [`global_meta_image`].
+    pub slots: Handle<Image>,
+    /// `globalmetaweights.dds`, BC1, linear filter.
+    pub weights: Handle<Image>,
+    /// `globalslopes.dds`, BC1, linear filter.
+    pub gradient: Handle<Image>,
 }
 
 impl SplatContext {
@@ -336,6 +427,8 @@ impl SplatContext {
                     None
                 }
             });
+        let zones = images.add(zone_image(land.zones.as_ref()));
+        let global = load_global_layers(game, images);
         let blank = images.add(Image::new(
             Extent3d {
                 width: 1,
@@ -354,17 +447,19 @@ impl SplatContext {
             displace,
             blank,
             horizon: HorizonShadow::load(game, images, buffers),
+            zones,
+            global,
         })
     }
 
     /// The colour table of texture zone `zone` (`MetaMaterialColors`: per slot x band the
     /// `globalcolorpixelmap` texel of the entry's atlas texture) packed as sRGB RGBA8.
-    pub fn colours(&self, zone: u8) -> [UVec4; META_SLOTS * SLOPE_SLOTS / 4] {
+    pub fn colours(&self, zone: u8) -> [UVec4; ZONE_VEC4] {
         colour_table(&self.land, zone)
     }
 
     /// The slope table of texture zone `zone` packed for the uniform.
-    fn table(&self, zone: u8) -> [UVec4; META_SLOTS * SLOPE_SLOTS / 4] {
+    fn table(&self, zone: u8) -> [UVec4; ZONE_VEC4] {
         let slots = self.land.metas.slots(zone);
         let mut flat = [0u32; META_SLOTS * SLOPE_SLOTS];
         for (s, meta) in slots.iter().enumerate() {
@@ -422,9 +517,11 @@ impl SplatContext {
                         normal_strength,
                         if self.displace.is_some() { 1.0 } else { 0.0 },
                     ),
-                    table: self.table(zone),
-                    colours: self.colours(zone),
+                    table: join_zones(self.table(zone), None),
+                    colours: join_zones(self.colours(zone), None),
                 },
+                global: false,
+                zones: self.zones.clone(),
                 atlas,
                 slots: images.add(slots),
                 weights: images.add(weights),
@@ -437,9 +534,178 @@ impl SplatContext {
         };
         Some(materials.add(material))
     }
+
+    /// The material of the horizon chunks (JC2-157): the splat shader in global mode on the
+    /// game's global layers, with both texture zones' tables. `None` when a global layer
+    /// or every diffuse atlas is missing from the data (the atlas array is bound but never
+    /// sampled: the global shader runs the colour-table branch only).
+    pub fn global_material(
+        &self,
+        materials: &mut Assets<TerrainSplatMaterial>,
+    ) -> Option<Handle<TerrainSplatMaterial>> {
+        let layers = self.global.as_ref()?;
+        let atlas = self.atlases.iter().flatten().next()?.clone();
+        let both = |f: &dyn Fn(u8) -> [UVec4; ZONE_VEC4]| join_zones(f(0), Some(f(1)));
+        let material = TerrainSplatMaterial {
+            base: StandardMaterial {
+                base_color: Color::WHITE,
+                perceptual_roughness: 1.0,
+                metallic: 0.0,
+                reflectance: 0.1,
+                // the native fog is applied in `terrain_splat.wgsl` (`haze_fog.wgsl`)
+                fog_enabled: false,
+                ..default()
+            },
+            extension: TerrainSplat {
+                global: true,
+                params: SplatParams {
+                    origin: Vec4::new(0.0, 0.0, ATLAS_REPEAT_NEAR, ATLAS_REPEAT_FAR),
+                    slope: Vec4::new(
+                        SLOPE_UNIT,
+                        jc2_formats::landscape::SLOPE_BANDS,
+                        0.0,
+                        if self.displace.is_some() { 1.0 } else { 0.0 },
+                    ),
+                    table: both(&|z| self.table(z)),
+                    colours: both(&|z| self.colours(z)),
+                },
+                normals: atlas.clone(),
+                atlas,
+                slots: layers.slots.clone(),
+                weights: layers.weights.clone(),
+                displace: self.displace.clone().unwrap_or_else(|| self.blank.clone()),
+                gradient: layers.gradient.clone(),
+                ao: self.horizon.ao.clone(),
+                sun_horizon: self.horizon.params.clone(),
+                zones: self.zones.clone(),
+            },
+        };
+        Some(materials.add(material))
+    }
 }
 
-fn pack_flat(flat: &[u32; META_SLOTS * SLOPE_SLOTS]) -> [UVec4; META_SLOTS * SLOPE_SLOTS / 4] {
+/// The path of a global layer in the archives.
+fn global_layer_name(name: &str) -> String {
+    format!("textures\\landscape\\{name}.dds")
+}
+
+/// Read and convert the global layers; `None` (with a warning) when one is missing.
+fn load_global_layers(game: &Game, images: &mut Assets<Image>) -> Option<GlobalLayers> {
+    let read = |name: &str| -> Option<DdsImage> {
+        let path = global_layer_name(name);
+        match jc2_formats::landscape::read_landscape_file(&game.fs, &path)
+            .map_err(|e| e.to_string())
+            .and_then(|d| DdsImage::parse(&d).map_err(|e| e.to_string()))
+        {
+            Ok(i) => Some(i),
+            Err(e) => {
+                warn!("{path}: {e}; no global terrain material");
+                None
+            }
+        }
+    };
+    let slots = read("globalmetamaterials")?;
+    let weights = read("globalmetaweights")?;
+    let gradient = read("globalslopes")?;
+    let mut convert = |r: Result<Image, String>, name: &str| match r {
+        Ok(i) => Some(images.add(i)),
+        Err(e) => {
+            warn!("{name}: {e}; no global terrain material");
+            None
+        }
+    };
+    Some(GlobalLayers {
+        slots: convert(global_meta_image(&slots), "globalmetamaterials")?,
+        weights: convert(global_bc1_image(&weights), "globalmetaweights")?,
+        gradient: convert(global_bc1_image(&gradient), "globalslopes")?,
+    })
+}
+
+/// `globalmetamaterials.dds` (1024 x 1024 `A4R4G4B4`) as the slot texture the shader loads:
+/// `Rgba8Uint`, the nibbles R, G, B, A in channels x, y, z, w = slots 0..3 (the shader's
+/// `round(sample * 15)` of the game's UNORM sample, `terrain-terms-next.md`).
+pub fn global_meta_image(img: &DdsImage) -> Result<Image, String> {
+    if img.format != DdsFormat::Argb4444 {
+        return Err(format!("expected A4R4G4B4, got {:?}", img.format));
+    }
+    let texels = img.texels_u16(0).ok_or("level 0 is short")?;
+    if texels.len() != (img.width * img.height) as usize {
+        return Err("level 0 is short".into());
+    }
+    let data = texels
+        .iter()
+        .flat_map(|&v| global_slots(v))
+        .collect::<Vec<u8>>();
+    Ok(Image::new(
+        Extent3d {
+            width: img.width,
+            height: img.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8Uint,
+        RenderAssetUsages::RENDER_WORLD,
+    ))
+}
+
+/// The four slots of one `A4R4G4B4` texel of `globalmetamaterials`: R, G, B, A nibble =
+/// slot 0..3 (the global shader reads the sample's .xyzw as the slots; the tile layers use
+/// the order A, R, G, B, [`MetaCell::unpack`]).
+pub fn global_slots(texel: u16) -> [u8; 4] {
+    let nib = |shift: u32| ((texel >> shift) & 0xf) as u8;
+    [nib(8), nib(4), nib(0), nib(12)]
+}
+
+/// A 1024 x 1024 BC1 global layer (`globalmetaweights`, `globalslopes`) with its mip chain
+/// (the retail files have none), linear filter, clamped (`s0` / `s3` of the game).
+pub fn global_bc1_image(img: &DdsImage) -> Result<Image, String> {
+    if img.format != DdsFormat::Dxt1 {
+        return Err(format!("expected DXT1, got {:?}", img.format));
+    }
+    let bytes = img.chain_bytes().ok_or("mip chain is short")?;
+    let mut image = Image::new_uninit(
+        Extent3d {
+            width: img.width,
+            height: img.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        TextureFormat::Bc1RgbaUnorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.mip_level_count = img.mips.max(1);
+    image.data = Some(img.data[..bytes].to_vec());
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::ClampToEdge,
+        address_mode_v: ImageAddressMode::ClampToEdge,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    Ok(image)
+}
+
+/// The texture zone of every tile as a 64 x 64 `R8Uint` texture (all zero without the zone
+/// map, the same fallback as [`Landscape::texture_zone`]).
+pub fn zone_image(zones: Option<&ZoneMaps>) -> Image {
+    let n = jc2_formats::terrain::TILES_PER_SIDE;
+    let data = zones.map_or_else(|| vec![0u8; (n * n) as usize], |z| z.texture.clone());
+    Image::new(
+        Extent3d {
+            width: n,
+            height: n,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::R8Uint,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+fn pack_flat(flat: &[u32; META_SLOTS * SLOPE_SLOTS]) -> [UVec4; ZONE_VEC4] {
     let mut out = [UVec4::ZERO; META_SLOTS * SLOPE_SLOTS / 4];
     for (v, c) in out.iter_mut().zip(flat.as_chunks::<4>().0) {
         *v = UVec4::from_array(*c);
@@ -450,7 +716,7 @@ fn pack_flat(flat: &[u32; META_SLOTS * SLOPE_SLOTS]) -> [UVec4; META_SLOTS * SLO
 /// `MetaMaterialColors` of texture zone `zone` as the uniform carries it: entry
 /// `slot * 16 + band` is the `globalcolorpixelmap` texel of that entry's atlas texture
 /// (`FUN_00a70fb0`; [`Landscape::slot_colour`]), packed by [`pack_colour`].
-pub fn colour_table(land: &Landscape, zone: u8) -> [UVec4; META_SLOTS * SLOPE_SLOTS / 4] {
+pub fn colour_table(land: &Landscape, zone: u8) -> [UVec4; ZONE_VEC4] {
     let mut flat = [0u32; META_SLOTS * SLOPE_SLOTS];
     for (i, v) in flat.iter_mut().enumerate() {
         let (slot, band) = (i / SLOPE_SLOTS, i % SLOPE_SLOTS);
@@ -731,41 +997,45 @@ mod tests {
         }
     }
 
-    /// The shader cannot run here (no GPU), so at least parse and validate it with naga:
-    /// Bevy's imports are replaced by stubs of the pieces the shader touches, the
-    /// prepass branch is dropped.
-    #[test]
-    fn splat_shader_validates() {
-        let src = include_str!("terrain_splat.wgsl");
+    /// Preprocess `terrain_splat.wgsl` the way Bevy does for the shader defs `defs`
+    /// (`#ifdef` / `#ifndef` / `#else` / `#endif`, nested), dropping the `#import` lines
+    /// and flattening Bevy's module paths into the test stubs.
+    fn preprocess_splat(src: &str, defs: &[&str]) -> String {
         let mut body = String::new();
-        let mut skip = 0;
-        let mut in_prepass = false;
+        let mut skip = false;
+        // one entry per open conditional: (this branch is live, the enclosing region is live)
+        let mut stack: Vec<(bool, bool)> = Vec::new();
+        let live = |stack: &[(bool, bool)]| stack.last().is_none_or(|&(on, _)| on);
         for line in src.lines() {
             let t = line.trim();
             if t.starts_with("#import") {
-                skip = if t.ends_with('{') { 1 } else { 0 };
+                skip = t.ends_with('{');
                 continue;
             }
-            if skip > 0 {
-                if t == "}" {
-                    skip = 0;
-                }
+            if skip {
+                skip = t != "}";
                 continue;
             }
-            match t {
-                "#ifdef PREPASS_PIPELINE" => {
-                    in_prepass = true;
-                    continue;
-                }
-                "#ifndef PREPASS_PIPELINE" => continue,
-                "#else" => {
-                    in_prepass = false;
-                    continue;
-                }
-                "#endif" => continue,
-                _ => {}
+            if let Some(name) = t.strip_prefix("#ifdef ") {
+                let outer = live(&stack);
+                stack.push((outer && defs.contains(&name.trim()), outer));
+                continue;
             }
-            if in_prepass {
+            if let Some(name) = t.strip_prefix("#ifndef ") {
+                let outer = live(&stack);
+                stack.push((outer && !defs.contains(&name.trim()), outer));
+                continue;
+            }
+            if t == "#else" {
+                let (on, outer) = stack.pop().expect("#else without #ifdef");
+                stack.push((outer && !on, outer));
+                continue;
+            }
+            if t == "#endif" {
+                stack.pop().expect("#endif without #ifdef");
+                continue;
+            }
+            if !live(&stack) {
                 continue;
             }
             // Bevy's module paths are flat in the stubs
@@ -778,6 +1048,26 @@ mod tests {
             body.push_str(&line);
             body.push('\n');
         }
+        assert!(stack.is_empty(), "unbalanced #ifdef");
+        body
+    }
+
+    /// The shader cannot run here (no GPU), so at least parse and validate it with naga:
+    /// Bevy's imports are replaced by stubs of the pieces the shader touches, the
+    /// prepass branch is dropped.
+    #[test]
+    fn splat_shader_validates() {
+        validate_splat_shader(&[]);
+    }
+
+    /// JC2-157: the global mode compiles with the shader def the specialisation pushes.
+    #[test]
+    fn splat_shader_validates_in_global_mode() {
+        validate_splat_shader(&[TERRAIN_GLOBAL_DEF]);
+    }
+
+    fn validate_splat_shader(defs: &[&str]) {
+        let body = preprocess_splat(include_str!("terrain_splat.wgsl"), defs);
         let stubs = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -912,7 +1202,10 @@ fn main_pass_post_lighting_processing(p: PbrInput, c: vec4<f32>) -> vec4<f32> { 
             };
             let m = bevy::camera::CameraProjection::get_clip_from_view(&p);
             let fov = 2.0 * (1.0_f32 / m.y_axis.y).atan();
-            assert!((lod_scale(fov) / lod_scale(rad(deg)) - 1.0).abs() < 1e-4, "{deg}");
+            assert!(
+                (lod_scale(fov) / lod_scale(rad(deg)) - 1.0).abs() < 1e-4,
+                "{deg}"
+            );
         }
         // no hard cap in range: the clamp only bites below ~1.8 milliradians
         assert_eq!(TerrainLod::at(1e-4).scale, LOD_SCALE_MAX);
@@ -1110,6 +1403,250 @@ fn main_pass_post_lighting_processing(p: PbrInput, c: vec4<f32>) -> vec4<f32> { 
         assert_eq!(image.texture_descriptor.mip_level_count, 13);
         assert_eq!(image.texture_descriptor.format, TextureFormat::Bc3RgbaUnorm);
         assert!(image.data.as_ref().unwrap().len() > 5_000_000);
+    }
+
+    #[test]
+    fn global_slots_unpack_r_g_b_a_in_that_order() {
+        // A4R4G4B4: alpha nibble 15..12, red 11..8, green 7..4, blue 3..0; the global shader
+        // reads the sample's .xyzw = R, G, B, A as slots 0..3 (the tile layers use A, R, G, B)
+        assert_eq!(global_slots(0xABCD), [0xB, 0xC, 0xD, 0xA]);
+        let cell = MetaCell::unpack(0xABCD, 0);
+        assert_eq!(cell.slots, [0xA, 0xB, 0xC, 0xD]);
+        let dds = write_dds(2, 1, 1, DdsFormat::Argb4444, &[0xCD, 0xAB, 0x21, 0x03]);
+        let image = global_meta_image(&DdsImage::parse(&dds).unwrap()).unwrap();
+        assert_eq!(image.texture_descriptor.format, TextureFormat::Rgba8Uint);
+        assert_eq!(
+            image.data.as_ref().unwrap(),
+            &[0xB, 0xC, 0xD, 0xA, 0x3, 0x2, 0x1, 0x0]
+        );
+    }
+
+    #[test]
+    fn global_bc1_layers_are_linear_clamped_and_zones_point() {
+        let block = [0u8; 8];
+        let dds = write_dds(8, 8, 1, DdsFormat::Dxt1, &block.repeat(4));
+        let image = global_bc1_image(&DdsImage::parse(&dds).unwrap()).unwrap();
+        assert_eq!(image.texture_descriptor.format, TextureFormat::Bc1RgbaUnorm);
+        assert_eq!(image.texture_descriptor.mip_level_count, 1);
+        let ImageSampler::Descriptor(d) = &image.sampler else {
+            panic!("sampler");
+        };
+        assert_eq!(d.address_mode_u, ImageAddressMode::ClampToEdge);
+        assert_eq!(d.mag_filter, ImageFilterMode::Linear);
+        assert!(
+            global_bc1_image(
+                &DdsImage::parse(&write_dds(4, 4, 1, DdsFormat::Dxt5, &[0; 16])).unwrap()
+            )
+            .is_err()
+        );
+        // the zone map keeps its texture zone bytes (no sampler: it is loaded by texel)
+        let n = jc2_formats::terrain::TILES_PER_SIDE as usize;
+        let zones = ZoneMaps {
+            climate: vec![0; n * n],
+            texture: (0..n * n).map(|i| (i % 2) as u8).collect(),
+        };
+        let image = zone_image(Some(&zones));
+        assert_eq!(image.texture_descriptor.format, TextureFormat::R8Uint);
+        assert_eq!(image.data.as_ref().unwrap(), &zones.texture);
+        assert!(
+            zone_image(None)
+                .data
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|&z| z == 0)
+        );
+    }
+
+    #[test]
+    fn tables_fill_the_first_half_for_a_tile_and_both_for_the_global_mode() {
+        let a = [UVec4::splat(1); ZONE_VEC4];
+        let b = [UVec4::splat(2); ZONE_VEC4];
+        let tile = join_zones(a, None);
+        assert_eq!(tile[ZONE_VEC4 - 1], UVec4::splat(1));
+        assert_eq!(tile[ZONE_VEC4], UVec4::ZERO);
+        let both = join_zones(a, Some(b));
+        assert_eq!(
+            (both[0], both[ZONE_VEC4], both[TABLE_VEC4 - 1]),
+            (a[0], b[0], b[0])
+        );
+        // the shader's arrays and zone stride are the same size
+        let src = include_str!("terrain_splat.wgsl");
+        assert!(src.contains(&format!("table: array<vec4<u32>, {TABLE_VEC4}>")));
+        assert!(src.contains(&format!("colours: array<vec4<u32>, {TABLE_VEC4}>")));
+        assert!(src.contains(&format!("const ZONE_ENTRIES: u32 = {ZONE_ENTRIES}u;")));
+        assert_eq!(TABLE_VEC4, 128);
+    }
+
+    /// CPU mirror of the global mode of `terrain_splat.wgsl` for the first pass (no
+    /// displacement, nearest texels), the maths of the JC2-101 probe's `Native.colour`:
+    /// the colour-table (Lod2) colour at world (x, z) and the texture zone used.
+    struct GlobalFar {
+        land: Landscape,
+        /// 1024 x 1024 x 4 slot nibbles as uploaded ([`global_meta_image`]).
+        slots: Vec<u8>,
+        /// BC1 level 0 as stored (decoded per texel in float, as the GPU does).
+        weights: Vec<u8>,
+        slopes: Vec<u8>,
+    }
+
+    /// RGB (0..1, UNORM: 5/6/5 bits over 31/63/31, no 8-bit rounding) of texel (x, y) of a
+    /// 1024-wide BC1 level 0, the decode the GPU filters.
+    fn bc1_texel(data: &[u8], x: usize, y: usize) -> [f32; 3] {
+        let block = &data[((y / 4) * 256 + x / 4) * 8..][..8];
+        let (c0, c1) = (
+            u16::from_le_bytes([block[0], block[1]]),
+            u16::from_le_bytes([block[2], block[3]]),
+        );
+        let idx = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let rgb = |c: u16| {
+            [
+                (c >> 11) as f32 / 31.0,
+                ((c >> 5) & 63) as f32 / 63.0,
+                (c & 31) as f32 / 31.0,
+            ]
+        };
+        let (p0, p1) = (rgb(c0), rgb(c1));
+        let sel = (idx >> (2 * ((y & 3) * 4 + (x & 3)))) & 3;
+        let lerp = |t: f32| [0, 1, 2].map(|k| p0[k] * (1.0 - t) + p1[k] * t);
+        match (sel, c0 > c1) {
+            (0, _) => p0,
+            (1, _) => p1,
+            (2, true) => lerp(1.0 / 3.0),
+            (3, true) => lerp(2.0 / 3.0),
+            (2, false) => lerp(0.5),
+            _ => [0.0; 3],
+        }
+    }
+
+    impl GlobalFar {
+        fn load(fs: &jc2_formats::GameFs) -> Option<Self> {
+            let land = Landscape::load(fs).ok()?;
+            let read = |n: &str| {
+                jc2_formats::landscape::read_landscape_file(fs, &global_layer_name(n))
+                    .ok()
+                    .and_then(|d| DdsImage::parse(&d).ok())
+            };
+            let meta = global_meta_image(&read("globalmetamaterials")?).ok()?;
+            Some(Self {
+                land,
+                slots: meta.data?,
+                weights: read("globalmetaweights")?.level(0)?.to_vec(),
+                slopes: read("globalslopes")?.level(0)?.to_vec(),
+            })
+        }
+
+        fn colour(&self, x: f32, z: f32) -> ([f32; 3], u8) {
+            let (u, v) = (x / 32768.0 + 0.5, z / 32768.0 + 0.5);
+            let tex =
+                |n: f32, size: i32| ((n * size as f32).floor() as i32).clamp(0, size - 1) as usize;
+            let (tx, ty) = (tex(u, 1024), tex(v, 1024));
+            let i = ty * 1024 + tx;
+            let zone = self
+                .land
+                .zones
+                .as_ref()
+                .map_or(0, |zm| zm.texture[tex(v, 64) * 64 + tex(u, 64)]);
+            let slots: [u8; 4] = self.slots[i * 4..i * 4 + 4].try_into().unwrap();
+            let w3 = bc1_texel(&self.weights, tx, ty);
+            let w4 = [
+                w3[0],
+                w3[1],
+                w3[2],
+                1.0 - (w3[0] + w3[1] + w3[2]).clamp(0.0, 1.0),
+            ];
+            let cw = w4.map(jc2_formats::landscape::weight_curve);
+            let mut order = [0usize, 1, 2, 3];
+            order.sort_by(|&a, &b| cw[b].total_cmp(&cw[a]));
+            let (a, b) = (order[0], order[1]);
+            let t = (cw[a] + cw[b]).max(1e-6);
+            let (wa, wb) = (cw[a] / t, cw[b] / t);
+            let sl = bc1_texel(&self.slopes, tx, ty);
+            let g = [sl[0] * 2.0 - 1.0, sl[1] * 2.0 - 1.0];
+            let s = g[0].hypot(g[1]).min(1.0) * jc2_formats::landscape::SLOPE_BANDS;
+            let band = s.floor() as usize;
+            let fr = s - s.floor();
+            let mut cand = [
+                (slots[a], band, wa * (1.0 - fr)),
+                (slots[b], band, wb * (1.0 - fr)),
+                (slots[a], band + 1, wa * fr),
+                (slots[b], band + 1, wb * fr),
+            ];
+            cand.sort_by(|p, q| q.2.total_cmp(&p.2));
+            let t = (cand[0].2 + cand[1].2).max(1e-6);
+            let col = |(slot, band, _): (u8, usize, f32)| {
+                self.land
+                    .slot_colour(zone, slot, band.min(15))
+                    .unwrap_or([1.0, 0.0, 1.0])
+                    .map(srgb_to_linear)
+            };
+            let (c1, c2) = (col(cand[0]), col(cand[1]));
+            let mix = |k: usize| (cand[0].2 * c1[k] + cand[1].2 * c2[k]) / t;
+            ([mix(0), mix(1), mix(2)], zone)
+        }
+    }
+
+    /// JC2-157: the global mode reproduces the native far colours of the JC2-101 probe
+    /// (`research/tools/terrain_terms_probe.py`, `Native.colour`): golden points and the
+    /// 2500-point statistics of the highlands north of tile 40,40 (median linear luminance
+    /// 0.0382 against the old palette's 0.2265).
+    #[test]
+    fn global_far_colours_match_the_native_probe() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let Ok(fs) = jc2_formats::GameFs::open(dir) else {
+            return;
+        };
+        let Some(far) = GlobalFar::load(&fs) else {
+            return;
+        };
+        // (x, z, texture zone, linear rgb) from the probe's Native.colour
+        let golden: [(f32, f32, u8, [f32; 3]); 10] = [
+            (3500.0, 1800.0, 0, [0.052624, 0.033823, 0.014706]),
+            (4380.0, 2760.0, 0, [0.026890, 0.031005, 0.005964]),
+            (5460.0, 3720.0, 0, [0.014444, 0.026241, 0.005182]),
+            (-12000.0, -9000.0, 1, [0.051745, 0.031728, 0.012983]),
+            (9000.0, -3000.0, 0, [0.052043, 0.036329, 0.024457]),
+            (-300.0, -8960.0, 0, [0.038675, 0.026683, 0.017217]),
+            (15000.0, 12000.0, 1, [0.104616, 0.074214, 0.049707]),
+            (-20000.0, 5000.0, 1, [0.048939, 0.034323, 0.022991]),
+            (200.0, 200.0, 0, [0.263496, 0.178887, 0.111607]),
+            (1000.0, 20000.0, 1, [0.045186, 0.031896, 0.021219]),
+        ];
+        for (x, z, zone, want) in golden {
+            let (c, got_zone) = far.colour(x, z);
+            assert_eq!(got_zone, zone, "zone at {x},{z}");
+            for k in 0..3 {
+                assert!((c[k] - want[k]).abs() < 1e-4, "{x},{z}: {c:?} vs {want:?}");
+            }
+        }
+        let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let mut cols = Vec::new();
+        for zi in 0..50 {
+            for xi in 0..50 {
+                cols.push(
+                    far.colour(3500.0 + 40.0 * xi as f32, 1800.0 + 40.0 * zi as f32)
+                        .0,
+                );
+            }
+        }
+        let mut lums: Vec<f32> = cols.iter().map(|&c| lum(c)).collect();
+        lums.sort_by(f32::total_cmp);
+        let (median, p95) = (lums[lums.len() / 2], lums[lums.len() * 95 / 100]);
+        let mean: Vec<f32> = (0..3)
+            .map(|k| cols.iter().map(|c| c[k]).sum::<f32>() / cols.len() as f32)
+            .collect();
+        eprintln!("native far ground: median {median:.4} p95 {p95:.4} mean {mean:.4?}");
+        // probe: median 0.0382, p95 0.0789, mean (0.0595, 0.0481, 0.0288)
+        assert!((median - 0.0382).abs() < 5e-4, "{median}");
+        assert!((p95 - 0.0789).abs() < 1e-3, "{p95}");
+        for (m, w) in mean.iter().zip([0.0595, 0.0481, 0.0288]) {
+            assert!((m - w).abs() < 1e-3, "{mean:?}");
+        }
+        // the old palette's darkest land colour (grass) is ~6x brighter
+        let grass = crate::world::terrain_colour(300.0, 1.0);
+        assert!(lum([grass[0], grass[1], grass[2]]) / median > 4.0);
     }
 
     #[test]

@@ -292,7 +292,9 @@ impl Plugin for WorldPlugin {
     }
 }
 
-/// Colour of a terrain vertex from its height and slope.
+/// Colour of a terrain vertex from its height and slope. **Non-native, by-eye palette**: only
+/// the fallback of a streamed tile whose game material tables are missing (`terrain_mesh`);
+/// the horizon chunks no longer use it (JC2-157, they draw the native global layers).
 pub(crate) fn terrain_colour(height: f32, up: f32) -> [f32; 4] {
     // albedo values; the scene is lit at Bevy's calibrated daylight, so keep these in
     // the range real ground sits in (grass ≈ 0.1–0.2, dry soil ≈ 0.3, fresh snow ≈ 0.8)
@@ -1060,12 +1062,19 @@ fn unload_tile(st: &mut Streamer, key: (u32, u32), commands: &mut Commands) {
     st.unloads += 1;
 }
 
+/// The asset stores `setup` hands the splat context (kept as one parameter).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct SplatStores<'w> {
+    buffers: Option<ResMut<'w, Assets<bevy::render::storage::ShaderBuffer>>>,
+    materials: ResMut<'w, Assets<crate::terrain_material::TerrainSplatMaterial>>,
+}
+
 pub(crate) fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut buffers: Option<ResMut<Assets<bevy::render::storage::ShaderBuffer>>>,
+    mut stores: SplatStores,
     game: Res<Game>,
     cfg: Res<WorldConfig>,
 ) {
@@ -1073,10 +1082,14 @@ pub(crate) fn setup(
     let splat = if cfg.flat_terrain {
         None
     } else {
-        SplatContext::new(&game, &mut images, buffers.as_deref_mut())
+        SplatContext::new(&game, &mut images, stores.buffers.as_deref_mut())
     };
     if let Some(splat) = &splat {
         commands.insert_resource(splat.horizon.clone());
+        // the horizon chunks draw with the splat shader on the global layers (JC2-157)
+        if let Some(material) = splat.global_material(&mut stores.materials) {
+            commands.insert_resource(crate::terrain_material::GlobalTerrainMaterial(material));
+        }
     }
     let terrain_material = materials.add(StandardMaterial {
         base_color: Color::WHITE,

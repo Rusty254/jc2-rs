@@ -63,7 +63,7 @@ comments addressed to `claude/orchestrator`.
 
 ## Public GitHub mirror (from 9 October 2026)
 
-`github` (remote name; not `origin`) is the private GitHub repo https://github.com/Rusty254/jc2-rs. It must never receive research
+`github` (remote name; not `origin`) is the public GitHub repo https://github.com/Rusty254/jc2-rs (public again since 10 October 2026). It must never receive research
 derived from JustCause2.exe (research/analysis, probes, decompiler excerpts). Therefore:
 - **Never push `master`, worktree branches or any other branch to `github`.** Their history
   contains executable-derived research.
