@@ -946,9 +946,11 @@ fn npc_animation(
                 .map_or(Quat::from_rotation_y(npc.facing), |t| t.rotation);
             drive_upper_body(&mut an, &mut arms, gait, model_rot, true, dt);
         }
-        // dragged on the hook: arms flailing (`UB_ANIM_GRAPPLED`), no aim
-        if hooked.is_some_and(|h| h.pulled || h.lean > 0.0) {
-            an.set_layer(crate::rig::Slot::Wield, Some(Clip::NpcStumble), 0.1, false);
+        // dragged on the hook: arms flailing (`UB_S_GRAPPLED`: `stumble_grpl`), then the
+        // hook comes off (`UB_S_REMOVE_GRAPPLINGHOOK`: `stumble_grpl_release`); the state
+        // follows the hook counter (`grapple/anim.rs`, `C_GRAPPLED_ATLEAST_ONCE`)
+        if let Some(clip) = hooked.and_then(|h| h.victim.clip()) {
+            an.set_layer(crate::rig::Slot::Wield, Some(clip), 0.1, false);
             an.set_layer(crate::rig::Slot::Aim, None, 0.1, false);
             an.aim.target = 0.0;
         }
@@ -1044,12 +1046,15 @@ mod tests {
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
         .init_asset::<crate::general_material::GeneralMaterial>()
+        .init_asset::<crate::hemisphere_material::HemisphereMaterial>()
         .register_asset_loader(RbmLoader::default())
         .insert_resource(Game { fs })
         .insert_resource(WorldConfig {
             tile: (31, 14),
             radius: 0,
             lod: 1,
+            object_lod: 1,
+            lodfactor: 0,
             models: true,
             physics: true,
             flat_terrain: true,

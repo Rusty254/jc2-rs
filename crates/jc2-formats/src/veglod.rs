@@ -67,6 +67,21 @@ pub fn owner_scale_with_unit(unit: f32, model_scale: f32, zoom: f32) -> f32 {
     1.0 / (((unit * f) * unit) * f)
 }
 
+/// The angle whose tangent is the camera zoom ratio of `00920240` (`0.40840706` rad, 23.4
+/// degrees; the exe evaluates it with its own sine/cosine polynomials, so the last digits of
+/// `tan` here are inferred, not bit-exact).
+const ZOOM_RATIO_ANGLE: f32 = 0.408_407_06;
+
+/// The camera zoom factor `camera+0x620` (`00920240`, refreshed with every projection update
+/// `00960000:5448`): `pow(cot(fov / 2) * tan(23.4 deg), 1.0)` (the exponent is the float
+/// `0108c590` = 1.0 and the enabling byte `0108c58c` = 1 in the shipped image), with `fov` the
+/// camera's vertical FOV in radians (`camera+0x61c = cot(fov / 2)`, `0092c620`). The
+/// consumers clamp it up to 1 ([`owner_scale_with_unit`]), so it is above 1 only for a FOV
+/// narrower than 46.8 degrees (on foot at 40 degrees: 1.1889, aiming at 20 degrees: 2.45).
+pub fn camera_zoom(fov_rad: f32) -> f32 {
+    ((fov_rad * 0.5).tan().recip() * ZOOM_RATIO_ANGLE.tan()).max(1.0)
+}
+
 /// Continuous LOD level of a scaled squared distance (`00a89b90`).
 pub fn level(scaled_d2: f32) -> f32 {
     let x = scaled_d2;
@@ -84,6 +99,38 @@ pub fn level(scaled_d2: f32) -> f32 {
     }
     let l4 = (x - 10000.0) * C_4 + 4.0;
     if x - 10000.0 < 0.0 { l } else { l4 }
+}
+
+/// Breakpoints of the vehicle level's scaled squared distance (`0061bb00`; levels 1..4).
+const VEHICLE_BREAKS: [f32; 4] = [196.0, 625.0, 4900.0, 18225.0];
+/// Slopes of the vehicle level (`0061bb00` literals): below 196, then after 196, 625 and 4900.
+const VEHICLE_SLOPES: [f32; 4] = [0.005_102_040_7, 0.002_331_002_4, 0.000_233_918_12, 7.504_690_4e-5];
+
+/// The squared camera distance the vehicle level takes (`0061bb00`): `d^2 (g s)^2 / F^2` with
+/// `s` the vehicle's body-model LOD scale, `g = 1 / unit` (`DAT_0107214c`, set to the reciprocal
+/// of the model-LOD distance unit by the graphics setting handler `00612050` through `006a07b0`)
+/// and `F = max(1, camera zoom)`. NOTE the scale divides the distance here (a small scale keeps
+/// detail further out), the opposite of the owner multiplier ([`owner_scale`]).
+pub fn vehicle_scaled_d2(model_scale: f32, d2: f32, zoom: f32, unit: f32) -> f32 {
+    let f = if 0.0 <= 1.0 - zoom { 1.0 } else { zoom };
+    let g = 1.0 / unit;
+    d2 * g * model_scale * g * model_scale / (f * f)
+}
+
+/// The vehicle's continuous LOD level 0..=4 for a scaled squared distance (`0061bb00`): linear
+/// in the squared distance between the breakpoints 196, 625, 4900 and 18225 (levels 1..4), and
+/// 4 beyond. No cull.
+pub fn vehicle_level(scaled_d2: f32) -> f32 {
+    let x = scaled_d2;
+    if x < VEHICLE_BREAKS[0] {
+        return x * VEHICLE_SLOPES[0];
+    }
+    for i in 1..4 {
+        if x < VEHICLE_BREAKS[i] {
+            return (x - VEHICLE_BREAKS[i - 1]) * VEHICLE_SLOPES[i] + i as f32;
+        }
+    }
+    4.0
 }
 
 /// What the original decides for one model instance at one distance.
@@ -135,7 +182,11 @@ pub fn instance_byte(filled: &[bool; LOD_SLOTS], lod: u8, k: u8) -> Option<u8> {
         return None;
     }
     let f = 2.0 - k as f32 * FADE_SLOPE;
-    Some(if f - 1.0 < 0.0 { (f * 255.0) as u8 } else { 255 })
+    Some(if f - 1.0 < 0.0 {
+        (f * 255.0) as u8
+    } else {
+        255
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -322,6 +373,38 @@ impl SlotPlan {
         }
     }
 
+    /// The model drawn at the vehicle level `level` ([`vehicle_level`]): slot `trunc(level)`,
+    /// then the first filled slot at or after it (`00a47b40`). The vehicle code (`006a0e80`)
+    /// computes one level per vehicle from its body model and applies it to the parts; that
+    /// the parts' slots follow it is inferred from the cleared automatic-LOD bit of the
+    /// vehicle models (`006c5530`), the application itself (`vtable+0xb4`) is not traced.
+    pub fn model_at_vehicle_level(&self, level: f32) -> Option<usize> {
+        let slot = (level.max(0.0) as usize).min(LOD_SLOTS - 1);
+        self.slot_model[drawn_slot(&self.filled, slot as u8)?]
+    }
+
+    /// [`Self::model_at`] under camera zoom factor `zoom` ([`camera_zoom`]): the owner
+    /// multiplier is `1 / (unit * s * F)^2`, so the distance is divided by `F` (clamped to >= 1).
+    pub fn model_at_zoom(&self, d2: f32, zoom: f32) -> Option<usize> {
+        let f = zoom.max(1.0);
+        self.model_at(d2 / (f * f))
+    }
+
+    /// The instance fade byte the original submits at squared camera distance `d2` (zoom factor
+    /// 1; [`instance_byte`]): `None` when culled or with no submission.
+    pub fn fade_byte_at(&self, d2: f32) -> Option<u8> {
+        match select(self.multiplier, d2, LOD_SLOTS as u8) {
+            Selection::Culled => None,
+            Selection::Lod { lod, k } => instance_byte(&self.filled, lod, k),
+        }
+    }
+
+    /// Whether the fade byte leaves 255 anywhere within `max_metres` of the camera (sampled each
+    /// metre): only then does a plant need the per-frame byte writer (JC2-153).
+    pub fn fades_within(&self, max_metres: f32) -> bool {
+        (0..=max_metres.ceil() as u32).any(|m| self.fade_byte_at((m * m) as f32) != Some(255))
+    }
+
     /// The model of the last filled slot (the one the original keeps the longest).
     pub fn far_model(&self) -> Option<usize> {
         self.slot_model.iter().rev().find_map(|m| *m)
@@ -336,6 +419,28 @@ impl SlotPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_slot_fade_byte_follows_the_selection() {
+        // a bush with only slots 0 and 1: slot 1 is the last, its byte drops over its range
+        let bush = SlotPlan::new(3.0, [Some("B1"), Some("B2"), None, None, None]);
+        assert_eq!(bush.fade_byte_at(1.0), Some(255));
+        let mut seen_fade = false;
+        for m in 0..400 {
+            if let Some(b) = bush.fade_byte_at((m * m) as f32) {
+                seen_fade |= b < 255;
+            }
+        }
+        assert!(seen_fade);
+        assert!(bush.fades_within(400.0));
+        // five filled slots: the byte stays 255 until the last slot far away
+        let pine = SlotPlan::new(
+            4.0,
+            [Some("P1"), Some("P2"), Some("P2"), Some("P2"), Some("P2")],
+        );
+        assert!(!pine.fades_within(200.0));
+        assert_eq!(pine.fade_byte_at(2500.0 * 2500.0), None);
+    }
 
     #[test]
     fn slot_plan_picks_the_near_and_far_model() {
@@ -374,6 +479,43 @@ mod tests {
 
     fn at(scale: f32, metres: f32) -> Selection {
         select(owner_scale(scale, 1.0), metres * metres, 5)
+    }
+
+    #[test]
+    fn vehicle_level_follows_the_native_breakpoints() {
+        // 0061bb00: levels 1..4 at 196, 625, 4900, 18225 scaled squared metres
+        for (x, want) in [(0.0, 0.0), (196.0, 1.0), (625.0, 2.0), (4900.0, 3.0), (18225.0, 4.0)] {
+            assert!((vehicle_level(x - 1e-3) - want).abs() < 1e-2, "{x}");
+        }
+        assert_eq!(vehicle_level(1.0e6), 4.0);
+        // the helicopter body (scale 0.2): the first break is at 14 / 0.2 = 70 m, the last 675 m
+        let at = |m: f32| vehicle_level(vehicle_scaled_d2(0.2, m * m, 1.0, 1.0));
+        assert!(at(69.0) < 1.0 && at(71.0) > 1.0);
+        assert!(at(674.0) < 4.0 && at(676.0) >= 4.0);
+        // a car (scale 1.0): 14, 25, 70, 135 m
+        let car = |m: f32| vehicle_level(vehicle_scaled_d2(1.0, m * m, 1.0, 1.0));
+        assert!(car(13.0) < 1.0 && car(15.0) > 1.0);
+        assert!(car(24.0) < 2.0 && car(26.0) > 2.0);
+        // a larger distance unit (lodfactor 1: 1.5) pushes the breaks out, the zoom pulls them in
+        assert!(vehicle_level(vehicle_scaled_d2(1.0, 15.0 * 15.0, 1.0, 1.5)) < 1.0);
+        assert!(vehicle_level(vehicle_scaled_d2(1.0, 15.0 * 15.0, 1.19, 1.0)) < 1.0);
+    }
+
+    #[test]
+    fn vehicle_slots_from_the_level() {
+        // v062 body: LOD1, LOD1, LOD3, LOD4, LOD4
+        let body = SlotPlan::new(
+            0.2,
+            [Some("L1"), Some("L1"), Some("L3"), Some("L4"), Some("L4")],
+        );
+        assert_eq!(body.model_at_vehicle_level(0.5), Some(0));
+        assert_eq!(body.model_at_vehicle_level(1.5), Some(0));
+        assert_eq!(body.model_at_vehicle_level(2.5), Some(1));
+        assert_eq!(body.model_at_vehicle_level(3.5), Some(2));
+        assert_eq!(body.model_at_vehicle_level(4.0), Some(2));
+        // an empty tail finds nothing (the forward scan of 00a47b40)
+        let rock = SlotPlan::new(1.0, [Some("A"), Some("B"), None, None, None]);
+        assert_eq!(rock.model_at_vehicle_level(2.5), None);
     }
 
     #[test]
@@ -486,6 +628,22 @@ mod tests {
         assert_eq!(at(3.0, 1501.0), Selection::Culled);
     }
 
+    /// `00920240`: the zoom factor follows the realised vertical FOV, 1 from 46.8 degrees up.
+    #[test]
+    fn camera_zoom_follows_the_fov() {
+        let rad = |d: f32| d * 0.017_453_292;
+        near(camera_zoom(rad(40.0)), 1.1889, 1e-3);
+        near(camera_zoom(rad(20.0)), 2.4541, 1e-3);
+        assert_eq!(camera_zoom(rad(50.0)), 1.0);
+        assert_eq!(camera_zoom(rad(65.0)), 1.0);
+        // a 10 m slot boundary (scale 1) moves out to 11.89 m at the on-foot FOV
+        let plan = SlotPlan::new(1.0, [Some("a"), Some("b"), None, None, None]);
+        let z = camera_zoom(rad(40.0));
+        assert_eq!(plan.model_at_zoom(11.0 * 11.0, z), Some(0));
+        assert_eq!(plan.model_at_zoom(11.0 * 11.0, 1.0), Some(1));
+        assert_eq!(plan.model_at_zoom(12.0 * 12.0, z), Some(1));
+    }
+
     #[test]
     fn camera_zoom_widens_every_threshold() {
         let wide = owner_scale(4.0, 2.0);
@@ -547,7 +705,9 @@ mod tests {
     fn engine_table_by_lodfactor() {
         let t0 = engine_table(0);
         assert_eq!(
-            [t0.d1c, t0.d20, t0.d24, t0.d28, t0.d2c, t0.d30, t0.d34, t0.d38],
+            [
+                t0.d1c, t0.d20, t0.d24, t0.d28, t0.d2c, t0.d30, t0.d34, t0.d38
+            ],
             [450.0, 350.0, 480.0, 120.0, 55.0, 55.0, 60.0, 60.0]
         );
         assert_eq!(engine_table(1), t0);

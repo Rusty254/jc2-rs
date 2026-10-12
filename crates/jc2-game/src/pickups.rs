@@ -17,13 +17,16 @@ use crate::chaos::{Progress, Wallet};
 use crate::character::{HEIGHT, Hero};
 use crate::combat::{Arsenal, Dead, Gunner};
 use crate::coords::mat_to_bevy;
+use crate::identity::{
+    Books, Event, IdentitySynced, ObjectLedger, ObjectRef, Outcome, Reward, Table,
+};
 use crate::npc::Npc;
 use crate::rbm_loader::RbmAsset;
 use crate::world::Streamer;
 use crate::world::{GameplaySourceKey, SourceOrigin};
 use bevy::prelude::*;
 use jc2_formats::lod::LodDescriptor;
-use jc2_formats::pickups::{PickupEntity, PickupKind, entity_models};
+use jc2_formats::pickups::{PickupEntity, PickupKind, ResourceKind, entity_models};
 use jc2_formats::placement::bare_name;
 use jc2_formats::sarc::SmallArchive;
 use std::collections::{HashMap, HashSet};
@@ -35,21 +38,20 @@ const DROP_SECONDS: f32 = 90.0;
 /// Magazines in a dropped gun without a `pickup.<weapon>.ee` of its own.
 const DEFAULT_COUNT: i32 = 1;
 
-/// A resource crate: its tile and index in the tile's list.
-type CrateKey = (String, usize);
-
 /// Something to pick up.
 #[derive(Component, Clone, Debug)]
 pub struct Pickup {
     pub kind: PickupKind,
     /// Magazines (guns) or items (grenades); ≤ 0 counts as one.
     pub count: i32,
-    /// The stash it came from (tile, index of the spawn), so a taken stash stays empty.
-    stash: Option<CrateKey>,
+    /// The durable object it is (a stash or resource crate of a registered source set,
+    /// `identity.rs`): taking it goes through the ledger, so it is paid once and stays
+    /// taken across unload/reload. Dropped guns have none.
+    object: Option<ObjectRef>,
     /// Seconds left for a dropped gun.
     life: Option<f32>,
-    /// A resource crate: (tile, index in the tile's list), the settlement it counts for.
-    resource: Option<(CrateKey, Option<String>)>,
+    /// A resource crate: the settlement it counts for.
+    counter: Option<String>,
 }
 
 impl Pickup {
@@ -58,9 +60,9 @@ impl Pickup {
         Self {
             kind: PickupKind::Weapon(name.to_string()),
             count,
-            stash: None,
+            object: None,
             life: None,
-            resource: None,
+            counter: None,
         }
     }
 }
@@ -76,9 +78,6 @@ pub struct Pickups {
     stashes: HashMap<String, Option<PickupEntity>>,
     tiles_done: HashSet<GameplaySourceKey>,
     spawned: Vec<(Entity, GameplaySourceKey)>,
-    taken: HashSet<CrateKey>,
-    /// Resource crates taken (tile, index).
-    resources_taken: HashSet<CrateKey>,
     /// The box model of each resource entity (`None`: none found).
     boxes: HashMap<String, Option<String>>,
     /// Taken so far, for the tests.
@@ -89,6 +88,9 @@ pub struct PickupPlugin;
 
 impl Plugin for PickupPlugin {
     fn build(&self, app: &mut App) {
+        if !app.is_plugin_added::<crate::identity::IdentityPlugin>() {
+            app.add_plugins(crate::identity::IdentityPlugin);
+        }
         app.init_resource::<Pickups>()
             .add_systems(Startup, read_pickups)
             .add_systems(
@@ -96,6 +98,7 @@ impl Plugin for PickupPlugin {
                 (spawn_stashes, drop_weapons, dress_pickups, collect, expire)
                     .chain()
                     .after(crate::locations::LocationReconciled)
+                    .after(IdentitySynced)
                     .in_set(crate::world::GameplaySourcesReconciled),
             );
     }
@@ -189,6 +192,7 @@ fn spawn_stashes(
     mut pickups: ResMut<Pickups>,
     streamer: Option<Res<Streamer>>,
     arsenal: Option<Res<Arsenal>>,
+    ledger: Res<ObjectLedger>,
     game: Res<Game>,
     assets: Res<AssetServer>,
 ) {
@@ -201,8 +205,10 @@ fn spawn_stashes(
         }
         pickups.tiles_done.insert(source);
         for (i, s) in tile.exported_spawns.iter().enumerate() {
-            let key = (tile.source_container.clone(), i);
-            if pickups.taken.contains(&key) {
+            // an object the ledger does not know (its source set was refused) or that is
+            // already taken does not appear
+            let object = ObjectRef::new(source, Table::Stash, i as u32);
+            if ledger.0.fact_of(object).is_none_or(|f| f.collected) {
                 continue;
             }
             let container = bare_name(&s.entity).to_ascii_lowercase();
@@ -233,9 +239,9 @@ fn spawn_stashes(
                     Pickup {
                         kind: entity.item.kind.clone(),
                         count: entity.item.count,
-                        stash: Some(key),
+                        object: Some(object),
                         life: None,
-                        resource: None,
+                        counter: None,
                     },
                     Dress(dress),
                     Name::new(format!("stash {container}")),
@@ -251,8 +257,8 @@ fn spawn_stashes(
         }
         // the resource crates
         for (i, r) in tile.resources.iter().enumerate() {
-            let key = (tile.source_container.clone(), i);
-            if pickups.resources_taken.contains(&key) {
+            let object = ObjectRef::new(source, Table::Resource, i as u32);
+            if ledger.0.fact_of(object).is_none_or(|f| f.collected) {
                 continue;
             }
             let container = bare_name(&r.entity).to_ascii_lowercase();
@@ -271,9 +277,9 @@ fn spawn_stashes(
                     Pickup {
                         kind: PickupKind::Resource(r.kind),
                         count: 1,
-                        stash: None,
+                        object: Some(object),
                         life: None,
-                        resource: Some((key, r.counter.clone())),
+                        counter: r.counter.clone(),
                     },
                     Dress(dress),
                     Name::new(format!("resource {}", r.name)),
@@ -335,9 +341,9 @@ fn drop_weapons(
                 Pickup {
                     kind: PickupKind::Weapon(name.clone()),
                     count,
-                    stash: None,
+                    object: None,
                     life: Some(DROP_SECONDS),
-                    resource: None,
+                    counter: None,
                 },
                 Dress(dress),
                 Name::new(format!("dropped {name}")),
@@ -382,7 +388,60 @@ fn dress_pickups(
     }
 }
 
-/// Rico walks over a pickup and takes it.
+/// A gun or grenade into Rico's arsenal; false when he cannot take it.
+fn into_arsenal(arsenal: &mut Arsenal, assets: &AssetServer, kind: &PickupKind, n: u32) -> bool {
+    match kind {
+        PickupKind::Weapon(w) => {
+            let rounds = n * arsenal.magazine_of(w);
+            arsenal.pick_up(Some(assets), w, rounds).is_some()
+        }
+        PickupKind::Item(lod) => {
+            // the grenade (`wea33`); the triggered charge is not a weapon here yet
+            lod.to_ascii_lowercase().contains("wea33") && arsenal.pick_up_grenades(n) > 0
+        }
+        PickupKind::Resource(_) => false,
+    }
+}
+
+/// What a resource crate puts in the wallet (`Wallet::take`).
+fn crate_reward(kind: ResourceKind, counter: Option<String>) -> Reward {
+    let n = kind.amount();
+    let mut r = Reward {
+        settlement: counter,
+        ..Default::default()
+    };
+    match kind {
+        ResourceKind::Weapon => r.weapon_parts = n,
+        ResourceKind::Vehicle => r.vehicle_parts = n,
+        ResourceKind::Armor => r.armor_parts = n,
+        ResourceKind::Cash => r.money = n,
+    }
+    r
+}
+
+/// A resource crate taken: the wallet and the settlement counter change with the ledger
+/// or not at all (`Ledger::commit`).
+fn take_resource(
+    ledger: &mut crate::identity::Ledger,
+    object: ObjectRef,
+    kind: ResourceKind,
+    counter: Option<String>,
+    wallet: Option<&mut Wallet>,
+    progress: Option<&mut Progress>,
+) -> Outcome {
+    let reward = crate_reward(kind, counter);
+    let mut books = Books {
+        chaos: None,
+        wallet,
+        progress,
+    };
+    ledger.commit(object, Event::Collect, Some((&reward, &mut books)), || true)
+}
+
+/// Rico walks over a pickup and takes it. Stashes and resource crates are durable
+/// objects: the take goes through the ledger (`identity.rs`), which pays the wallet and
+/// the settlement counter atomically and only once, however often or in whatever order
+/// the pickup and its tile come and go.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn collect(
     mut commands: Commands,
@@ -394,6 +453,7 @@ fn collect(
     models: Query<(), With<PickupModel>>,
     mut wallet: Option<ResMut<Wallet>>,
     mut progress: Option<ResMut<Progress>>,
+    mut ledger: ResMut<ObjectLedger>,
 ) {
     let Some(mut arsenal) = arsenal else { return };
     let Ok((hero, htf)) = heroes.single() else {
@@ -409,40 +469,51 @@ fn collect(
             continue;
         }
         let n = p.count.max(1) as u32;
-        let took = match &p.kind {
-            PickupKind::Weapon(w) => {
-                let rounds = n * arsenal.magazine_of(w);
-                arsenal.pick_up(Some(&assets), w, rounds).is_some()
+        // `Some(true)`: taken now; `Some(false)`: already taken before (clean up only)
+        let took = match (p.object, &p.kind) {
+            (Some(h), PickupKind::Resource(kind)) => {
+                match take_resource(
+                    &mut ledger.0,
+                    h,
+                    *kind,
+                    p.counter.clone(),
+                    wallet.as_deref_mut(),
+                    progress.as_deref_mut(),
+                ) {
+                    Outcome::Applied => {
+                        info!("rico takes a {kind:?} crate (+{})", kind.amount());
+                        Some(true)
+                    }
+                    Outcome::AlreadyDone => Some(false),
+                    Outcome::Stale | Outcome::Rejected(_) => None,
+                }
             }
-            PickupKind::Item(lod) => {
-                // the grenade (`wea33`); the triggered charge is not a weapon here yet
-                lod.to_ascii_lowercase().contains("wea33") && arsenal.pick_up_grenades(n) > 0
+            (Some(h), kind) => {
+                match ledger.0.commit(h, Event::Collect, None, || {
+                    into_arsenal(&mut arsenal, &assets, kind, n)
+                }) {
+                    Outcome::Applied => Some(true),
+                    Outcome::AlreadyDone => Some(false),
+                    Outcome::Stale | Outcome::Rejected(_) => None,
+                }
             }
-            PickupKind::Resource(kind) => match wallet.as_mut() {
+            (None, PickupKind::Resource(kind)) => match wallet.as_mut() {
                 Some(w) => {
                     let got = w.take(*kind);
                     info!("rico takes a {kind:?} crate (+{got})");
-                    true
+                    Some(true)
                 }
-                None => false,
+                None => None,
             },
+            (None, kind) => into_arsenal(&mut arsenal, &assets, kind, n).then_some(true),
         };
-        if !took {
-            continue;
+        let Some(took) = took else { continue };
+        if took {
+            pickups.collected += 1;
         }
-        pickups.collected += 1;
-        if let Some((key, counter)) = &p.resource {
-            pickups.resources_taken.insert(key.clone());
-            if let (Some(id), Some(pr)) = (counter, progress.as_mut()) {
-                pr.count(id, format!("crate {} {}", key.0, key.1));
-            }
-            commands.entity(e).despawn();
-            continue;
-        }
-        match &p.stash {
-            Some(key) => {
+        match p.object {
+            Some(h) if h.table == Table::Stash => {
                 // the crate stays, empty
-                pickups.taken.insert(key.clone());
                 for c in children.into_iter().flatten() {
                     if models.contains(*c) {
                         commands.entity(*c).despawn();
@@ -450,7 +521,7 @@ fn collect(
                 }
                 commands.entity(e).remove::<Pickup>();
             }
-            None => commands.entity(e).despawn(),
+            _ => commands.entity(e).despawn(),
         }
     }
 }
@@ -534,9 +605,9 @@ mod tests {
             Pickup {
                 kind: PickupKind::Item("weapons\\wea33\\wea33-wea33.lod".into()),
                 count: 5,
-                stash: None,
+                object: None,
                 life: None,
-                resource: None,
+                counter: None,
             },
         ));
         app.update();
@@ -572,5 +643,118 @@ mod tests {
         assert_eq!(app.world().resource::<Pickups>().collected, 3);
         let mut left = app.world_mut().query::<&Pickup>();
         assert_eq!(left.iter(app.world()).count(), 0);
+    }
+
+    /// Headless, tile 31,14 (eight resource crates): a crate pays its part once however
+    /// often it is taken; after the tile unloads and reloads (a new source generation) the
+    /// same crate is still taken and pays nothing, the old generation's handle is stale,
+    /// and the settlement count does not move. Needs the tile's test data.
+    #[test]
+    fn resource_crates_pay_once_across_unload_and_reload() {
+        use crate::chaos::ChaosPlugin;
+        use crate::world::FlyCamera;
+        use bevy::ecs::system::RunSystemOnce;
+        use jc2_formats::terrain::TILE_SIZE;
+        let Some(mut app) = crate::world::tests::tile_app(|app| {
+            app.add_plugins(ChaosPlugin);
+        }) else {
+            return;
+        };
+        let (key, index, kind, counter) = {
+            let st = app.world().resource::<Streamer>();
+            let t = &st.loaded[&(31, 14)];
+            assert!(!t.resources.is_empty(), "the village has resource crates");
+            let r = &t.resources[0];
+            (t.source_key.unwrap(), 0u32, r.kind, r.counter.clone())
+        };
+        let object = ObjectRef::new(key, Table::Resource, index);
+        let take = |app: &mut App, object: ObjectRef| {
+            let counter = counter.clone();
+            app.world_mut()
+                .run_system_once(
+                    move |mut ledger: ResMut<ObjectLedger>,
+                          mut wallet: ResMut<Wallet>,
+                          mut progress: ResMut<Progress>| {
+                        take_resource(
+                            &mut ledger.0,
+                            object,
+                            kind,
+                            counter.clone(),
+                            Some(&mut wallet),
+                            Some(&mut progress),
+                        )
+                    },
+                )
+                .unwrap()
+        };
+        let totals = |app: &App| {
+            let w = app.world().resource::<Wallet>().clone();
+            let done = counter
+                .as_deref()
+                .map_or(0, |c| app.world().resource::<Progress>().done(c));
+            (w, done)
+        };
+        let start = totals(&app);
+        assert_eq!(take(&mut app, object), Outcome::Applied);
+        let paid = totals(&app);
+        assert_ne!(paid.0, start.0, "the crate paid");
+        assert_eq!(take(&mut app, object), Outcome::AlreadyDone);
+        assert_eq!(totals(&app), paid);
+        // away and back
+        let mut cams = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<FlyCamera>>();
+        cams.single_mut(app.world_mut()).unwrap().translation.x += 3.0 * TILE_SIZE;
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(
+            !app.world()
+                .resource::<Streamer>()
+                .loaded
+                .contains_key(&(31, 14))
+        );
+        assert!(
+            !app.world().resource::<ObjectLedger>().0.has_source(key.0),
+            "the unloaded generation's handles are released"
+        );
+        cams.single_mut(app.world_mut()).unwrap().translation.x -= 3.0 * TILE_SIZE;
+        let started = std::time::Instant::now();
+        while !app
+            .world()
+            .resource::<Streamer>()
+            .loaded
+            .contains_key(&(31, 14))
+        {
+            app.update();
+            assert!(started.elapsed().as_secs() < 60);
+        }
+        app.update();
+        let new_key = app.world().resource::<Streamer>().loaded[&(31, 14)]
+            .source_key
+            .unwrap();
+        assert_ne!(new_key, key);
+        let again = ObjectRef::new(new_key, Table::Resource, index);
+        assert!(
+            app.world()
+                .resource::<ObjectLedger>()
+                .0
+                .fact_of(again)
+                .unwrap()
+                .collected,
+            "the reloaded crate is already taken"
+        );
+        assert_eq!(take(&mut app, again), Outcome::AlreadyDone);
+        assert_eq!(take(&mut app, object), Outcome::Stale, "old token");
+        assert_eq!(totals(&app), paid, "nothing was paid again");
+        // another crate of the tile is a different object and still pays
+        if app.world().resource::<Streamer>().loaded[&(31, 14)]
+            .resources
+            .len()
+            > 1
+        {
+            let other = ObjectRef::new(new_key, Table::Resource, 1);
+            assert_eq!(take(&mut app, other), Outcome::Applied);
+        }
     }
 }

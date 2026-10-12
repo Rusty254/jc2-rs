@@ -25,6 +25,7 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use jc2_formats::grass::{GRASS_PATCH, GrassBlade, QUADS_PER_BLADE, blade_quad};
 use jc2_formats::terrain::{TILE_SIZE, TerrainTile, WORLD_MIN, tile_file_name};
@@ -79,6 +80,34 @@ pub struct GrassExt {
     /// x: fade start, y: fade end (metres from the camera)
     #[uniform(100)]
     pub fade: GrassFade,
+    /// The shared per-frame constants (`sun_horizon::SunHorizon`); grass reads only the haze fog
+    /// fields (JC2-163). Filled by the system `haze::add_haze_binding` registers.
+    #[storage(101, read_only)]
+    pub sun_horizon: Handle<ShaderBuffer>,
+    /// `t11`: `ambientocclusionmap.dds`, filled by `sun_horizon::add_ao_binding` (white = AO 1
+    /// until then). The grass pixel shader reads it for the ambient, the horizon shadow and the
+    /// `(AO / 2 + 1/2)` factor of the Sun (lighting-gaps-next.md G2/G3).
+    #[texture(102)]
+    #[sampler(103)]
+    pub ao_map: Handle<Image>,
+}
+
+impl crate::sun_horizon::AoBound for GrassMaterial {
+    fn ao_map(&self) -> &Handle<Image> {
+        &self.extension.ao_map
+    }
+    fn set_ao_map(&mut self, map: Handle<Image>) {
+        self.extension.ao_map = map;
+    }
+}
+
+impl crate::haze::HazeBound for GrassMaterial {
+    fn haze_buffer(&self) -> &Handle<ShaderBuffer> {
+        &self.extension.sun_horizon
+    }
+    fn set_haze_buffer(&mut self, buffer: Handle<ShaderBuffer>) {
+        self.extension.sun_horizon = buffer;
+    }
 }
 
 #[derive(ShaderType, Clone, Debug, Default)]
@@ -96,6 +125,18 @@ impl MaterialExtension for GrassExt {
         ShaderRef::Path(
             AssetPath::from_path_buf(embedded_path!("grass.wgsl")).with_source("embedded"),
         )
+    }
+    // JC2-237: no depth pre-pass and no shadow cascades. The material is `AlphaToCoverage`; with
+    // MSAA Bevy's prepass (and shadow) pipeline has no alpha discard for that mode (`MAY_DISCARD`
+    // is only set for `Mask`, or A2C with MSAA off), so every grass card wrote its whole quad
+    // into the depth buffer and the terrain behind the transparent texels failed the main pass's
+    // depth test: the scene clear colour showed through as flat patches. Whether the native grass
+    // draws in a depth pre-pass or casts shadows is not traced (non-native choice, Gap).
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
     }
 }
 
@@ -127,6 +168,10 @@ impl Plugin for GrassPlugin {
         crate::vegdata::ensure(app);
         bevy::asset::embedded_asset!(app, "grass.wgsl");
         let shader: Handle<Shader> = load_embedded_asset!(app, "grass.wgsl");
+        crate::haze::ensure_shader(app);
+        crate::haze::add_haze_binding::<GrassMaterial>(app);
+        crate::sun_horizon::ensure_correction_shader(app);
+        crate::sun_horizon::add_ao_binding::<GrassMaterial>(app);
         app.insert_resource(GrassShader(shader))
             .add_plugins(MaterialPlugin::<GrassMaterial>::default())
             .add_systems(Startup, setup)
@@ -143,7 +188,15 @@ fn setup(
 ) {
     let veg = data.veg.clone();
     // the atlas every zone's grass types name (they all say global_grass_DIF.dds)
-    let texture: Handle<Image> = assets.load("jc2://general.blz/global_grass_dif.dds");
+    // sampler: CLAMP in U and V, fields (7,7) with the user anisotropy (`FUN_00a821d0`)
+    let texture: Handle<Image> = assets
+        .load_builder()
+        .with_settings(|settings: &mut bevy::image::ImageLoaderSettings| {
+            settings.sampler =
+                crate::native_sampler::SlotState::new(crate::native_sampler::CLAMP, 7, 7, true)
+                    .sampler();
+        })
+        .load("jc2://general.blz/global_grass_dif.dds");
     let material = materials.add(GrassMaterial {
         base: StandardMaterial {
             base_color: Color::WHITE,
@@ -154,9 +207,13 @@ fn setup(
             alpha_mode: AlphaMode::AlphaToCoverage,
             cull_mode: None,
             double_sided: false,
+            // the native fog is applied in `grass.wgsl` (`haze_fog.wgsl`), not Bevy's
+            fog_enabled: false,
             ..default()
         },
         extension: GrassExt {
+            sun_horizon: Handle::default(),
+            ao_map: Handle::default(),
             fade: GrassFade {
                 range: Vec4::new(cfg.radius * 0.6, cfg.radius, 0.0, 0.0),
             },
@@ -420,6 +477,29 @@ mod tests {
     use super::*;
     use jc2_formats::GameFs;
     use jc2_formats::vegetation::GroundSample;
+
+    /// JC2-237: an A2C grass card in the depth pre-pass / shadow pass writes its whole quad
+    /// (no alpha discard there under MSAA), which hides the terrain behind the transparent texels.
+    #[test]
+    fn grass_stays_out_of_the_depth_prepass_and_shadows() {
+        assert!(!<GrassMaterial as bevy::pbr::Material>::enable_prepass());
+        assert!(!<GrassMaterial as bevy::pbr::Material>::enable_shadows());
+        let m = GrassMaterial {
+            base: StandardMaterial {
+                alpha_mode: AlphaMode::AlphaToCoverage,
+                ..default()
+            },
+            extension: GrassExt {
+                sun_horizon: Handle::default(),
+                ao_map: Handle::default(),
+                fade: GrassFade::default(),
+            },
+        };
+        assert!(matches!(
+            bevy::pbr::Material::alpha_mode(&m),
+            AlphaMode::AlphaToCoverage
+        ));
+    }
 
     fn veg() -> Option<(GameFs, Vegetation)> {
         let dir = std::env::var("JC2_TEST_DIR").ok()?;

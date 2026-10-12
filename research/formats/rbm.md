@@ -36,7 +36,7 @@ knows 53 types (`rbm::BLOCK_TYPE_NAMES`); counts in this game:
 | DeformableWindow v1 | 958 | yes | vehicle glass |
 | VegetationFoliage v0 | 710 | yes | leaves |
 | Window v0 | 289 | yes | building glass |
-| BillboardFoliage v0 | 16 | yes (quads in the XY plane, not billboarded) | canopy sprites |
+| BillboardFoliage v0 | 16 | yes (mesh as XY quads; drawn camera-facing by `foliage_billboard.wgsl`) | canopy sprites |
 
 How the seven later types were found: each block class has a 24-slot vtable
 (`classes.csv`, `NGraphicsEngine::CRenderBlock*`); slot 1 is `Read(stream)`.
@@ -160,7 +160,8 @@ u8 version; f32 ×6; material; 40 B: f32 x y z; f32 u0 v0 u1 v1; f32 normal, tan
 u8 version; material; 28 B: f32 centre x y z; f32 u v; f32 offset x y; faces
 ```
 The quad corners are `centre + offset` in view space (a billboard); the parser
-applies the offset in the model's XY plane so the geometry has area.
+applies the offset in the model's XY plane (bounds) and keeps it in `uv1`; the game draws the card camera-facing
+(`research/formats/billboard-foliage-next.md`, `foliage_billboard.wgsl`).
 
 ### Halo v0
 ```
@@ -200,6 +201,32 @@ indices as they are. (It used to mirror Z, which turned every model inside out.)
 vehicle space, so loading every `lod1` model of a container assembles the vehicle.
 Shared parts (tyres) are referenced through the `.lod` text files and live in
 `Vehicles\04_SharedAssets\…` (top-level archive entries, by bare name).
+
+## Rico's blocks (board 845e8e4c)
+
+`mc01_lod1-rico.rbm` is the only Rico model (one file; the `.lod` repeats it for five levels), so the
+model was right and the faults were draw state and skinning. Native: the `SkinnedGeneral` main-pass
+setup `0x00931080` derives cull from the block flags (code 1 none when the low byte is 1 or bit 16,
+block without bit 18, 1 for the bit-18 block: the hair's two passes) and the blended branch for low byte 4.
+Rico's eye block (flag 4, `ava_eye02_dif` is plain white) is the `SkinnedGeneralEyeGloss` cornea
+over the iris that the head block takes from the `mc01_clothes_dif` atlas: its pixel shader adds
+specular and a faint fresnel reflection (<= 0.025) over the refracted scene, so it must not be drawn
+opaque. Blocks 9-11 (head, neck, upper chest skin; flag `0x80000` "big vertices") store their four
+batch-local bone indices in the first four of the eight extra bytes; the four bytes after the weights are
+constant, so reading them bound the whole head and neck skin rigidly to one bone and the skin
+showed over the grey T-shirt at the collar. Inferred (not decoded): the bit-18 hair pass is drawn
+as a blended fringe, the hair sheen is switched off (native hair shader gates specular by the mpm map),
+the cornea uses Bevy's PBR specular. Gaps: the remaining 8 unknown bytes of big vertices (four after
+the weights, last four of the extra eight; probably facial-rig data), the native blend factors of the
+eye block and the blend/coverage state of the second hair pass, the hair shader's own lighting.
+
+Update (board 21ff361e, `rico-eyes.md`, probe `rico_eyes_probe.py`): the eye block's output alpha is 1 and its colour is the
+scene copy behind it plus a faint reflection and a tight highlight, so its blend factors do not matter (gap closed); the
+iris and sclera are in the head block, the eye block is a 0.2 mm larger glass shell. Every `SkinnedGeneral` main-pass block
+has blending enabled (state byte `013e0e28+0x178` == 0, inferred), the default factors are SRC_ALPHA / INV_SRC_ALPHA, and the
+alpha references are `(2v+1)/510` = 0.7706 (hair pass 1) and 3/510 (pass 2 and all other blocks), not 196/255 and 1/255.
+The black rings around the eyes in the rewrite are the eyelash cards (hair blocks 14 and 15, UV v 0.91-0.98) drawn opaque:
+`hemisphere_main.wgsl` never calls `alpha_discard`, so `Mask` is inert on the hemisphere route.
 
 ## Sources
 

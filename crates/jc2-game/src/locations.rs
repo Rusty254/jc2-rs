@@ -111,7 +111,8 @@ impl Locations {
 pub struct LocationsPlugin;
 impl Plugin for LocationsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Locations>()
+        app.add_plugins(crate::batch_lod::BatchLodPlugin)
+            .init_resource::<Locations>()
             .init_resource::<Activation>()
             .add_systems(Startup, load_registry)
             .add_systems(
@@ -150,23 +151,34 @@ impl Activation {
         self.state.as_ref()
     }
 }
-/// Locations the camera activation serves. `wc/` tile containers stay with the terrain
-/// streamer (it loads a tile's own container with the tile; the streamer is unchanged), and
-/// the city gameplay/settlement containers remain with the gameplay milestone.
-fn camera_activates(loc: &Location) -> bool {
-    if loc.identity.starts_with("wc/") {
-        return false;
+/// Locations the camera activation serves. `wc/` tile containers are ordinary records
+/// natively (`0x7c4840` does not filter by name, JC2-150): they are served here when
+/// [`world::WcByActivation`] is present (`wc`), else they stay with the terrain streamer
+/// (it loads a tile's own container with the tile). The city gameplay/settlement
+/// containers remain with the gameplay milestone.
+fn camera_activates(loc: &Location, wc: bool) -> bool {
+    if wc_tile(&loc.identity).is_some() {
+        return wc;
     }
     !(is_city(loc) && (loc.identity.contains("gameplay") || loc.identity.contains("settlement")))
 }
 fn is_city(loc: &Location) -> bool {
     loc.identity.starts_with("metropolis/")
 }
+/// The terrain tile a `wc/NN/NNxMM` tile container is named after.
+fn wc_tile(identity: &str) -> Option<(u32, u32)> {
+    let name = identity.strip_prefix("wc/")?.rsplit('/').next()?;
+    let (x, z) = name.split_once('x')?;
+    Some((x.parse().ok()?, z.parse().ok()?))
+}
 fn owner_of(loc: &Location, key: ActivationKey) -> LocationOwner {
     LocationOwner::Activated {
         location: key.location,
         kind: key.kind,
-        gameplay: is_city(loc) && key.kind == RecordKind::Near,
+        // the old `Tile` owner enabled a terrain tile's actors: its wc container's near record
+        // does the same (project policy, see above)
+        gameplay: (is_city(loc) || wc_tile(&loc.identity).is_some())
+            && key.kind == RecordKind::Near,
     }
 }
 /// One native location-manager pass per frame from the main camera's XZ position
@@ -179,7 +191,9 @@ fn activate(
     mut act: ResMut<Activation>,
     st: Option<Res<Streamer>>,
     cams: Query<&Transform, With<FlyCamera>>,
+    wc: Option<Res<world::WcByActivation>>,
 ) {
+    let wc = wc.is_some();
     let Ok(cam) = cams.single() else { return };
     let camera = crate::coords::to_engine(cam.translation);
     let act = &mut *act;
@@ -198,7 +212,7 @@ fn activate(
             if let Some(only) = &only {
                 return only.contains(&loc.identity);
             }
-            camera_activates(loc)
+            camera_activates(loc, wc)
         }));
     }
     let Some(state) = act.state.as_mut() else {
@@ -259,7 +273,10 @@ fn activate(
                 return;
             }
             let centre = |i: usize| (loc.lower[i] + loc.upper[i]) * 0.5;
-            let anchor = jc2_formats::terrain::tile_index(centre(0), centre(2))
+            // a wc container's objects resolve against its own tile, which the (3.6 km wide)
+            // box centre does not give
+            let anchor = wc_tile(&loc.identity)
+                .or_else(|| jc2_formats::terrain::tile_index(centre(0), centre(2)))
                 .or_else(|| jc2_formats::terrain::tile_index(camera[0], camera[2]))
                 .unwrap_or((0, 0));
             locations.request(owner, &container, anchor);
@@ -352,8 +369,25 @@ fn reconcile(
             }
         }
     }
+    // JC2-150: with the wc containers camera-activated, a tile a mission needs (its terrain
+    // is held by `mission_tiles`) may have no camera near it, so nothing would load that
+    // tile's container (its objects, collision and statics). The mission's tile then owns its
+    // wc near record itself, for as long as the mission holds the tile. Project policy, not
+    // native: natively every wc record is camera-driven only.
+    let mission_wc: HashSet<(u32, u32)> = if st.wc_by_activation {
+        st.mission_tiles
+            .values()
+            .flatten()
+            .copied()
+            .filter(|k| loaded.contains(k))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let wc_mode = st.wc_by_activation;
     for r in locations.records.values_mut() {
         r.owners.retain(|o| match o {
+            LocationOwner::Tile(k) if wc_mode => mission_wc.contains(k),
             LocationOwner::Tile(k) => loaded.contains(k),
             LocationOwner::ExtraTile(k) => extra_wanted.contains(&(*k, r.container.clone())),
             _ => true,
@@ -367,6 +401,12 @@ fn reconcile(
         .collect();
     for (owner, name, key) in wanted {
         locations.request(owner, &name, key);
+    }
+    for key in mission_wc {
+        let name = jc2_formats::terrain::tile_container_name(key.0, key.1);
+        if game.fs.contains(&name) {
+            locations.request(LocationOwner::Tile(key), &name, key);
+        }
     }
     // sorted: only one record begins per frame, so HashMap order must not pick it
     let mut keys: Vec<_> = locations.records.keys().cloned().collect();
@@ -879,6 +919,195 @@ mod tests {
         assert!(ready(&app, BASE_FAR), "kept inside the 10 m band");
         move_camera(&mut app, -3175.0, z);
         pump(&mut app, "far leaves", |_| {}, |app| gone(app, BASE_FAR));
+    }
+    #[test]
+    fn wc_container_names_give_their_terrain_tile() {
+        assert_eq!(wc_tile("wc/31/31x14"), Some((31, 14)));
+        assert_eq!(wc_tile("wc/02/02x26"), Some((2, 26)));
+        assert_eq!(wc_tile("keymissions/km01/km01.base"), None);
+        assert_eq!(wc_tile("wc/31/garbage"), None);
+    }
+    /// JC2-150: with [`world::WcByActivation`] the terrain tile 31,14 loads terrain only and
+    /// its `wc/31/31x14` container comes from the camera activation (near, gameplay on, then
+    /// far statics), anchored at its own tile.
+    #[test]
+    fn retail_wc_tile_container_is_a_camera_activated_record() {
+        const NEAR: &str = "locations/wc/31/31x14.nlz";
+        const FAR: &str = "locations/wc/31/31x14.flz";
+        let Some(mut app) = world::tests::tile_app_with((31, 14), Vec::new(), |app| {
+            app.insert_resource(world::WcByActivation);
+            app.insert_resource(Activation {
+                only: Some(["wc/31/31x14".to_string()].into()),
+                ..Default::default()
+            });
+        }) else {
+            return;
+        };
+        {
+            let st = app.world().resource::<Streamer>();
+            let t = &st.loaded[&(31, 14)];
+            assert!(
+                t.containers.is_empty(),
+                "the terrain tile owns no container"
+            );
+            assert_eq!(t.objects_total, 0);
+            assert!(t.terrain_triangles > 0);
+        }
+        let started = std::time::Instant::now();
+        while !(ready(&app, NEAR) && ready(&app, FAR)) {
+            app.update();
+            assert!(
+                !matches!(base_state(&app, NEAR), Some(LocationState::Failed(_)))
+                    && !matches!(base_state(&app, FAR), Some(LocationState::Failed(_))),
+                "{:?} {:?}",
+                base_state(&app, NEAR),
+                base_state(&app, FAR)
+            );
+            assert!(started.elapsed().as_secs() < 120, "wc records never loaded");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let st = app.world().resource::<Streamer>();
+        let (anchor, near) = &st.location_tiles[NEAR];
+        assert_eq!(*anchor, (31, 14));
+        assert!(near.objects_total > 100, "{}", near.objects_total);
+        assert!(
+            near.gameplay_enabled,
+            "the near record enables the tile's actors"
+        );
+        let (_, far) = &st.location_tiles[FAR];
+        assert!(far.objects_total > 0 && !far.gameplay_enabled);
+    }
+    /// JC2-150: a far metropolis record spawns its `.batchlod` models hidden, and the camera
+    /// picks the tier: merged model from afar, a part model inside 350 m, its records inside
+    /// 120 m of the part.
+    #[test]
+    fn retail_far_batch_models_follow_the_three_tiers() {
+        use crate::batch_lod::{BatchNode, NodeKind};
+        const FAR_B1: &str = "locations/metropolis/city.district.b1.houses.flz";
+        let Some(mut app) = world::tests::tile_app(|app| {
+            app.add_plugins(LocationsPlugin);
+        }) else {
+            return;
+        };
+        app.world_mut()
+            .resource_mut::<Locations>()
+            .registry
+            .0
+            .clear();
+        let owner = LocationOwner::Mission(crate::missions::MissionOwner(83));
+        let generation =
+            app.world_mut()
+                .resource_mut::<Locations>()
+                .request(owner, FAR_B1, (6, 29));
+        wait_ready(&mut app, FAR_B1, generation);
+        let nodes = |app: &mut App| -> Vec<(BatchNode, Visibility)> {
+            let mut q = app.world_mut().query::<(&BatchNode, &Visibility)>();
+            q.iter(app.world()).map(|(n, v)| (*n, *v)).collect()
+        };
+        let all = nodes(&mut app);
+        let count = |k: NodeKind| all.iter().filter(|(n, _)| n.kind == k).count();
+        let (merged, entries, records) = (
+            count(NodeKind::Merged),
+            count(NodeKind::Entry),
+            count(NodeKind::Record),
+        );
+        assert!(
+            merged > 0 && entries > 0 && records > 0,
+            "{merged} {entries} {records}"
+        );
+        {
+            let st = app.world().resource::<Streamer>();
+            assert_eq!(st.location_tiles[FAR_B1].1.objects_failed, 0);
+        }
+        // far from every batch: only merged models show
+        move_camera(&mut app, -20000.0, -20000.0);
+        app.update();
+        let far = nodes(&mut app);
+        assert!(
+            far.iter()
+                .all(|(n, v)| (n.kind == NodeKind::Merged) == (*v != Visibility::Hidden))
+        );
+        // standing on the first record's entry: its box is within 120 m, so its records
+        // show, its merged model and part model do not
+        let first = all
+            .iter()
+            .find(|(n, _)| n.kind == NodeKind::Record)
+            .unwrap()
+            .0;
+        let (entry, batch) = (first.entry, first.batch);
+        let c = |k: usize| (entry.min[k] + entry.max[k]) * 0.5;
+        {
+            let mut q = app
+                .world_mut()
+                .query_filtered::<&mut Transform, With<FlyCamera>>();
+            let mut t = q.single_mut(app.world_mut()).unwrap();
+            t.translation = Vec3::new(c(0), c(1), c(2));
+        }
+        app.update();
+        let here = nodes(&mut app);
+        for (n, v) in &here {
+            let at_entry = n.entry.min == entry.min && n.entry.max == entry.max;
+            let in_batch = n.batch.min == batch.min && n.batch.max == batch.max;
+            match n.kind {
+                NodeKind::Merged if in_batch => assert_eq!(*v, Visibility::Hidden),
+                NodeKind::Entry if at_entry => assert_eq!(*v, Visibility::Hidden),
+                NodeKind::Record if at_entry => assert_eq!(*v, Visibility::Inherited),
+                _ => {}
+            }
+        }
+    }
+    /// JC2-150: a tile only a mission holds (no camera near it) still gets its wc container
+    /// objects, owned by the tile and released when the mission lets go.
+    #[test]
+    fn mission_held_tile_loads_its_wc_container_without_the_camera() {
+        const NEAR: &str = "locations/wc/31/31x14.nlz";
+        let Some(mut app) = world::tests::tile_app_with((31, 14), Vec::new(), |app| {
+            app.insert_resource(world::WcByActivation);
+            app.insert_resource(Activation {
+                only: Some(HashSet::new()),
+                ..Default::default()
+            });
+        }) else {
+            return;
+        };
+        assert!(base_state(&app, NEAR).is_none());
+        let mission = crate::missions::MissionOwner(84);
+        app.world_mut()
+            .resource_mut::<Streamer>()
+            .mission_tiles
+            .insert(mission, [(31, 14)].into_iter().collect());
+        let started = std::time::Instant::now();
+        while !ready(&app, NEAR) {
+            app.update();
+            assert!(
+                !matches!(base_state(&app, NEAR), Some(LocationState::Failed(_))),
+                "{:?}",
+                base_state(&app, NEAR)
+            );
+            assert!(started.elapsed().as_secs() < 120, "container never loaded");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            app.world().resource::<Streamer>().location_tiles[NEAR]
+                .1
+                .objects_total
+                > 100
+        );
+        assert!(
+            app.world()
+                .resource::<Locations>()
+                .has_owner(NEAR, LocationOwner::Tile((31, 14)))
+        );
+        app.world_mut()
+            .resource_mut::<Streamer>()
+            .mission_tiles
+            .clear();
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<Locations>()
+                .has_owner(NEAR, LocationOwner::Tile((31, 14)))
+        );
     }
     #[test]
     fn missing_location_fails_instead_of_acknowledging_loaded_terrain() {

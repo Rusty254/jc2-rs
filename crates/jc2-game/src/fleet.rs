@@ -59,6 +59,16 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The class prologue of the vehicle death routine (which `government.*.destroyed` event).
+    fn death_class(&self) -> crate::vehicle_damage::DeathClass {
+        use crate::vehicle_damage::DeathClass;
+        match self {
+            Kind::Car(_) => DeathClass::Land,
+            Kind::Heli(_) | Kind::Plane(..) => DeathClass::Air,
+            Kind::Boat(_) => DeathClass::Sea,
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Kind::Car(_) => "car",
@@ -77,11 +87,19 @@ struct Pending {
     parts: DollParts,
     /// The driver seat controller's camera setting (`camera_id`), when the doll has one.
     camera: Option<VehicleCamera>,
+    /// The damage block of the doll and the burn keys of the `.epe` (FX-VEH-3).
+    damage: crate::vehicle_damage::VehicleDamage,
+    /// The doll's effect mount points (slots 8 and 12 to 15 are driven by `vehicle_damage`).
+    fx: crate::vehicle_damage::VehicleFx,
+    contact_fx: crate::vehicle_contact_fx::VehicleContactFx,
 }
 
 #[derive(Resource)]
 pub struct Fleet {
+    /// `.lod` level of every part; 0 = the native five-slot selection (JC2-128).
     pub lod: usize,
+    /// Graphics setting `/lodfactor` for the native selection.
+    pub lodfactor: u32,
     pub requests: Vec<Request>,
     pending: Vec<Pending>,
     source_requests: Vec<(Request, SourceOrigin)>,
@@ -100,6 +118,7 @@ impl Fleet {
     pub fn new(lod: usize, world_vehicles: bool) -> Self {
         Self {
             lod,
+            lodfactor: 0,
             requests: Vec::new(),
             pending: Vec::new(),
             source_requests: Vec::new(),
@@ -225,8 +244,16 @@ fn request_parts(mut fleet: ResMut<Fleet>, assets: Res<AssetServer>, game: Res<G
             continue;
         };
         let lod = fleet.lod;
-        let Some(parts) = load_doll_parts(&container, &sarc, &data, &doll, &game, &assets, lod)
-        else {
+        let Some(parts) = load_doll_parts(
+            &container,
+            &sarc,
+            &data,
+            &doll,
+            &game,
+            &assets,
+            lod,
+            fleet.lodfactor,
+        ) else {
             warn!("{container}: no body part");
             continue;
         };
@@ -235,6 +262,24 @@ fn request_parts(mut fleet: ResMut<Fleet>, assets: Res<AssetServer>, game: Res<G
             .driver_seat()
             .and_then(|s| Some((s.camera_id?, s.camera_id_reverse)))
             .map(|(id, reverse)| VehicleCamera { id, reverse });
+        // the moped has no damage module: the loader defaults apply (0x008cb720)
+        let epe = sarc
+            .get(&format!("{container}.epe"))
+            .and_then(|e| sarc.data(&data, e).ok())
+            .and_then(|d| jc2_formats::compress::maybe_inflate(d).ok());
+        let burn = epe
+            .as_deref()
+            .map(jc2_formats::vehicle::BurnTuning::from_epe)
+            .unwrap_or_default();
+        let contact_ids = epe
+            .as_deref()
+            .map(jc2_formats::vehicle::ContactFxIds::from_epe)
+            .unwrap_or_default();
+        let damage = crate::vehicle_damage::VehicleDamage::new(
+            doll.damage.unwrap_or_default(),
+            burn.into(),
+        );
+        let fx = crate::vehicle_damage::VehicleFx::new(&doll.effects).with_class(kind.death_class());
         fleet.pending.push(Pending {
             origin,
             req,
@@ -242,6 +287,9 @@ fn request_parts(mut fleet: ResMut<Fleet>, assets: Res<AssetServer>, game: Res<G
             kind,
             parts,
             camera,
+            damage,
+            fx,
+            contact_fx: crate::vehicle_contact_fx::VehicleContactFx::new(contact_ids),
         });
     }
 }
@@ -411,6 +459,7 @@ fn spawn_ready(
         if let Some(camera) = p.camera {
             commands.entity(id).insert(camera);
         }
+        commands.entity(id).insert((p.damage, p.fx, p.contact_fx));
         fleet.spawned.push((id, p.req.tile));
     }
     fleet.pending.extend(keep);
@@ -485,6 +534,9 @@ pub mod testing {
         TerrainTile::parse(&d).unwrap()
     }
 
+    /// Wall-clock hang guard for the waits below (not a performance expectation).
+    const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
     /// The app, the ground height of the flat tile it stands on (tile 31,14's corner),
     /// and the spawn point in the middle of it. `None` without the test data.
     pub fn app(needs: &[&str], setup: impl FnOnce(&mut App)) -> Option<(App, f32, Vec3)> {
@@ -522,6 +574,7 @@ pub mod testing {
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
         .init_asset::<crate::general_material::GeneralMaterial>()
+        .init_asset::<crate::hemisphere_material::HemisphereMaterial>()
         .register_asset_loader(RbmLoader::default())
         .insert_resource(Game { fs })
         .insert_resource(Fleet::new(1, false))
@@ -539,8 +592,9 @@ pub mod testing {
 
     /// Frames, one at a time, until `done`. Whatever loads on other threads (models, Rico)
     /// shows up after a number of frames that depends on the machine's load, so a test
-    /// waits for it by the wall clock (a minute at most) instead of stepping a fixed
-    /// number of frames and then looking for it.
+    /// waits for it by the wall clock instead of stepping a fixed number of frames and
+    /// then looking for it. The limit is only a hang guard: a suite run beside builds
+    /// (JC2-162) can take minutes for what takes seconds alone.
     pub fn wait_until(app: &mut App, what: &str, mut done: impl FnMut(&mut App) -> bool) {
         let start = std::time::Instant::now();
         loop {
@@ -549,7 +603,7 @@ pub mod testing {
                 return;
             }
             assert!(
-                start.elapsed() < std::time::Duration::from_secs(60),
+                start.elapsed() < WAIT_LIMIT,
                 "timed out waiting for {what}"
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -593,7 +647,7 @@ pub mod testing {
         // the models load on other threads: wait by the wall clock, not for a number of
         // frames (a loaded machine takes many more of them)
         let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_secs(60) {
+        while start.elapsed() < WAIT_LIMIT {
             app.update();
             let fleet = app.world().resource::<Fleet>();
             if fleet.spawned.len() > before
@@ -653,12 +707,15 @@ mod tests {
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
         .init_asset::<crate::general_material::GeneralMaterial>()
+        .init_asset::<crate::hemisphere_material::HemisphereMaterial>()
         .register_asset_loader(RbmLoader::default())
         .insert_resource(Game { fs })
         .insert_resource(WorldConfig {
             tile: (31, 14),
             radius: 0,
             lod: 1,
+            object_lod: 1,
+            lodfactor: 0,
             models: true,
             physics: true,
             flat_terrain: true,
@@ -695,6 +752,35 @@ mod tests {
         );
         eprintln!("tile 31,14 parks {n} vehicles: {asked:?}");
     }
+    /// JC2-128: with `lod` 0 a vehicle's parts whose `.lod` names several distinct models
+    /// carry the native slot selection, starting on the full-detail model; at level 1 none do.
+    #[test]
+    fn vehicle_parts_follow_the_native_slots() {
+        let count = |lod: usize| {
+            let (mut app, _, _) = testing::app(&["lave.v016_military_apc.ee"], |_| {})?;
+            app.world_mut().resource_mut::<Fleet>().lod = lod;
+            testing::spawn(
+                &mut app,
+                "lave.v016_military_apc.ee",
+                Place::NearStart(Vec3::ZERO),
+            );
+            let mut q = app.world_mut().query::<&crate::plant_lod::PlantLod>();
+            let mut n = 0;
+            for l in q.iter(app.world()) {
+                assert!(l.set.plan.switches());
+                assert!(l.shown < l.set.handles.len());
+                n += 1;
+            }
+            Some(n)
+        };
+        let (Some(native), Some(single)) = (count(0), count(1)) else {
+            return;
+        };
+        eprintln!("APC: {native} parts with native LOD slots");
+        assert!(native > 0);
+        assert_eq!(single, 0);
+    }
+
     #[test]
     fn retired_source_vehicle_assets_cannot_spawn_but_external_requests_can() {
         let Some((mut app, _, _)) = testing::app(&["lave.v016_military_apc.ee"], |_| {}) else {

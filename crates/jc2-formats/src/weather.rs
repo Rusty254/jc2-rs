@@ -448,6 +448,9 @@ const ZONE_PICTURE_SETS: usize = 16;
 /// sky ambient (`cb0[10]`, up-facing), row 5 the ground ambient (`cb0[11]`, down-facing).
 pub const ZONE_ROWS: usize = 6;
 pub const ROW_SUN: usize = 0;
+/// Row 1 ("colour 2"): the General specular colour `cb0[1].xyz = 4 * row1` (JC2-110, `FUN_00a58a00`
+/// at 0x00a593cd); used unchanged, no sun transform.
+pub const ROW_SPECULAR: usize = 1;
 /// Row 2: the haze (fog) colour toward the sun, haze preset P1 (`FUN_00a55cd0`, JC2-116).
 pub const ROW_HAZE_TOWARD_SUN: usize = 2;
 /// Row 3: the haze (fog) colour away from the sun, haze preset P2 (`FUN_00a55cd0`, JC2-116).
@@ -941,6 +944,36 @@ pub mod post {
 /// A block of post-effect settings indexed by `S(n)`.
 pub type PostBlock = [f32; POST_SETTINGS];
 
+/// Values of the settings a shipped hour block does not name: the block constructor
+/// `FUN_0092d540` (JC2-135): S21 = 0.03, S22 = 0.006, S23 = S24 = 0 (the MotionBlur settings);
+/// everything else is overwritten by the file keys.
+const POST_BLOCK_DEFAULTS: PostBlock = {
+    let mut b = [0.0; POST_SETTINGS];
+    b[21] = 0.03;
+    b[22] = 0.006;
+    b
+};
+
+/// The gradient set and blend index `b` (0..=3) the per-frame update `FUN_00a66c30` picks for a
+/// camera at height `y` over terrain `ground` when the camera is far above or below the land
+/// (JC2-135 section 7, proven): set 8 (height) when `y >= 200` and the height over
+/// `max(ground, 200)` exceeds 300 m, `b = int(3 * clamp((h - 300) / 700))`; set 9 (water)
+/// when `y < 200`, `b = int(3 * clamp((200 - y) / 120))`. `None` means the zone byte decides.
+pub fn height_water_set(y: f32, ground: f32) -> Option<(usize, u32)> {
+    let band = |x: f32| (3.0 * x.clamp(0.0, 1.0)) as u32;
+    if y < 200.0 {
+        return Some((9, band((200.0 - y) / 120.0)));
+    }
+    let h = y - ground.max(200.0);
+    (h > 300.0).then(|| (8, band((h - 300.0) / 700.0)))
+}
+
+/// Blend weight of `b` for gradient `set` (`FUN_00a5e010`: `b / max_gradient`, all ten
+/// `max_gradient_n` of `game_zones` are 3).
+pub fn gradient_blend_weight(b: u32) -> f32 {
+    b as f32 / 3.0
+}
+
 const PE_CONTAINER: &str = "post_effects";
 const PE_NIGHT: u32 = 0x0a10_a074;
 const PE_DAY: u32 = 0x0a48_aa9b;
@@ -1023,7 +1056,7 @@ impl PostEffectBlocks {
             .ok_or_else(|| missing("post_effects"))?;
         let block = |h: u32, what: &str| -> Result<PostBlock> {
             let node = child_by_hash(post, h).ok_or_else(|| missing(what))?;
-            let mut b = [0.0; POST_SETTINGS];
+            let mut b = POST_BLOCK_DEFAULTS;
             for (n, key) in PE_KEYS {
                 b[n] = num(node, key).ok_or_else(|| missing(what))?;
             }
@@ -1131,6 +1164,27 @@ mod tests {
             }],
         }
         .to_bytes()
+    }
+
+    #[test]
+    fn the_height_and_water_selector_follows_the_brief() {
+        assert_eq!(height_water_set(100.0, 0.0), Some((9, 2)));
+        assert_eq!(height_water_set(160.0, 0.0), Some((9, 1)));
+        assert_eq!(height_water_set(80.0, 0.0), Some((9, 3)));
+        assert_eq!(height_water_set(199.0, 0.0), Some((9, 0)));
+        assert_eq!(height_water_set(500.0, 0.0), None); // h = 300 is not strictly above
+        assert_eq!(height_water_set(520.0, 0.0), Some((8, 0)));
+        assert_eq!(height_water_set(1300.0, 0.0), Some((8, 3)));
+        assert_eq!(height_water_set(1300.0, 600.0), Some((8, 1)));
+        assert_eq!(gradient_blend_weight(3), 1.0);
+    }
+
+    #[test]
+    fn post_blocks_default_the_motion_blur_slots() {
+        assert_eq!(POST_BLOCK_DEFAULTS[21], 0.03);
+        assert_eq!(POST_BLOCK_DEFAULTS[22], 0.006);
+        assert_eq!(POST_BLOCK_DEFAULTS[23], 0.0);
+        assert_eq!(POST_BLOCK_DEFAULTS[24], 0.0);
     }
 
     #[test]

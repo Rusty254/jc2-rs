@@ -66,7 +66,7 @@ use bevy::prelude::*;
 use jc2_formats::terrain::{GAMEZONE_RESET_BYTE, GameZoneCell, zone_cell};
 use jc2_formats::weather::{
     GameZoneGradients, LandscapeEffects, ROW_GROUND_AMBIENT, ROW_HAZE_AWAY, ROW_HAZE_TOWARD_SUN,
-    ROW_SKY_AMBIENT, ROW_SUN, ZONE_TYPE_DEFAULT, sun_colour_transform,
+    ROW_SKY_AMBIENT, ROW_SPECULAR, ROW_SUN, ZONE_TYPE_DEFAULT, sun_colour_transform,
 };
 
 /// The exposure `e0` of the game camera: Bevy's default [`Exposure::BLENDER`], written
@@ -101,6 +101,8 @@ const CONSTRUCTOR: LightState = LightState {
     // the haze presets' constructor colour (1, 1, 1, 1) (`FUN_00a3f8b0`)
     haze_toward_sun: Vec3::ONE,
     haze_away: Vec3::ONE,
+    // inferred: the same constructor colour as the other rows (no separate evidence)
+    specular: Vec3::ONE,
 };
 
 /// The tables and the file's constants, when the files could be read.
@@ -123,6 +125,8 @@ struct Rows {
     /// smoothed with the rest of the state, no gain.
     haze_toward_sun: Vec3,
     haze_away: Vec3,
+    /// Row 1, raw (the General specular colour is `4 *` this).
+    specular: Vec3,
 }
 
 impl Rows {
@@ -133,6 +137,7 @@ impl Rows {
             ground: self.ground.lerp(to.ground, f),
             haze_toward_sun: self.haze_toward_sun.lerp(to.haze_toward_sun, f),
             haze_away: self.haze_away.lerp(to.haze_away, f),
+            specular: self.specular.lerp(to.specular, f),
         }
     }
 }
@@ -150,6 +155,9 @@ pub struct LightState {
     pub haze_toward_sun: Vec3,
     /// Gradient row 3, raw: the fog colour away from the sun (haze preset P2, `cloud+0xc0`).
     pub haze_away: Vec3,
+    /// Gradient row 1, raw, smoothed with the rest: the General specular colour is
+    /// `4 *` this (`cb0[1].xyz`, general-terms-next.md section 2).
+    pub specular: Vec3,
 }
 
 impl LightState {
@@ -217,6 +225,7 @@ fn target_rows(g: &ZoneGradients, set: usize, intensity: f32, hour: f32) -> Rows
         ground: v3(r[ROW_GROUND_AMBIENT]),
         haze_toward_sun: v3(r[ROW_HAZE_TOWARD_SUN]),
         haze_away: v3(r[ROW_HAZE_AWAY]),
+        specular: v3(r[ROW_SPECULAR]),
     }
 }
 
@@ -227,6 +236,7 @@ fn state_of(g: &ZoneGradients, rows: Rows) -> LightState {
         ground_ambient: rows.ground,
         haze_toward_sun: rows.haze_toward_sun,
         haze_away: rows.haze_away,
+        specular: rows.specular,
     }
 }
 
@@ -312,8 +322,36 @@ pub fn zone_inputs(byte: u8, effects: Option<&LandscapeEffects>) -> (usize, f32)
     (set, cell.intensity() as f32)
 }
 
-/// Feed the zone under the camera into [`SkyLighting`] (milestone 1 of the zone map: no height,
-/// underwater, rain or snow inputs). Does nothing without a world streamer.
+/// Terrain height in metres under `(x, z)` from the resident tiles, 0 where none is loaded.
+/// **Inferred** stand-in for `FUN_00a645a0` (ground height of the terrain patch; whether it
+/// snaps to the 4 m cell is open, JC2-183 gaps): bilinear over the tile's height grid.
+pub fn ground_height<'a>(x: f32, z: f32, tile: impl Fn((u32, u32)) -> Option<&'a [u16]>) -> f32 {
+    let Some(key) = jc2_formats::terrain::tile_index(x, z) else {
+        return 0.0;
+    };
+    let (ox, oz) = jc2_formats::terrain::tile_origin(key.0, key.1);
+    tile(key)
+        .and_then(|h| jc2_formats::terrain::sample_height_grid(h, x - ox, z - oz))
+        .unwrap_or(0.0)
+}
+
+/// The height / water override of the zone set (`FUN_00a66c30`, JC2-135 section 7): far
+/// above the ground gradient set 8, below 200 m (sea level side) set 9, with the blend index
+/// `b` standing in the intensity (`variant_weight` is `b / max_gradient = b / 3` for both
+/// sets, equal to `gradient_blend_weight(b)`). Otherwise the zone's own set and intensity.
+pub fn height_water_override(
+    (set, intensity): (usize, f32),
+    camera_y: f32,
+    ground: f32,
+) -> (usize, f32) {
+    match jc2_formats::weather::height_water_set(camera_y, ground) {
+        Some((s, b)) => (s, b as f32),
+        None => (set, intensity),
+    }
+}
+
+/// Feed the zone under the camera into [`SkyLighting`] (the zone byte, plus the height and water sets, JC2-183;
+/// no rain or snow inputs). Does nothing without a world streamer.
 pub fn update_zone_inputs(
     streamer: Option<Res<Streamer>>,
     data: Res<ZoneGradientData>,
@@ -327,7 +365,11 @@ pub fn update_zone_inputs(
     let byte = zone_byte(p.x, p.z, |k| {
         st.loaded.get(&k).map(|t| t.gamezone.as_slice())
     });
-    let (set, intensity) = zone_inputs(byte, data.0.as_ref().map(|g| &g.effects));
+    let zone = zone_inputs(byte, data.0.as_ref().map(|g| &g.effects));
+    let ground = ground_height(p.x, p.z, |k| {
+        st.loaded.get(&k).map(|t| t.heights.as_slice())
+    });
+    let (set, intensity) = height_water_override(zone, p.y, ground);
     if lighting.zone_set != set || lighting.zone_intensity != intensity {
         lighting.zone_set = set;
         lighting.zone_intensity = intensity;
@@ -561,6 +603,45 @@ mod tests {
     }
 
     #[test]
+    fn height_and_water_override_the_zone_set() {
+        let zone = (1, 3.0);
+        // between the water line and 300 m over the ground the zone stands
+        assert_eq!(height_water_override(zone, 250.0, 0.0), zone);
+        assert_eq!(
+            height_water_override(zone, 500.0, 0.0),
+            zone,
+            "h = 300 is not above"
+        );
+        // under 200: water set 9, b = int(3 * (200 - y) / 120)
+        assert_eq!(height_water_override(zone, 100.0, 0.0), (9, 2.0));
+        assert_eq!(height_water_override(zone, 70.0, 0.0), (9, 3.0));
+        // high: set 8; the ground lifts the base above 200
+        assert_eq!(height_water_override(zone, 1300.0, 0.0), (8, 3.0));
+        assert_eq!(height_water_override(zone, 1300.0, 600.0), (8, 1.0));
+        // the post/light weight is b / 3 in both sets
+        let g = synthetic();
+        for set in [8, 9] {
+            for b in 0..=3 {
+                let w = g.effects.variant_weight(set, b as f32);
+                assert!((w - jc2_formats::weather::gradient_blend_weight(b)).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn the_ground_height_comes_from_the_resident_tile() {
+        // tile (29, 18): a flat grid of raw height 1000 (HEIGHT_SCALE m each)
+        let grid = vec![1000u16; 132 * 132];
+        let tiles: std::collections::HashMap<(u32, u32), Vec<u16>> =
+            std::collections::HashMap::from([((29, 18), grid)]);
+        let get = |k: (u32, u32)| tiles.get(&k).map(|v| v.as_slice());
+        let want = jc2_formats::terrain::height_to_metres(1000);
+        assert!((ground_height(-1280.0 + 40.0, -6712.0 + 40.0, get) - want).abs() < 1e-3);
+        assert_eq!(ground_height(0.0, 0.0, get), 0.0, "not loaded");
+        assert_eq!(ground_height(-20_000.0, 0.0, get), 0.0, "outside the world");
+    }
+
+    #[test]
     fn a_zone_byte_gives_the_light_set_and_intensity() {
         // the start base is Arctic at full intensity (probe fixture 0xC8)
         assert_eq!(zone_inputs(0xC8, None), (1, 3.0));
@@ -602,6 +683,7 @@ mod tests {
             ground_ambient: Vec3::new(0.73, 0.554, 0.263),
             haze_toward_sun: Vec3::ZERO,
             haze_away: Vec3::ZERO,
+            specular: Vec3::ZERO,
         };
         let b = s.to_bevy();
         let c = b.sun_color.to_linear();
@@ -626,6 +708,7 @@ mod tests {
             ground_ambient: Vec3::ZERO,
             haze_toward_sun: Vec3::ZERO,
             haze_away: Vec3::ZERO,
+            specular: Vec3::ZERO,
         }
         .to_bevy();
         assert_eq!((z.sun_illuminance, z.ambient_brightness), (0.0, 0.0));

@@ -115,13 +115,14 @@ u32   7                version
 u32   count            instances
 u32   models           distinct .lod names
 u32   strings          size of the name table at the end
-u8    [40]             zero (in-memory pointers)
+u8    [40]             zero in 1177 of 1845 version-7 files; the 4th word of the 10 is the count of
+                       trailing 0x14-byte records after the name table (JC2-146)
 f32   [count × 16]     world matrix per instance, 4 × 4, row vectors, translation in the
                        last row (absolute, same convention as the .blo)
 u16   [count]          model index into the name table
-u8    [count × 12]     zero
-f32   [count]          −1.0 (unused; a fade distance?)
-u16   [count]          3 (every instance seen)
+u8    [count × 12]     distance anchor vec3 (zero = none; cgd-model-batch-next.md)
+f32   [count]          −1.0 = no LOD-scale override (the metre scale applies only with an anchor)
+u16   [count]          flags: bit 0 -> owner flag 0x80, bit 1 -> distance cull + fade-in (3 for 144 652)
 f32   [count × 6]      world-space AABB min, max
 char  [strings]        NUL-separated bare .lod names
 ```

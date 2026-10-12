@@ -753,6 +753,7 @@ mod tests {
                 radius: 5.0,
                 damage: 0.0,
                 impulse: 0.0,
+                effect: None,
             });
         app.update();
         app.world_mut()

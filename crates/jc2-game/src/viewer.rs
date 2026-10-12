@@ -437,6 +437,15 @@ fn spawn_loaded(
             }
             for (mut cam, mut tf) in &mut cams {
                 frame(&mut cam, lo, hi);
+                // capture aid: `JC2_VIEWER_ZOOM=0.4` moves the framed camera closer (before/after
+                // captures of texture magnification); it changes nothing without the variable
+                if let Some(zoom) = std::env::var("JC2_VIEWER_ZOOM")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|z| *z > 0.0)
+                {
+                    cam.distance *= zoom;
+                }
                 apply(&cam, &mut tf);
             }
         }

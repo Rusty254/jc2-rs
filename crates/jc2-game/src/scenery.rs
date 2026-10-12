@@ -207,7 +207,7 @@ pub(crate) fn dress_tiles(
             &scfg,
         );
     }
-    if scfg.static_geometry {
+    if scfg.static_geometry && !st.wc_by_activation {
         place_statics(&mut st, &mut sc, &mut tile, key, &assets, &game, &cfg);
     }
     sc.stats.tiles += 1;
@@ -350,6 +350,7 @@ fn grow(
             vis_range,
             mission_owner: None,
             lod,
+            batch: None,
         });
         tile.objects_total += 1;
         match inst.group {
@@ -382,7 +383,12 @@ fn resolve_plant(
         let slots = d.slots().map(|s| s.filter(|n| c.member(n).is_some()));
         let plan = SlotPlan::with_lodfactor(d.lod_scale(), slots, lodfactor);
         let far = plan.models.get(plan.far_model()?)?.clone();
-        if plan.switches() {
+        // a plant also needs the plan when its last-slot fade byte leaves 255 inside the
+        // foliage fade range (`plant_lod.rs` writes it per frame, JC2-153)
+        let fade_range = jc2_formats::veglod::foliage_fade_end_max(
+            &jc2_formats::veglod::engine_table(lodfactor),
+        );
+        if plan.switches() || plan.fades_within(fade_range) {
             let paths = plan
                 .models
                 .iter()
@@ -610,9 +616,137 @@ pub(crate) fn place_container_statics_part(
                 vis_range: None,
                 mission_owner: None,
                 lod: None,
+                batch: None,
             });
             tile.objects_total += 1;
             placed += 1;
+        }
+    }
+    if let Some(far) = &far {
+        placed += place_batches(st, tile, (x, z), &local, far, assets, game, cfg)?;
+    }
+    Ok(placed)
+}
+
+/// The `.batchlod` model batches of a far container (JC2-150): per batch the merged model,
+/// each entry's part model and each entry's records, all spawned hidden with a
+/// [`crate::batch_lod::BatchNode`] that `batch_lod.rs` shows by the native three-tier rule.
+/// Models that do not resolve count as unresolved, like any other static.
+#[allow(clippy::too_many_arguments)]
+fn place_batches(
+    st: &mut Streamer,
+    tile: &mut LoadedTile,
+    (x, z): (u32, u32),
+    local: &std::sync::Arc<crate::world::Container>,
+    far: &std::sync::Arc<crate::world::Container>,
+    assets: &AssetServer,
+    game: &Game,
+    cfg: &WorldConfig,
+) -> jc2_formats::Result<usize> {
+    use crate::batch_lod::{BatchNode, NodeKind};
+    use jc2_formats::batchlod::{Aabb, BatchLod};
+    let mut placed = 0;
+    let bounds = |name: &str, world: &jc2_formats::placement::Transform3| {
+        let bytes = far.member(name)?;
+        let data = jc2_formats::compress::maybe_inflate(bytes).ok()?;
+        let (lo, hi) = jc2_formats::rbm::header_bounds(&data).ok()?;
+        Some(Aabb::of_model(world, lo, hi))
+    };
+    for member in far
+        .sarc
+        .entries
+        .iter()
+        .filter(|e| e.name.to_ascii_lowercase().ends_with(".batchlod"))
+    {
+        let bytes = far
+            .member(&member.name)
+            .ok_or_else(|| jc2_formats::Error::format("unreadable batchlod"))?;
+        let batch = BatchLod::parse(&jc2_formats::compress::maybe_inflate(bytes)?)?;
+        let Some(batch_box) = bounds(&batch.batch.name, &batch.batch.world) else {
+            *st.unresolved.entry(batch.batch.name.clone()).or_default() += 1;
+            tile.unresolved += 1;
+            continue;
+        };
+        let push = |st: &mut Streamer,
+                    tile: &mut LoadedTile,
+                    home: &str,
+                    rbm: &str,
+                    world: &jc2_formats::placement::Transform3,
+                    node: BatchNode| {
+            let path = format!("jc2://{home}/{rbm}");
+            let handle = st.model_handle(assets, &path);
+            tile.models.push(path);
+            tile.pending.push(PendingModel {
+                handle,
+                transform: mat_to_bevy(world),
+                name: format!("batch {rbm}"),
+                mesh_colliders: false,
+                piece: None,
+                vis_range: None,
+                mission_owner: None,
+                lod: None,
+                batch: Some(node),
+            });
+            tile.objects_total += 1;
+        };
+        let nowhere = batch_box;
+        push(
+            st,
+            tile,
+            &far.name,
+            &batch.batch.name,
+            &batch.batch.world,
+            BatchNode {
+                kind: NodeKind::Merged,
+                batch: batch_box,
+                entry: nowhere,
+            },
+        );
+        placed += 1;
+        for entry in &batch.entries {
+            let Some(entry_box) = bounds(&entry.object.name, &entry.object.world) else {
+                *st.unresolved.entry(entry.object.name.clone()).or_default() += 1;
+                tile.unresolved += 1;
+                continue;
+            };
+            push(
+                st,
+                tile,
+                &far.name,
+                &entry.object.name,
+                &entry.object.world,
+                BatchNode {
+                    kind: NodeKind::Entry,
+                    batch: batch_box,
+                    entry: entry_box,
+                },
+            );
+            placed += 1;
+            for record in &entry.records {
+                let model = &record.object.name;
+                let resolved = st
+                    .index
+                    .resolve(game, local, (x, z), model, cfg.lod)
+                    .or_else(|| st.index.resolve(game, far, (x, z), model, cfg.lod));
+                let Some((home, rbm)) = resolved else {
+                    *st.unresolved.entry(model.clone()).or_default() += 1;
+                    tile.unresolved += 1;
+                    continue;
+                };
+                push(
+                    st,
+                    tile,
+                    &home,
+                    &rbm,
+                    &record.object.world,
+                    BatchNode {
+                        kind: NodeKind::Record,
+                        batch: batch_box,
+                        entry: entry_box,
+                    },
+                );
+                placed += 1;
+            }
         }
     }
     Ok(placed)
@@ -667,12 +801,15 @@ mod tests {
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
         .init_asset::<crate::general_material::GeneralMaterial>()
+        .init_asset::<crate::hemisphere_material::HemisphereMaterial>()
         .register_asset_loader(RbmLoader::default())
         .insert_resource(Game { fs })
         .insert_resource(WorldConfig {
             tile: (31, 14),
             radius: 0,
             lod: 1,
+            object_lod: 1,
+            lodfactor: 0,
             models: true,
             physics: true,
             flat_terrain: true,
@@ -774,7 +911,10 @@ mod tests {
                     .world()
                     .resource::<AssetServer>()
                     .get_load_state(lod.set.handles[want].id());
-                let plant = app.world().get::<GlobalTransform>(target).map(|g| g.translation());
+                let plant = app
+                    .world()
+                    .get::<GlobalTransform>(target)
+                    .map(|g| g.translation());
                 let cams: Vec<Vec3> = app
                     .world_mut()
                     .query_filtered::<&GlobalTransform, With<Camera3d>>()
@@ -789,7 +929,11 @@ mod tests {
         };
         app.update();
         let lod = app.world().get::<PlantLod>(target).unwrap();
-        assert_ne!(Some(near), lod.set.plan.far_model(), "near differs from far");
+        assert_ne!(
+            Some(near),
+            lod.set.plan.far_model(),
+            "near differs from far"
+        );
         let blocks = app
             .world()
             .resource::<Assets<RbmAsset>>()

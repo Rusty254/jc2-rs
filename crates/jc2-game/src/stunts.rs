@@ -1130,8 +1130,13 @@ fn hang_wire_visual(
         }
         return;
     };
-    // taut: his weight hangs on it
-    let cable = Cable { a, b, slack: 0.02 };
+    // a completed wire: the native 1 percent sag, a hook model at each end
+    let cable = Cable {
+        a,
+        b,
+        sag: true,
+        hooks: true,
+    };
     if let Ok((_, mut c)) = wires.single_mut() {
         *c = cable;
         return;
@@ -1301,6 +1306,7 @@ fn tether_shots(
     bodies: BodyQuery,
     poses: Query<(&Position, &Rotation)>,
     tethers: Query<(Entity, &Tether)>,
+    mut fx: Option<ResMut<crate::grapple::effects::GrappleFx>>,
 ) {
     if state.clear {
         state.clear = false;
@@ -1312,6 +1318,15 @@ fn tether_shots(
         }
     }
     for shot in std::mem::take(&mut shots.0) {
+        // the hook's hit: 212 `hook_impact` (surface id unknown: default entry)
+        if let Some(fx) = fx.as_mut() {
+            fx.push(crate::grapple::effects::FxCall::HookImpact {
+                at: shot.point,
+                normal: Vec3::Y, // NON-NATIVE: the shot carries no normal
+                surface: None,
+                water: false,
+            });
+        }
         let end = make_end(&mut commands, shot, &colliders, &bodies);
         let Some(first) = state.pending.take() else {
             state.pending = Some(end);
@@ -1352,6 +1367,10 @@ fn tether_shots(
             Name::new("tether"),
         ));
         info!("tether: {dist:.1} m cable");
+        // the tether completion plays slot 4 (215 `dual_hook_deployed`, `0x00538470`)
+        if let Some(fx) = fx.as_mut() {
+            fx.push(crate::grapple::effects::tether_complete_call(b));
+        }
     }
 }
 
@@ -1436,6 +1455,7 @@ fn tether_visuals(
     poses: Query<(&Position, &Rotation)>,
     heroes: Query<(&Hero, &Transform)>,
     mut wires: Query<(Entity, &TetherWire, &mut Cable), Without<Hero>>,
+    mut fx: Option<ResMut<crate::grapple::effects::GrappleFx>>,
 ) {
     let mut seen_pending = false;
     let mut have: Vec<Entity> = Vec::new();
@@ -1443,6 +1463,20 @@ fn tether_visuals(
         match w.0 {
             Some(t) => {
                 let Ok((_, tether)) = tethers.get(t) else {
+                    // the tether is gone (snapped, cleared, a body removed): the original's
+                    // cut, two pieces snapping back (the port has no strength; every removal
+                    // plays it)
+                    if cable.a != cable.b {
+                        crate::grapple::spawn_cut(&mut commands, cable.a, cable.b);
+                        // 213 at both ends, stop 215, play 410 (surface ids not tracked)
+                        if let Some(fx) = fx.as_mut() {
+                            fx.extend(crate::grapple::effects::cut_calls(
+                                cable.a,
+                                cable.b,
+                                [None, None],
+                            ));
+                        }
+                    }
                     commands.entity(wire).try_despawn();
                     continue;
                 };
@@ -1451,12 +1485,12 @@ fn tether_visuals(
                     end_world(&tether.ends[0], &poses),
                     end_world(&tether.ends[1], &poses),
                 ) {
-                    // wound in tight, it is straight; with length to spare it sags
-                    let spare = (1.0 - a.distance(b) / tether.rest.max(0.1)).clamp(0.0, 1.0);
+                    // a completed wire: the native 1 percent sag whatever the slack
                     *cable = Cable {
                         a,
                         b,
-                        slack: spare * 2.0,
+                        sag: true,
+                        hooks: true,
                     };
                 }
             }
@@ -1470,7 +1504,8 @@ fn tether_visuals(
                         *cable = Cable {
                             a: crate::grapple::default_hand(h.translation, hero.facing),
                             b: end,
-                            slack: 0.15,
+                            sag: false, // the in-flight wire is drawn as it is (native)
+                            hooks: true,
                         };
                     }
                     _ => commands.entity(wire).try_despawn(),
@@ -1550,6 +1585,7 @@ impl Plugin for TetherPlugin {
         app.init_resource::<CameraMode>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<TetherShots>()
+            .init_resource::<crate::grapple::effects::GrappleFx>()
             .init_resource::<TetherState>()
             .add_observer(tether_removed)
             .add_observer(body_removed)

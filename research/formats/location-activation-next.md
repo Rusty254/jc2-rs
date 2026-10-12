@@ -147,17 +147,10 @@ inside the km01.base near window x (-2160.6, -329.0), z (-7906.7, -6194.7).
 
 ### Inferred
 
-* The flag byte `+0x58` bit 0 that the CLocation clears in each `CModelBatchResource` and the
-  one the `CModelBatch` update tests are the same offset and bit; I take `CModelBatchResource`
-  to contain or derive from `CModelBatch`. Not proven (Gap 7).
-* The 350 m switch is the hand-off between a far batch (merged, low LOD) and the individual
-  near objects: a far batch is hidden within 350 m of its AABB and its 120 m exclusion
-  tells the near layer which instances to skip. It is consistent with the 1000 m ring
-  (far batches of a base stay visible out to the raw box, they disappear when the camera
-  is within 350 m of their box).
-* A far location's `.fl.cgd` (the large structures: `key036_lod3`, `gb066_lod2`) is the batch
-  content; whether the near `.nl.cgd` is also a batch, and how instances are merged, is not
-  proven (Gap 7).
+* **Resolved by JC2-146** (`cgd-model-batch-next.md`): the `+0x58` byte is the `CModelBatch` object
+  that the loader wraps as `CModelBatchResource` (proven, not inferred). The 350 m switch is the first
+  of three tiers (merged model from 350 m, per-part models 120..350 m, individual records below 120 m),
+  the "exclusion list" is the entry vector, near `.nl.cgd` is a plain `CModelCollection` and not a batch.
 
 ## Project rule today vs native
 
@@ -210,13 +203,12 @@ inside the km01.base near window x (-2160.6, -329.0), z (-7906.7, -6194.7).
    use in `0xa4c6b0`, the tether range and the water mirror; the writer of that row for the free
    camera, cutscenes and the character camera is not traced. Blocks claims for modes where the
    main camera is not the gameplay camera.
-7. **Model-batch ownership.** Which class owns the CGD reader `0x8a40f0` (via `0x85b440`),
-   which objects create `CModelBatch` instances from a `CModelBatchResource`, whether the near `.nl.cgd` is also batched, the 350 m / 120 m semantics
-   (hide threshold and exclusion consumer `0xa4bac0` / `0xa4c5a0`), the per-instance AABB use, and the
-   CGD fields documented in `world.md` as `-1.0` and `3` (no reader traced) are unresolved. Blocks
-   a native per-instance draw distance for `.cgd` statics.
-8. **Which `.lod` slot a batch instance shows.** The batch submission `0xa42740` is the shared
-   one but the slot index source for batches is not traced (the vegetation selector is excluded).
+7. **Model-batch ownership.** Answered in `cgd-model-batch-next.md` (JC2-146): the reader belongs to
+   `CModelCollection`, the batch object is `CModelBatch`/`CModelBatchResource` created from `.batchlod`
+   files (resource type 0x21); the CGD `-1.0` is a LOD-scale override valid with a non-zero distance
+   anchor (the 12 "zero" bytes), the `3` is a flag word. Remaining details are that document's Gaps.
+8. **Which `.lod` slot a batch instance shows.** Answered there: batch objects never run the continuous
+   selector and always submit slot 0; `.cgd` instances use the shared gate `0x8c9100`.
 9. **Margin key** `#1070a35f` (carried from JC2-111): sign and int/float conversion unproven;
    four locations use it, none a tile or km01.base.
 10. **Actors, conditional locations, `conditions.bin` key name** (carried from JC2-111, unchanged).

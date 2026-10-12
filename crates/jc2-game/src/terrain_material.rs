@@ -263,6 +263,11 @@ pub struct TerrainSplat {
     /// the global mode reads it.
     #[texture(114, sample_type = "u_int")]
     pub zones: Handle<Image>,
+    /// The frame's selected point lights and the 4 m cell grid (`point_lights.rs`), shared.
+    #[storage(120, read_only)]
+    pub point_lights: Handle<ShaderBuffer>,
+    #[storage(121, read_only)]
+    pub point_cells: Handle<ShaderBuffer>,
 }
 
 /// The pipeline key of [`TerrainSplat`]: tile or global mode.
@@ -321,6 +326,7 @@ impl Plugin for TerrainMaterialPlugin {
         bevy::asset::embedded_asset!(app, "sun_horizon.wgsl");
         let horizon: Handle<Shader> = load_embedded_asset!(app, "sun_horizon.wgsl");
         crate::haze::ensure_shader(app);
+        crate::point_lights::ensure_shader(app);
         app.insert_resource(TerrainShader(shader));
         app.insert_resource(SunHorizonShader(horizon));
         app.add_plugins(MaterialPlugin::<TerrainSplatMaterial>::default());
@@ -530,6 +536,8 @@ impl SplatContext {
                 gradient: images.add(gradient_image(tile)),
                 ao: self.horizon.ao.clone(),
                 sun_horizon: self.horizon.params.clone(),
+                point_lights: crate::point_lights::LIGHT_BUFFER,
+                point_cells: crate::point_lights::CELL_BUFFER,
             },
         };
         Some(materials.add(material))
@@ -577,6 +585,8 @@ impl SplatContext {
                 gradient: layers.gradient.clone(),
                 ao: self.horizon.ao.clone(),
                 sun_horizon: self.horizon.params.clone(),
+                point_lights: crate::point_lights::LIGHT_BUFFER,
+                point_cells: crate::point_lights::CELL_BUFFER,
                 zones: self.zones.clone(),
             },
         };
@@ -1125,10 +1135,12 @@ fn main_pass_post_lighting_processing(p: PbrInput, c: vec4<f32>) -> vec4<f32> { 
         let shared: String = [
             include_str!("sun_horizon.wgsl"),
             include_str!("haze_fog.wgsl"),
+            include_str!("point_lights.wgsl"),
         ]
         .iter()
         .flat_map(|m| m.lines())
         .filter(|l| !l.starts_with("#define_import_path"))
+        .map(|l| l.replace("#{MATERIAL_BIND_GROUP}", "2"))
         .collect::<Vec<_>>()
         .join("\n");
         let full = format!("{stubs}\n{shared}\n{body}");

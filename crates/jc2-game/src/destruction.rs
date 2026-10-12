@@ -17,6 +17,7 @@ const UNIT_BLAST: Blast = Blast {
     radius: 7.0,
     damage: 350.0,
     impulse: 1200.0,
+    effect: Some(crate::explosion::effect_id::BARREL),
 };
 const DEBRIS_SPEED: f32 = 5.0;
 const DEFAULT_DEBRIS_MASS: f32 = 100.0;

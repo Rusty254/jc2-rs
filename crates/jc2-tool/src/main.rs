@@ -1951,6 +1951,9 @@ fn scan_rbm(game_dir: &Path) -> Result<()> {
     let mut bbox_bad: BTreeMap<String, usize> = BTreeMap::new();
     let mut bbox_examples: BTreeMap<String, String> = BTreeMap::new();
     let mut tris = 0usize;
+    // VegetationBark census (lighting research 646639f2): layout flag, material flags and the occupied
+    // texture slots (bit i = `Material::textures()[i]` non-empty) -> block count and one example.
+    let mut bark: BTreeMap<String, (usize, String)> = BTreeMap::new();
     for e in fs.entries() {
         let Ok(raw) = fs.read_hash(e.name_hash) else {
             continue;
@@ -1992,6 +1995,22 @@ fn scan_rbm(game_dir: &Path) -> Result<()> {
                         *blocks
                             .entry(format!("{} v{}", b.type_name, b.version))
                             .or_default() += 1;
+                        if b.type_name == "VegetationBark" {
+                            let slots = b
+                                .material
+                                .textures()
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, t)| !t.is_empty())
+                                .fold(0u32, |a, (i, _)| a | (1 << i));
+                            let key = format!(
+                                "layout_flags={:#x} material_flags={:#x} slots={slots:#010b} verts_have_colour={}",
+                                b.params.first().copied().unwrap_or(0.0) as u32,
+                                b.material.flags,
+                                !b.mesh.packed_colours.is_empty()
+                            );
+                            bark.entry(key).or_insert_with(|| (0, label.clone())).0 += 1;
+                        }
                         // vertex bounds must sit inside the file's bounding box: validates position scaling
                         if let (true, Some((lo, hi))) = (has_bbox, b.mesh.bounds()) {
                             let over = (0..3).any(|i| {
@@ -2031,6 +2050,12 @@ fn scan_rbm(game_dir: &Path) -> Result<()> {
     println!("block types parsed:");
     for (k, v) in &blocks {
         println!("  {v:>7}  {k}");
+    }
+    if !bark.is_empty() {
+        println!("VegetationBark blocks by layout / material flags / occupied texture slots:");
+        for (k, (n, ex)) in &bark {
+            println!("  {n:>7}  {k}   e.g. {ex}");
+        }
     }
     if !unsupported.is_empty() {
         println!("models cut short by an unsupported block type:");
@@ -2994,6 +3019,11 @@ fn anim_cmd(game_dir: &Path, name: &str, at: Option<f32>) -> Result<()> {
                 None => "none".into(),
             }
         );
+        if at.is_some() {
+            for (i, r) in clip.root_motion.iter().enumerate() {
+                println!("RM {i} {:.6} {:.6} {:.6} {:.6}", r[0], r[1], r[2], r[3]);
+            }
+        }
         let mut pose = Vec::new();
         clip.sample(at.unwrap_or(0.0), &mut pose);
         for (ti, t) in clip.blocks[0].iter().enumerate() {

@@ -424,4 +424,54 @@ mod tests {
         assert_eq!(x_only_far(-2155.0), [Near, Far]);
         let _ = keys(&[]);
     }
+    /// JC2-150 spawn-load bound: how many `wc` near records (each a gameplay-enabled tile
+    /// container) the camera holds at once, over the whole world on a 256 m grid (measured: at most 9, mean 2.6). The legacy
+    /// tile set was the (2r+1)^2 = 9 tiles of the default radius 1. Prints the census.
+    #[test]
+    fn retail_wc_near_window_size_over_the_world() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = GameFs::open(dir).unwrap();
+        let registry = LocationRegistry::load(&fs).unwrap();
+        let wc: Vec<_> = registry
+            .0
+            .iter()
+            .filter(|l| l.identity.starts_with("wc/"))
+            .collect();
+        assert_eq!(wc.len(), 817);
+        let (mut max, mut sum, mut n, mut max_bytes, mut sum_bytes) =
+            (0usize, 0usize, 0usize, 0u64, 0u64);
+        let mut z = -16384.0f32;
+        while z < 16384.0 {
+            let mut x = -16384.0f32;
+            while x < 16384.0 {
+                let inside: Vec<_> = wc
+                    .iter()
+                    .filter(|l| l.contains_load(RecordKind::Near, x, z))
+                    .collect();
+                if !inside.is_empty() {
+                    let bytes: u64 = inside
+                        .iter()
+                        .filter_map(|l| fs.locate(&l.container(RecordKind::Near)))
+                        .map(|loc| loc.size)
+                        .sum();
+                    max = max.max(inside.len());
+                    sum += inside.len();
+                    n += 1;
+                    max_bytes = max_bytes.max(bytes);
+                    sum_bytes += bytes;
+                }
+                x += 256.0;
+            }
+            z += 256.0;
+        }
+        eprintln!(
+            "wc near window: {n} grid points with a record, max {max} records, mean {:.1},              max {} KiB of near containers, mean {} KiB",
+            sum as f64 / n as f64,
+            max_bytes / 1024,
+            sum_bytes / n as u64 / 1024
+        );
+        assert!(n > 0 && max == 9, "{max}");
+    }
 }

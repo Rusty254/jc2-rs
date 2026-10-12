@@ -272,6 +272,20 @@ pub fn general_vertex_colour(raw: u32) -> [f32; 4] {
     [fraction(c), fraction(c / 64.0), fraction(c / 4096.0), 1.0]
 }
 
+/// VegetationBark (32 B layout) vertex colour: the vertex shader's `frc(w * (1, 1/256, 1/65536))`
+/// on the packed float `w` of `v0` (`vegetationbark` VS, `o6`), multiplied into the diffuse by the
+/// pixel shader (`mul r1.xyz, diffuse, v6`). Alpha is not part of it.
+pub fn vegetation_bark_colour(raw: u32) -> [f32; 4] {
+    let c = f32::from_bits(raw);
+    let fraction = |v: f32| v - v.floor();
+    [
+        fraction(c),
+        fraction(c * (1.0 / 256.0)),
+        fraction(c * (1.0 / 65536.0)),
+        1.0,
+    ]
+}
+
 /// One placement from a Merged batch block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Instance {
@@ -311,6 +325,15 @@ pub fn unpack_normal(v: f32) -> ([f32; 3], f32) {
     let b1 = (i & 0xff) as f32;
     let b2 = ((i >> 8) & 0xff) as f32;
     ([b0 / 127.5 - 1.0, b1 / 127.5 - 1.0, b2 / 127.5 - 1.0], sign)
+}
+
+/// Bytes x, y, z of a packed `u32` mapped to [-1, 1] (SkinnedGeneral normal, tangent, bitangent).
+fn unpack_bytes3(v: u32) -> [f32; 3] {
+    [
+        (v & 0xff) as f32 / 127.5 - 1.0,
+        ((v >> 8) & 0xff) as f32 / 127.5 - 1.0,
+        ((v >> 16) & 0xff) as f32 / 127.5 - 1.0,
+    ]
 }
 
 fn snorm(v: i16) -> f32 {
@@ -412,6 +435,114 @@ fn read_count(r: &mut Reader, elem_size: usize) -> Result<usize> {
         )));
     }
     Ok(n)
+}
+
+/// The sibling model a Merged mode-0 block (instance list) draws from: `<stem>_base_<N>.rbm`
+/// with `N` the block's `flags` word (`params[1]`), `<stem>` the model's name without its
+/// `_batchN` / `_partN` suffix. Observed in retail: the base model's own `flags` equals its
+/// `N` and every instance range fits its index list. `None` for any other block or name.
+pub fn merged_base_name(model_name: &str, block: &RenderBlock) -> Option<String> {
+    if block.type_name != "Merged" || block.instances.is_empty() {
+        return None;
+    }
+    let lower = model_name.to_ascii_lowercase();
+    let stem_end = lower.rfind("_batch").or_else(|| lower.rfind("_part"))?;
+    let flags = *block.params.get(1)?;
+    (flags >= 0.0 && flags.fract() == 0.0).then(|| format!("{}_base_{}.rbm", &model_name[..stem_end], flags as u32))
+}
+
+/// Merged mode 0 (`*_batchN`, `*_partN`): every instance draws `extra` triangles of the base
+/// model's index list starting at index `part`, placed by its 3x4 matrix. Native draw loop of
+/// the Merged block `0x9458a0` (stride 0x34 per instance: matrix rows set as constants, then
+/// the draw call `0x9263e0` with the two `u16` fields at +0x30/+0x32 as start index and
+/// triangle count, as its other caller passes (0, triangles)); the `part`/`extra` roles are
+/// confirmed by retail data (start + 3 * count never exceeds the base model's index count,
+/// and reaches it exactly for the last range). Returns the instances as ordinary geometry,
+/// split so each block stays within 16-bit indices; instances that fall outside the base
+/// model are skipped.
+pub fn expand_merged_instances(batch: &RenderBlock, base: &RenderBlock) -> Vec<RenderBlock> {
+    let src = &base.mesh;
+    let mut out: Vec<RenderBlock> = Vec::new();
+    let fresh = || {
+        let mut b = batch.clone();
+        b.instances.clear();
+        b.mesh = MeshData::default();
+        b.params = base.params.clone();
+        b
+    };
+    let mut cur = fresh();
+    for inst in &batch.instances {
+        let start = inst.part as usize;
+        let end = start + inst.extra as usize * 3;
+        if end > src.indices.len() {
+            continue;
+        }
+        let m = &inst.matrix;
+        let place = |p: [f32; 3]| {
+            [
+                m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
+                m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7],
+                m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11],
+            ]
+        };
+        let turn = |n: [f32; 3]| {
+            [
+                m[0] * n[0] + m[1] * n[1] + m[2] * n[2],
+                m[4] * n[0] + m[5] * n[1] + m[6] * n[2],
+                m[8] * n[0] + m[9] * n[1] + m[10] * n[2],
+            ]
+        };
+        let tris = &src.indices[start..end];
+        if cur.mesh.positions.len() + tris.len() > u16::MAX as usize {
+            out.push(std::mem::replace(&mut cur, fresh()));
+        }
+        // one copy of each distinct source vertex per instance
+        let mut remap = std::collections::HashMap::new();
+        for &i in tris {
+            let i = i as usize;
+            let to = *remap.entry(i).or_insert_with(|| {
+                let n = cur.mesh.positions.len() as u16;
+                cur.mesh.positions.push(place(src.positions[i]));
+                if let Some(v) = src.normals.get(i) {
+                    cur.mesh.normals.push(turn(*v));
+                }
+                if let Some(v) = src.uv0.get(i) {
+                    cur.mesh.uv0.push(*v);
+                }
+                if let Some(v) = src.uv1.get(i) {
+                    cur.mesh.uv1.push(*v);
+                }
+                n
+            });
+            cur.mesh.indices.push(to);
+        }
+    }
+    if !cur.mesh.indices.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The model-space bounds in an `.rbm` header, without reading its blocks.
+pub fn header_bounds(data: &[u8]) -> Result<([f32; 3], [f32; 3])> {
+    let mut r = Reader::new(data);
+    let ml = r.u32()?;
+    let endian = if ml == 5 {
+        Endian::Little
+    } else if ml.swap_bytes() == 5 {
+        Endian::Big
+    } else {
+        return Err(Error::format("not an RBMDL file"));
+    };
+    if r.bytes(5)? != b"RBMDL" {
+        return Err(Error::format("not an RBMDL file (magic)"));
+    }
+    r.endian = endian;
+    r.bytes(12)?;
+    Ok((
+        [r.f32()?, r.f32()?, r.f32()?],
+        [r.f32()?, r.f32()?, r.f32()?],
+    ))
 }
 
 impl RbmModel {
@@ -823,22 +954,36 @@ fn parse_skinned_general(r: &mut Reader) -> Result<RenderBlock> {
         ]);
         local_joints.push([j[0], j[1], j[2], j[3]]);
         if big {
-            r.bytes(8)?;
+            // "big" vertices (`0x80000`: Rico's head, neck and chest skin) keep their four
+            // batch-local bone indices in the FIRST four of these eight bytes (retail Rico:
+            // the four bytes after the weights are identical for every vertex and would bind
+            // the whole head rigidly to one bone; the first four extra bytes pair with the
+            // weights, a zero weight with index 0 or 13). The other eight bytes (four after
+            // the weights, four after the indices) are unknown (gap, `rbm.md`).
+            let e = r.bytes(8)?;
+            let last = local_joints.len() - 1;
+            local_joints[last] = [e[0], e[1], e[2], e[3]];
         }
     }
     let n1 = read_count(r, 20)?;
     for _ in 0..n1 {
         let n = r.u32()?;
-        let _t = r.u32()?;
-        let _bt = r.u32()?;
+        let t = r.u32()?;
+        let bt = r.u32()?;
         b.mesh.uv0.push([r.f32()?, r.f32()?]);
         // bytes x,y,z of the u32 map to [-1,1]
-        let nn = [
-            (n & 0xff) as f32 / 127.5 - 1.0,
-            ((n >> 8) & 0xff) as f32 / 127.5 - 1.0,
-            ((n >> 16) & 0xff) as f32 / 127.5 - 1.0,
-        ];
+        let nn = unpack_bytes3(n);
         b.mesh.normals.push(nn);
+        // tangent frame (board 2280444f): handedness from the stored bitangent, B = sign * N x T
+        let tt = unpack_bytes3(t);
+        let bb = unpack_bytes3(bt);
+        let cross = [
+            nn[1] * tt[2] - nn[2] * tt[1],
+            nn[2] * tt[0] - nn[0] * tt[2],
+            nn[0] * tt[1] - nn[1] * tt[0],
+        ];
+        let sign = if cross[0] * bb[0] + cross[1] * bb[1] + cross[2] * bb[2] < 0.0 { -1.0 } else { 1.0 };
+        b.mesh.tangents.push([tt[0], tt[1], tt[2], sign]);
     }
     // skin batches: a run of faces and the skeleton bones their local indices mean
     let batches = r.i32()?.max(0) as usize;
@@ -857,6 +1002,7 @@ fn parse_skinned_general(r: &mut Reader) -> Result<RenderBlock> {
     if n1 != n0 {
         b.mesh.uv0.clear();
         b.mesh.normals.clear();
+        b.mesh.tangents.clear();
     }
     // resolve the local joints through the batch each vertex is drawn by
     let mut joints = vec![[0u16; 4]; n0];
@@ -958,7 +1104,14 @@ fn parse_window(r: &mut Reader) -> Result<RenderBlock> {
 
 /// VegetationBark v0: trunks and rocks. u32 flags; material; vertices; faces
 /// flags & 4 == 0 (40 B): f32 x y z; f32 u0 v0 (tiling bark); f32 u1 v1; packed normal, tangent, bitangent
-/// flags & 4 != 0 (32 B): f32 x y z; packed normal, tangent, bitangent; f32 u v
+/// flags & 4 != 0 (32 B): f32 x y z; **packed colour**, packed normal, packed tangent (sign = bitangent sign); f32 u v
+///
+/// The 32 B order is the input layout of the native `vegetationbark` vertex shader (JC2-lighting
+/// research `research/formats/lighting-gaps-next.md`): `v0 = (x y z, w)` with `w` the packed vertex colour
+/// (`frc(w * (1, 1/256, 1/65536))`), `v1 = (packed normal -> o9, packed tangent with sign -> o7 / o8, u, v)`.
+/// Checked on the retail Jungle canopy trunks: the second packed float agrees with the geometric normal
+/// (median |dot| 0.87 to 0.997 over four blocks), the first does not (0.44 to 0.56) and its decoded colour
+/// spans 0.28..1.0. Earlier code read the colour as the normal and the normal as the tangent.
 fn parse_vegetation_bark(r: &mut Reader) -> Result<RenderBlock> {
     let version = r.u8()?;
     if version != 0 {
@@ -985,9 +1138,9 @@ fn parse_vegetation_bark(r: &mut Reader) -> Result<RenderBlock> {
         let n = read_count(r, 32)?;
         for _ in 0..n {
             b.mesh.positions.push([r.f32()?, r.f32()?, r.f32()?]);
+            b.mesh.packed_colours.push(r.f32()?.to_bits());
             let (nn, _) = unpack_normal(r.f32()?);
             let (t, sg) = unpack_normal(r.f32()?);
-            let _bt = r.f32()?;
             b.mesh.uv0.push([r.f32()?, r.f32()?]);
             b.mesh.normals.push(nn);
             b.mesh.tangents.push([t[0], t[1], t[2], sg]);
@@ -1019,10 +1172,18 @@ fn parse_vegetation_foliage(r: &mut Reader) -> Result<RenderBlock> {
         b.mesh.uv0.push([r.f32()?, r.f32()?]);
         b.mesh.uv1.push([r.f32()?, r.f32()?]);
         let (nn, _) = unpack_normal(r.f32()?);
-        let (t, sg) = unpack_normal(r.f32()?);
-        let _bt = r.f32()?;
+        let (t, _) = unpack_normal(r.f32()?);
+        let (bt, _) = unpack_normal(r.f32()?);
+        // The VS (`vegetationfoliage`) decodes tangent and bitangent as two independent packed vectors
+        // (o3, o4); Bevy rebuilds B = w * cross(N, T), so w is the handedness of the stored bitangent.
+        let c = [
+            nn[1] * t[2] - nn[2] * t[1],
+            nn[2] * t[0] - nn[0] * t[2],
+            nn[0] * t[1] - nn[1] * t[0],
+        ];
+        let w = if c[0] * bt[0] + c[1] * bt[1] + c[2] * bt[2] < 0.0 { -1.0 } else { 1.0 };
         b.mesh.normals.push(nn);
-        b.mesh.tangents.push([t[0], t[1], t[2], sg]);
+        b.mesh.tangents.push([t[0], t[1], t[2], w]);
     }
     b.mesh.indices = read_faces(r)?;
     Ok(b)
@@ -1030,7 +1191,10 @@ fn parse_vegetation_foliage(r: &mut Reader) -> Result<RenderBlock> {
 
 /// BillboardFoliage v0: camera-facing canopy sprites. material; 28 B vertices: f32 centre x y z; f32 u v;
 /// f32 offset x y (corner offset in view space); faces. Positions here are the centres plus the
-/// offset applied in the XY plane so the quads at least have area without a billboard shader.
+/// offset applied in the XY plane so the bounds and the legacy route have area; `uv1` carries
+/// the corner offset itself (the native vertex input `v1.zw`), so the centre is
+/// `position - (uv1, 0)` and the native vertex shader (`foliage_billboard.wgsl`) can rebuild
+/// the camera-facing card.
 fn parse_billboard_foliage(r: &mut Reader) -> Result<RenderBlock> {
     let version = r.u8()?;
     if version != 0 {
@@ -1047,6 +1211,7 @@ fn parse_billboard_foliage(r: &mut Reader) -> Result<RenderBlock> {
         let (ox, oy) = (r.f32()?, r.f32()?);
         b.mesh.positions.push([x + ox, y + oy, z]);
         b.mesh.uv0.push(uv);
+        b.mesh.uv1.push([ox, oy]);
     }
     b.mesh.indices = read_faces(r)?;
     b.extra_attribute_streams = 1;
@@ -1178,6 +1343,226 @@ mod tests {
         );
     }
 
+    /// Board 2280444f (`rico-model-detail.md`): every Rico `SkinnedGeneral` vertex carries a unit tangent
+    /// orthogonal to its normal and a handedness sign.
+    #[test]
+    fn rico_skinned_general_tangents_are_decoded() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let bytes = fs.read_inflated("mc01_lod1-rico.rbm").unwrap();
+        let model = RbmModel::parse(&bytes).unwrap();
+        assert_eq!(model.blocks.len(), 16);
+        for block in &model.blocks {
+            let m = &block.mesh;
+            assert_eq!(m.tangents.len(), m.positions.len());
+            // individual vertices may be off (up to ~0.4 seen); the mean is what the shader frame needs
+            let mut sum_dot = 0.0;
+            for (t, n) in m.tangents.iter().zip(&m.normals) {
+                let len = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+                assert!((0.9..1.1).contains(&len), "tangent length {len}");
+                sum_dot += (t[0] * n[0] + t[1] * n[1] + t[2] * n[2]).abs();
+                assert!(t[3] == 1.0 || t[3] == -1.0);
+            }
+            assert!(sum_dot / (m.tangents.len() as f32) < 0.05, "mean |T.N| {}", sum_dot / m.tangents.len() as f32);
+        }
+    }
+
+    /// Lighting research (7625eb04): the VegetationFoliage tangent follows the UV u direction (the
+    /// native normal map basis is the stored tangent/bitangent pair) and the handedness `w` derived
+    /// from the stored bitangent is consistent with the UV layout (always opposite to the sign of
+    /// `cross(N, T) . dP/dv`, the v axis running down the image).
+    #[test]
+    fn jungle_vegetation_foliage_basis_follows_the_uv_layout() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let bytes = fs.read_inflated("vegetation_0.blz").unwrap();
+        let archive = crate::sarc::SmallArchive::parse(&bytes).unwrap();
+        for name in ["jungle_T16_palmCLL_LOD1-Whole.rbm"] {
+            let model = RbmModel::parse(archive.data(&bytes, archive.get(name).unwrap()).unwrap()).unwrap();
+            for block in &model.blocks {
+                if block.type_name != "VegetationFoliage" {
+                    continue;
+                }
+                let m = &block.mesh;
+                let n = m.positions.len();
+                let mut dpdu = vec![[0.0f32; 3]; n];
+                let mut dpdv = vec![[0.0f32; 3]; n];
+                for t in m.indices.as_chunks::<3>().0 {
+                    let i = [t[0] as usize, t[1] as usize, t[2] as usize];
+                    let e1: Vec<f32> = (0..3).map(|k| m.positions[i[1]][k] - m.positions[i[0]][k]).collect();
+                    let e2: Vec<f32> = (0..3).map(|k| m.positions[i[2]][k] - m.positions[i[0]][k]).collect();
+                    let (du1, dv1) = (m.uv0[i[1]][0] - m.uv0[i[0]][0], m.uv0[i[1]][1] - m.uv0[i[0]][1]);
+                    let (du2, dv2) = (m.uv0[i[2]][0] - m.uv0[i[0]][0], m.uv0[i[2]][1] - m.uv0[i[0]][1]);
+                    let det = du1 * dv2 - du2 * dv1;
+                    if det.abs() < 1e-12 {
+                        continue;
+                    }
+                    for k in 0..3 {
+                        let pu = (e1[k] * dv2 - e2[k] * dv1) / det;
+                        let pv = (e2[k] * du1 - e1[k] * du2) / det;
+                        for &v in &i {
+                            dpdu[v][k] += pu;
+                            dpdv[v][k] += pv;
+                        }
+                    }
+                }
+                let dot = |a: &[f32; 3], b: &[f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+                let norm = |a: [f32; 3]| {
+                    let l = dot(&a, &a).sqrt().max(1e-9);
+                    [a[0] / l, a[1] / l, a[2] / l]
+                };
+                let (mut tu, mut tn, mut pos, mut neg, mut agree_w) = (0.0f64, 0.0f64, 0, 0, 0);
+                for v in 0..n {
+                    let t = [m.tangents[v][0], m.tangents[v][1], m.tangents[v][2]];
+                    let nn = m.normals[v];
+                    tn += dot(&t, &nn).abs() as f64;
+                    let du = norm(dpdu[v]);
+                    let d = dot(&t, &du);
+                    tu += d as f64;
+                    if d > 0.0 { pos += 1 } else { neg += 1 }
+                    // handedness of the uv map vs w
+                    let c = [
+                        nn[1] * t[2] - nn[2] * t[1],
+                        nn[2] * t[0] - nn[0] * t[2],
+                        nn[0] * t[1] - nn[1] * t[0],
+                    ];
+                    let dv = dpdv[v];
+                    let hand = if dot(&c, &dv) >= 0.0 { 1.0 } else { -1.0 };
+                    if hand == m.tangents[v][3] { agree_w += 1 }
+                }
+                assert_eq!(block.material.normal, "jungle_fanpalm_foliage_nrm.dds");
+                assert_eq!(block.material.properties, "dummy_foliage128_aoc.dds", "t2 = the properties slot");
+                assert!(tn / (n as f64) < 0.05, "{name}: tangent is not orthogonal to the normal");
+                assert!(tu / (n as f64) > 0.95 && neg == 0, "{name}: tangent does not follow dP/du ({pos}/{neg})");
+                assert_eq!(agree_w, 0, "{name}: the stored-bitangent handedness is inconsistent with the UV layout");
+            }
+        }
+    }
+
+    #[test]
+    fn vegetation_bark_colour_is_the_vertex_shader_fraction_chain() {
+        // frc(w * (1, 1/256, 1/65536)): 0.5 + 3 / 256 in the second byte, 2 / 65536 in the third
+        let w: f32 = 515.5;
+        let c = vegetation_bark_colour(w.to_bits());
+        assert_eq!(c[0], 0.5);
+        assert!((c[1] - (515.5f32 / 256.0).fract()).abs() < 1e-6);
+        assert!((c[2] - (515.5f32 / 65536.0).fract()).abs() < 1e-6);
+        assert_eq!(c[3], 1.0);
+    }
+
+    /// BillboardFoliage (f012a36f): every card is four vertices that share one centre
+    /// (`position - uv1`) and whose offsets are the four corners of a rectangle; the native loader
+    /// (`0x960490`) averages the centres into block +0x28 (the vertex shader's `cb2[5].xyz`).
+    #[test]
+    fn jungle_billboard_foliage_cards_share_a_centre_and_carry_corner_offsets() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            eprintln!("SKIP jungle billboard: JC2_TEST_DIR absent");
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let bytes = fs.read_inflated("vegetation_0.blz").unwrap();
+        let archive = crate::sarc::SmallArchive::parse(&bytes).unwrap();
+        let model = RbmModel::parse(
+            archive
+                .data(
+                    &bytes,
+                    archive.get("Jungle_T02_CanopyM_LOD1-Whole.rbm").unwrap(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let mut seen = 0;
+        for block in model.blocks.iter().filter(|b| b.type_name == "BillboardFoliage") {
+            let m = &block.mesh;
+            assert_eq!(m.uv1.len(), m.positions.len());
+            assert_eq!(m.positions.len() % 4, 0, "cards are four vertices");
+            for quad in 0..m.positions.len() / 4 {
+                let centre = |i: usize| {
+                    let (p, o) = (m.positions[i], m.uv1[i]);
+                    [p[0] - o[0], p[1] - o[1], p[2]]
+                };
+                let c0 = centre(quad * 4);
+                let mut corners = std::collections::BTreeSet::new();
+                for k in 0..4 {
+                    let c = centre(quad * 4 + k);
+                    for a in 0..3 {
+                        assert!((c[a] - c0[a]).abs() < 1e-3, "quad {quad} centre differs");
+                    }
+                    let o = m.uv1[quad * 4 + k];
+                    assert!(o[0].abs() > 1e-4 && o[1].abs() > 1e-4, "{o:?}");
+                    corners.insert((o[0] > 0.0, o[1] > 0.0));
+                }
+                assert_eq!(corners.len(), 4, "quad {quad}: one vertex per corner");
+            }
+            seen += 1;
+        }
+        assert!(seen > 0, "the canopy model has billboard blocks");
+    }
+
+    /// Lighting research (f3772304): the 32-byte VegetationBark layout is `x y z, colour, normal,
+    /// tangent, u, v` (the native `vegetationbark` vertex shader's input order). The decoded normal must
+    /// follow the triangles' geometric normal, the colour must be a baked darkening factor in 0.2..1.
+    #[test]
+    fn jungle_vegetation_bark_32_byte_layout_normal_follows_geometry() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            eprintln!("SKIP jungle bark: JC2_TEST_DIR absent");
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let bytes = fs.read_inflated("vegetation_0.blz").unwrap();
+        let archive = crate::sarc::SmallArchive::parse(&bytes).unwrap();
+        let model = RbmModel::parse(
+            archive
+                .data(
+                    &bytes,
+                    archive.get("Jungle_T02_CanopyM_LOD1-Whole.rbm").unwrap(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let block = &model.blocks[1];
+        assert_eq!(block.type_name, "VegetationBark");
+        assert_eq!(block.params[0] as u32 & 4, 4, "the 32-byte layout");
+        let m = &block.mesh;
+        assert_eq!(m.packed_colours.len(), m.positions.len());
+        // accumulate area-weighted face normals
+        let mut geo = vec![[0.0f32; 3]; m.positions.len()];
+        for t in m.indices.as_chunks::<3>().0 {
+            let p = |i: u16| m.positions[i as usize];
+            let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            for i in t {
+                for k in 0..3 {
+                    geo[*i as usize][k] += n[k];
+                }
+            }
+        }
+        let mut dots: Vec<f32> = geo
+            .iter()
+            .zip(&m.normals)
+            .map(|(g, n)| {
+                let l = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-9);
+                (g[0] * n[0] + g[1] * n[1] + g[2] * n[2]).abs() / l
+            })
+            .collect();
+        dots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(dots[dots.len() / 2] > 0.9, "median |dot| {}", dots[dots.len() / 2]);
+        for raw in &m.packed_colours {
+            let c = vegetation_bark_colour(*raw);
+            assert!(c[..3].iter().all(|v| (0.2..=1.0).contains(v)), "{c:?}");
+        }
+    }
+
     #[test]
     fn original_general_hook_and_opaque_crate_headers_colours_and_textures() {
         let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
@@ -1279,5 +1664,66 @@ mod tests {
     fn rejects_non_rbm() {
         assert!(!is_rbm(b"DDS "));
         assert!(RbmModel::parse(b"\x05\x00\x00\x00RBMDLxxxx").is_err());
+    }
+
+    /// Retail: every Merged mode-0 instance of every metropolis far container fits its
+    /// `*_base_N` model's index list (start + 3 * count <= index count), which fixes the
+    /// roles of the two `u16` fields, and the expansion yields geometry.
+    #[test]
+    fn retail_merged_instances_are_index_ranges_of_their_base() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let (mut models, mut instances) = (0, 0);
+        for l in fs.entries() {
+            let Some(name) = fs.names.file(l.name_hash) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if !lower.contains("metropolis") || !lower.ends_with(".flz") {
+                continue;
+            }
+            let data = fs.read_inflated(name).unwrap();
+            let sarc = crate::sarc::SmallArchive::parse(&data).unwrap();
+            let read = |n: &str| {
+                let m = sarc.get(n)?;
+                let raw = crate::compress::maybe_inflate(sarc.data(&data, m).ok()?).ok()?;
+                RbmModel::parse(&raw).ok()
+            };
+            for e in &sarc.entries {
+                if !e.name.ends_with(".rbm") {
+                    continue;
+                }
+                let model = read(&e.name).unwrap();
+                for block in &model.blocks {
+                    let Some(base_name) = merged_base_name(&e.name, block) else {
+                        continue;
+                    };
+                    let base = read(&base_name).unwrap_or_else(|| panic!("{name}: {base_name}"));
+                    let base = &base.blocks[0];
+                    for i in &block.instances {
+                        assert!(
+                            i.part as usize + 3 * i.extra as usize <= base.mesh.indices.len(),
+                            "{name}/{}",
+                            e.name
+                        );
+                    }
+                    let out = expand_merged_instances(block, base);
+                    let tris: usize = out.iter().map(|b| b.mesh.indices.len() / 3).sum();
+                    assert_eq!(
+                        tris,
+                        block
+                            .instances
+                            .iter()
+                            .map(|i| i.extra as usize)
+                            .sum::<usize>()
+                    );
+                    models += 1;
+                    instances += block.instances.len();
+                }
+            }
+        }
+        assert!(models > 1000 && instances > 10000, "{models} {instances}");
     }
 }

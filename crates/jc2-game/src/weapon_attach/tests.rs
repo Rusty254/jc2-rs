@@ -454,6 +454,8 @@ fn rico_guns_follow_the_native_slots() {
         q.iter(app.world())
             .any(|g| g.slot == slot && g.stow == Stow::Hand)
     };
+    // he starts holstered; draw the pistol
+    app.world_mut().resource_mut::<crate::combat::Arsenal>().drawn = true;
     crate::fleet::testing::wait_until(&mut app, "the pistol in his hand", |app| held(app, 0));
     app.world_mut().resource_mut::<StowSmoothing>().enabled = false;
     for _ in 0..5 {

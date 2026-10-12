@@ -88,6 +88,35 @@ pub enum ModifierKind {
     Damping(f32),
     Unsupported,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RenderFlags {
+    pub additive_hint: bool,
+    pub bit6: bool,
+    pub distortion: bool,
+    /// Flag bit12 `#a1028df6`: the quad's long axis follows the screen velocity (doc
+    /// `particle-units-next.md` section 6, native `0xa5bc30`).
+    pub align_velocity: bool,
+}
+/// The emitter fields of a leaf (`0xa5a2d0` / `0xa5a4e0`, doc `particle-units-next.md` section 3).
+/// A leaf without the shape field `#89c42bb5` never reads its emitter node, so it keeps the
+/// constructor defaults (`0xa54830`): 30 births per second, no angles, speed 0.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Emission {
+    /// Births per second.
+    pub rate: f32,
+    /// Emitter shape (`#89c42bb5`): 0 point, 3 box, 4 radial disc, 5 sphere shell.
+    pub shape: Option<i32>,
+    /// `[base, variation]` in radians: `ax = signed * variation + base`.
+    pub pitch: [f32; 2],
+    pub yaw: [f32; 2],
+    /// `[base, variation]` in m/s, clamped to `[-128, 127]` after the draw.
+    pub speed: [f32; 2],
+    /// Birth offset (`#5c50f180`, `offset_y`, `#de1afd07`).
+    pub offset: [f32; 3],
+    /// Shape 3: box extents (`#11b73cc0`, `#d2cbd704`, `#2a2907f2`); shapes 4/5: inner radius,
+    /// outer radius, height (`#c2826ce3`, `#7c01072c`, `#d2cbd704`). Defaults 0, 10, 10.
+    pub shape_params: [f32; 3],
+}
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ParticleSystem {
     pub raw: PropertyFile,
@@ -96,13 +125,37 @@ pub struct ParticleSystem {
     pub lifetime: f32,
     pub system_lifetime: f32,
     pub emission_rate: f32,
-    /// Shape/direction consumers are not yet implemented.
+    /// Raw `[velocity, variation]` of the emitter node (see [`Emission`] for the effective values).
     pub emission_speed: [f32; 2],
+    pub emission: Emission,
+    /// Initial particle colour `(#99030548, #b3c17b1d, #25e4e2ca)` (default 1).
+    pub colour: [f32; 3],
+    /// Velocity stretch `(#b8fd2b9e base, #b294c343 max, #4f2b9eee per m/s)`, defaults `(1, 1, 0)`.
+    pub stretch: [f32; 3],
+    /// Maximum draw / emit distance `#d1e88637` (default 800 m).
+    pub max_distance: f32,
+    /// Near fade `(#c9a96718 start, #5af3683a length)` in metres; both 0 = none.
+    pub near_fade: [f32; 2],
     pub emitter: Node,
     /// Native loader +168/+16a, used as inverse UV dimensions by FUN_00a5b430.
     pub atlas: [u16; 2],
     pub child_link: Option<String>,
+    /// Every named follow-on system of this leaf: `linked_system_N` for N = 0, 1, 2, ... until the
+    /// first missing one (native `0xa71720`; 12 for `fx_exp_grenade_01`, up to 33 in retail). All
+    /// of them start with the parent (`0xa6d290`).
+    pub children: Vec<String>,
+    /// Per-particle trail system `#1de3fca7` (native leaf+0xc, flag bit 14; 273 retail leaves,
+    /// `0xa6e2f0`): every particle born gets its own emitter of this system that follows it. The
+    /// key's spelling is unresolved (the hash is proven).
+    pub trail: Option<String>,
+    /// The leaf names `mesh_N` / `physics_N` debris slots (`0xa71720`): the capacity is then at most
+    /// 150.
+    pub debris_slots: bool,
     pub initial_alpha: f32,
+    /// Initial emissive `#24683665` (native root `+0xce`, a clamped `ushort / 65535`, default 0: `0xa62710`
+    /// zero-stores it; loader `0xa71720`), copied to the particle at birth
+    /// (`0xa5a4e0`: `ushort(+0xbe) * 1.5259022e-05`) and uploaded as `cb1[3k+2].z`.
+    pub initial_emissive: f32,
     /// Native birth size = base + uniform01 * range, not symmetric variation.
     pub initial_size: [f32; 2],
     pub initial_frame: [f32; 2],
@@ -115,6 +168,25 @@ pub struct ParticleSystem {
     /// Native indexed effect_N order, or visual_effect_N then physical_effect_N
     /// only when effect_0 is absent. Raw unmatched children remain in `raw`.
     pub execution_order: Vec<u32>,
+}
+/// Key `#1de3fca7`: the per-particle trail system name (leaf+0xc).
+pub const TRAIL_SYSTEM_HASH: u32 = 0x1de3fca7;
+/// Key `#d1e88637`: the birth cull distance in metres (leaf+0x160, default 800).
+pub const CULL_DISTANCE_HASH: u32 = 0xd1e88637;
+/// Variation key `#b0124c0a` of an effect's particle component: the flags byte whose bit 0 lets
+/// the emitter release itself (`0x005b9960`, default 1).
+pub const RELEASE_FLAG_HASH: u32 = 0xb0124c0a;
+
+/// Hash of the property `linked_system_N` (`0xa71720` builds the name with `sprintf`; N = 0 is
+/// `#841408bf`, 1 is `#f47c95e6`, ...).
+pub fn linked_system_hash(n: usize) -> u32 {
+    crate::hash::hash_str(&format!("linked_system_{n}"))
+}
+fn number_or(n: &Node, hash: u32, default: f32) -> f32 {
+    match n.value_hash(hash) {
+        Some(Variant::Float(f)) if f.is_finite() => *f,
+        _ => default,
+    }
 }
 fn integer(n: &Node, hash: u32) -> Result<i32> {
     match n.value_hash(hash) {
@@ -167,8 +239,10 @@ impl ParticleSystem {
         }
         let lifetime = number(n, 0xbc4e9cf9)?;
         let system_lifetime = number(n, 0x79c213bb)?;
-        if lifetime <= 0.0 || system_lifetime < 0.0 {
-            return Err(Error::format("invalid particle lifetime"));
+        // The base lifetime may be non-positive (30 retail leaves): the per-particle value is
+        // clamped to [0.001, 10000] after the variation draw (`0xa5ca60`).
+        if system_lifetime < 0.0 {
+            return Err(Error::format("invalid particle system lifetime"));
         }
         let mut modifiers = Vec::new();
         for (key, child) in &n.children {
@@ -238,29 +312,103 @@ impl ParticleSystem {
             ));
         }
         let initial_alpha = number(n, 0x4885935d)?.clamp(0.0, 1.0);
+        let initial_emissive = number_or(n, 0x24683665, 0.0).clamp(0.0, 1.0);
         let max_particles = integer(n, 0x74175c29)?;
         if !(0..=32767).contains(&max_particles) {
             return Err(Error::format(
                 "particle capacity outside native signed-short range",
             ));
         }
+        let shape = match n.value_hash(0x89c42bb5) {
+            Some(Variant::Int(v)) => Some(*v),
+            _ => None,
+        };
+        let emission = if shape.is_some() {
+            let box_shape = shape == Some(3);
+            let p = |h| number_or(&emitter, h, 0.0);
+            Emission {
+                rate: emission_rate,
+                shape,
+                pitch: [p(0x8391b740), p(0xbedbc04d)],
+                yaw: [p(0xdf6a7f80), p(0x815d0180)],
+                speed: [p(0xe4021a11), p(0x38d18085)],
+                offset: [p(0x5c50f180), p(0x90e04ae5), p(0xde1afd07)],
+                shape_params: if box_shape {
+                    [
+                        number_or(&emitter, 0x11b73cc0, 0.0),
+                        number_or(&emitter, 0xd2cbd704, 10.0),
+                        number_or(&emitter, 0x2a2907f2, 10.0),
+                    ]
+                } else {
+                    [
+                        number_or(&emitter, 0xc2826ce3, 0.0),
+                        number_or(&emitter, 0x7c01072c, 10.0),
+                        number_or(&emitter, 0xd2cbd704, 10.0),
+                    ]
+                },
+            }
+        } else {
+            Emission {
+                rate: 30.0,
+                shape: None,
+                pitch: [0.0; 2],
+                yaw: [0.0; 2],
+                speed: [0.0; 2],
+                offset: [0.0; 3],
+                shape_params: [0.0, 10.0, 10.0],
+            }
+        };
+        let mut children = Vec::new();
+        for index in 0..256 {
+            match n.value_hash(linked_system_hash(index)) {
+                Some(Variant::Str(s)) => children.push(s.clone()),
+                _ => break,
+            }
+        }
+        let trail = match n.value_hash(TRAIL_SYSTEM_HASH) {
+            Some(Variant::Str(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        };
+        // retail slots are numbered from 2 (`mesh_2` .. `mesh_8`, `physics_2` .. `physics_8`)
+        let debris_slots = (0..40).any(|i| {
+            ["mesh_", "physics_"]
+                .iter()
+                .any(|p| n.value_hash(crate::hash::hash_str(&format!("{p}{i}"))).is_some())
+        });
         Ok(Self {
+            trail,
+            debris_slots,
             name: string(n, 0xd31ab684)?,
             texture: string(n, 0xfbdb7d47)?,
             child_link: match n.value_hash(0x841408bf) {
                 Some(Variant::Str(s)) => Some(s.clone()),
                 _ => None,
             },
+            children,
             atlas,
             lifetime,
             system_lifetime,
             emission_rate,
             emission_speed: [number(&emitter, 0xe4021a11)?, number(&emitter, 0x38d18085)?],
+            emission,
+            colour: [
+                number_or(n, 0x99030548, 1.0),
+                number_or(n, 0xb3c17b1d, 1.0),
+                number_or(n, 0x25e4e2ca, 1.0),
+            ],
+            stretch: [
+                number_or(n, 0xb8fd2b9e, 1.0),
+                number_or(n, 0xb294c343, 1.0),
+                number_or(n, 0x4f2b9eee, 0.0),
+            ],
+            max_distance: number_or(n, CULL_DISTANCE_HASH, 800.0),
+            near_fade: [number_or(n, 0xc9a96718, 0.0), number_or(n, 0x5af3683a, 0.0)],
             emitter,
             modifiers,
             execution_order,
             // Native root+cc quantization, consumed as ushort/65535 at birth.
             initial_alpha: (initial_alpha * 65535.0) as u16 as f32 / 65535.0,
+            initial_emissive: (initial_emissive * 65535.0) as u16 as f32 * 1.525_902_2e-5,
             initial_size: [number(n, 0xef05f293)?, number(n, 0xadeb7b1a)?],
             initial_frame: frame.map(|v| (v as i32) as i16 as f32),
             space: integer(n, 0x562663c7)?,
@@ -268,6 +416,21 @@ impl ParticleSystem {
             max_particles: max_particles as i16,
             raw,
         })
+    }
+    /// Root render flag ints. `distortion` (#71feec86, native render flags bit13) is set on all
+    /// 129 leaves that use a normal-map texture (`distort_normal`, `spherify_*normal`) and on no
+    /// other. `additive_hint` (#27230869, bit7) is **inferred**: it is set on every leaf of the
+    /// glow textures (`flare`, `muzzleflashes`, `spark_dif`, `lightningbolt`, `gradient`) and on
+    /// 80 of 117 fire leaves; the native blend routine is not traced for this bit.
+    pub fn render_flags(&self) -> RenderFlags {
+        let n = &self.raw.nodes[0];
+        let g = |h| matches!(n.value_hash(h), Some(Variant::Int(v)) if *v != 0);
+        RenderFlags {
+            additive_hint: g(0x27230869),
+            bit6: g(0x59d9aeb9),
+            distortion: g(0x71feec86),
+            align_velocity: g(0xa1028df6),
+        }
     }
     pub fn execution_modifiers(&self) -> impl Iterator<Item = &Modifier> {
         self.execution_order
@@ -467,5 +630,75 @@ mod tests {
                 .unwrap();
         rate.1 = Variant::Float(f32::NAN);
         assert!(ParticleSystem::parse(&corrupt.to_bytes()).is_err());
+    }
+    #[test]
+    fn linked_system_names_enumerate_until_the_first_gap() {
+        // the first twelve hashes of doc particle-units-next.md section 5
+        let known = [
+            0x841408bf_u32, 0xf47c95e6, 0x02bcc1f0, 0x00e0c94d, 0x0f6944c8, 0x92010226,
+            0x84401592, 0x5de2258b, 0xee3aea16, 0xe32a9c36, 0xb1334086, 0xb71ac6b5,
+        ];
+        for (n, h) in known.iter().enumerate() {
+            assert_eq!(linked_system_hash(n), *h, "linked_system_{n}");
+        }
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            eprintln!("SKIP linked systems: JC2_TEST_DIR absent");
+            return;
+        };
+        let fs = GameFs::open(dir).unwrap();
+        let blob = fs.read_inflated("particles.blz").unwrap();
+        let a = crate::sarc::SmallArchive::parse(&blob).unwrap();
+        let get = |name: &str| {
+            let e = a.get(&format!("{name}.psmb")).unwrap();
+            ParticleSystem::parse(a.data(&blob, e).unwrap()).unwrap()
+        };
+        let grenade = get("fx_exp_grenade_01");
+        assert_eq!(grenade.children.len(), 12);
+        assert_eq!(grenade.children[11], "fx_exp_grenade_13");
+        assert_eq!(grenade.children[0], "fx_exp_grenade_02");
+        let (mut most, mut shapeless) = (0, 0);
+        for e in a.entries.iter().filter(|e| e.name.ends_with(".psmb")) {
+            if let Ok(s) = ParticleSystem::parse(a.data(&blob, e).unwrap()) {
+                most = most.max(s.children.len());
+                shapeless += usize::from(s.emission.shape.is_none());
+            }
+        }
+        eprintln!("most linked systems {most}, shapeless leaves {shapeless}");
+        assert_eq!(most, 33);
+        // a leaf with a non-positive base lifetime now parses
+        let trail = get("fx_fire_car_trail_05");
+        assert!(trail.lifetime <= 0.0);
+    }
+    #[test]
+    fn every_retail_particle_system_parses() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            eprintln!("SKIP retail particle systems: JC2_TEST_DIR absent");
+            return;
+        };
+        let fs = GameFs::open(dir).unwrap();
+        let blob = fs.read_inflated("particles.blz").unwrap();
+        let a = crate::sarc::SmallArchive::parse(&blob).unwrap();
+        let (mut ok, mut bad) = (0, Vec::new());
+        let mut distortion = 0;
+        for e in a.entries.iter().filter(|e| e.name.ends_with(".psmb")) {
+            match ParticleSystem::parse(a.data(&blob, e).unwrap()) {
+                Ok(s) => {
+                    ok += 1;
+                    let normal_map = s.texture.contains("normal");
+                    assert_eq!(s.render_flags().distortion, normal_map, "{}", e.name);
+                    distortion += usize::from(normal_map);
+                }
+                Err(err) => bad.push(format!("{}: {err}", e.name)),
+            }
+        }
+        eprintln!("particle systems parsed {ok}, failed {}", bad.len());
+        for b in bad.iter().take(15) {
+            eprintln!("  {b}");
+        }
+        // 9 retail leaves are not parseable (no texture string); the 30 leaves with a non-positive
+        // base lifetime that have one parse since dc95ceb0 (the per-particle lifetime is clamped at
+        // birth).
+        assert_eq!((ok, bad.len()), (2591, 9));
+        assert_eq!(distortion, 129);
     }
 }

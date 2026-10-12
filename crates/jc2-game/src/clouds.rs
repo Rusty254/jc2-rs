@@ -1,13 +1,9 @@
-//! The sky above the camera: a gradient dome, stars, the moon with its halo, the sun's
-//! glow, a field of cumulus cards and a high layer of cirrus (`research/formats/weather.md`).
+//! The sky above the camera: the moon with its halo, a field of cumulus cards and a high layer
+//! of cirrus (`research/formats/weather.md`).
 //!
-//! * **Dome**: a hemisphere (to a little below the horizon) coloured from the game's sky
-//!   table (`skygradient_dif.dds`: zenith to horizon at the hour), brighter around a low
-//!   sun. Its horizon is the clear/fog colour `sky.rs` computes, so it meets the haze.
-//! * **Stars**: 1 600 sprites of `star_dif.dds` on a sphere that turns with the sky (the
-//!   moon's orbit), added to the dome and faded in as the sun sets.
-//! * **Moon / sun**: the moon is `moon_full_dif.dds` (the disc with its halo in one
-//!   texture), the sun a glow sprite from `sun_dif.dds` behind `sky.rs`'s disc.
+//! * **Dome, fog band, stars, sun disc and glow**: native since JC2-214, see `native_sky.rs`.
+//! * **Moon**: `moon_full_dif.dds` (the disc with its halo in one texture), a project sprite
+//!   (the native moon pass is JC2-130's).
 //! * **Clouds**: `weathersettings.bin` says where (`cloud_base`, `cloud_height`, the field's
 //!   radius 20 km, 555 cards). Cards from `weather_dif.dds` (15 cumulus pictures in a 4 × 4
 //!   atlas) at heights between base and base + height, a field that repeats around the
@@ -15,20 +11,20 @@
 //!   day, orange at dusk, dark blue by night). The high **cirrus** is `cirrus_clouds_dif.dds`
 //!   (three pictures) on a few huge cards at 9 km.
 //!
-//! **Units (JC2-139).** The dome, the moon and the unlit sprites are written in native scene units
-//! (a colour `c` shows as `sqrt(c * A * tint)`): the dome and moon are project colours authored
-//! as display values and converted by `native_units::display_native` (policy); the stars and the
-//! sun glow are additive linear values already (policy). The cloud and cirrus cards go through
+//! **Units (JC2-139).** The moon and the unlit sprites are written in native scene units
+//! (a colour `c` shows as `sqrt(c * A * tint)`): the moon is a project colour authored
+//! as a display value and converted by `native_units::display_native` (policy). The cloud and cirrus cards go through
 //! Bevy's lighting in `sky_sprite.wgsl` (as before): the cumulus colour is the native table `C`
 //! (lit colour) and the cirrus a policy tint, both **multiplied by Bevy's sun and ambient**, which
 //! is not what the exe does (it has no second lighting of a lit colour) but is what reproduces the
 //! bright white cards of the reference frames (`reference/world/daylight-*clouds*`): drawing `C`
 //! unlit (tried, JC2-139) gave dark grey cards. The native card shader is not decoded (gap). The
-//! native sun/moon sprite tint constants (2.0 / 0.4 of `FUN_00a594e0`) are not applied for the
-//! same reason.
+//! native sun quad tints (2.0 / 0.4 of `FUN_00a594e0`) are applied in `native_sky.rs`; the moon
+//! sprite keeps a project tint.
 //!
 //! `--no-clouds` leaves the clouds and cirrus out, `--cloud-cover 0.8` sets how many of the
-//! 555 cards are drawn (the game's default is the file's 0.42), `--no-stars` leaves the stars.
+//! 555 cards are drawn (the game's default is the file's 0.42), `--no-stars` leaves the stars
+//! (`native_sky.rs` reads [`CloudConfig::stars`]).
 
 use crate::Game;
 use crate::impostors::atlas_image;
@@ -39,21 +35,17 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use jc2_formats::weather::elevation_degrees;
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 
-/// Where the sun and moon sprites, the stars and the dome sit (inside the 30 km far plane).
-const DOME_RADIUS: f32 = 27_500.0;
-const STAR_RADIUS: f32 = 24_500.0;
+/// Where the moon sprite sits (inside the 30 km far plane).
 const DISC_DISTANCE: f32 = 25_000.0;
 /// The cirrus layer's height (m above the sea) and its cards' width.
 const CIRRUS_HEIGHT: f32 = 9_000.0;
 /// The cloud field repeats every this many metres (the file's radius is 20 km).
 const FIELD: f32 = 40_000.0;
-const STARS: usize = 1600;
-/// The celestial axis the sun, moon and stars turn about (`weather.rs`'s `SUN_AXIS`).
-const SKY_AXIS: Vec3 = Vec3::new(0.0, -1.0, 0.8);
 
 #[derive(Resource, Clone, Debug)]
 pub struct CloudConfig {
@@ -90,12 +82,33 @@ pub type SkySpriteMaterial = ExtendedMaterial<StandardMaterial, SkySpriteExt>;
 pub struct SkySpriteExt {
     #[uniform(100)]
     pub params: SkySpriteParams,
+    /// The shared per-frame constants (`sun_horizon::SunHorizon`); the cards read only the haze
+    /// fog fields (JC2-163). Filled by the system `haze::add_haze_binding` registers.
+    #[storage(101, read_only)]
+    pub sun_horizon: Handle<ShaderBuffer>,
+}
+
+impl crate::haze::HazeBound for SkySpriteMaterial {
+    fn haze_buffer(&self) -> &Handle<ShaderBuffer> {
+        &self.extension.sun_horizon
+    }
+    fn set_haze_buffer(&mut self, buffer: Handle<ShaderBuffer>) {
+        self.extension.sun_horizon = buffer;
+    }
 }
 
 #[derive(ShaderType, Clone, Debug, Default)]
 pub struct SkySpriteParams {
     pub range: Vec4,
+    /// Native sky-card fog (`haze_fog.wgsl`): x the distance scale (0.7 `clouds`, 0.25
+    /// `cirrusclouds`, VS 106016 / 104892), y 1 for the cumulus exponent remap.
+    pub fog: Vec4,
 }
+
+/// `clouds` vertex shader: distance and height scale, cumulus remap.
+const CLOUD_FOG: Vec4 = Vec4::new(0.7, 1.0, 0.0, 0.0);
+/// `cirrusclouds` vertex shader: distance and height scale, no remap.
+const CIRRUS_FOG: Vec4 = Vec4::new(0.25, 0.0, 0.0, 0.0);
 
 impl MaterialExtension for SkySpriteExt {
     fn fragment_shader() -> ShaderRef {
@@ -116,13 +129,7 @@ fn shader() -> ShaderRef {
 struct SpriteShader(#[allow(dead_code)] Handle<Shader>);
 
 #[derive(Component)]
-struct SkyDome;
-#[derive(Component)]
-struct StarField;
-#[derive(Component)]
 struct MoonSprite;
-#[derive(Component)]
-struct SunGlow;
 #[derive(Component)]
 struct CloudLayer {
     /// The cirrus layer (the tint is computed from the sky state each frame).
@@ -132,14 +139,9 @@ struct CloudLayer {
 
 #[derive(Resource)]
 struct SkyAssets {
-    dome: Handle<Mesh>,
-    star_material: Handle<StandardMaterial>,
     moon_material: Handle<StandardMaterial>,
-    sun_material: Handle<StandardMaterial>,
     cloud_material: Option<Handle<SkySpriteMaterial>>,
     cirrus_material: Option<Handle<SkySpriteMaterial>>,
-    /// The hour the dome's colours were last computed for.
-    dome_hour: f32,
     replaced_moon: bool,
 }
 
@@ -152,6 +154,8 @@ impl Plugin for CloudPlugin {
         }
         bevy::asset::embedded_asset!(app, "sky_sprite.wgsl");
         let shader: Handle<Shader> = load_embedded_asset!(app, "sky_sprite.wgsl");
+        crate::haze::ensure_shader(app);
+        crate::haze::add_haze_binding::<SkySpriteMaterial>(app);
         app.insert_resource(SpriteShader(shader))
             .add_plugins(MaterialPlugin::<SkySpriteMaterial>::default())
             .add_systems(Startup, setup)
@@ -171,147 +175,6 @@ impl Rng {
 
 fn texture(game: &Game, images: &mut Assets<Image>, name: &str) -> Option<Handle<Image>> {
     atlas_image(game, name, true).map(|i| images.add(i))
-}
-
-/// The upper hemisphere (and a little below the horizon) as a mesh whose vertices carry
-/// colours the sky fills in. Rings of constant elevation, from −12° to the zenith.
-fn dome_mesh() -> Mesh {
-    const RINGS: usize = 28;
-    const SEGMENTS: usize = 40;
-    let mut positions = Vec::new();
-    let mut normals = Vec::new();
-    for r in 0..=RINGS {
-        // denser near the horizon
-        let t = r as f32 / RINGS as f32;
-        let elev = (-12.0 + 102.0 * t.powf(1.6)).to_radians();
-        for s in 0..SEGMENTS {
-            let az = s as f32 / SEGMENTS as f32 * TAU;
-            let d = Vec3::new(
-                elev.cos() * az.cos(),
-                elev.sin().min(1.0),
-                elev.cos() * az.sin(),
-            );
-            positions.push((d * DOME_RADIUS).to_array());
-            normals.push((-d).to_array());
-        }
-    }
-    let mut indices = Vec::new();
-    for r in 0..RINGS {
-        for s in 0..SEGMENTS {
-            let a = (r * SEGMENTS + s) as u32;
-            let b = (r * SEGMENTS + (s + 1) % SEGMENTS) as u32;
-            let c = ((r + 1) * SEGMENTS + s) as u32;
-            let d = ((r + 1) * SEGMENTS + (s + 1) % SEGMENTS) as u32;
-            indices.extend_from_slice(&[a, c, b, b, c, d]);
-        }
-    }
-    let n = positions.len();
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[0.5f32, 0.6, 0.9, 1.0]; n]);
-    mesh.insert_indices(Indices::U32(indices));
-    mesh
-}
-
-/// The dome's vertex colours at an hour: the game's sky table from the zenith to the
-/// horizon, taken relative to noon like the clear colour (`sky.rs`), plus a warm glow
-/// around a low sun.
-pub fn dome_colours(mesh: &Mesh, st: &SkyState, zenith: Vec3) -> Vec<[f32; 4]> {
-    let positions = mesh
-        .attribute(Mesh::ATTRIBUTE_POSITION)
-        .and_then(|a| a.as_float3())
-        .unwrap_or(&[]);
-    let low_sun = 1.0 - ((st.sun_elevation - 2.0) / 28.0).clamp(0.0, 1.0);
-    let sun_set = ((st.sun_elevation + 10.0) / 6.0).clamp(0.0, 1.0);
-    positions
-        .iter()
-        .map(|p| {
-            let d = Vec3::from(*p) / DOME_RADIUS;
-            let e = d.y.clamp(0.0, 1.0);
-            // 0 at the horizon, 1 at the zenith; most of the change is low down
-            let k = 1.0 - (1.0 - e).powf(2.2);
-            let k = k.powf(0.55);
-            let mut c = st.sky.lerp(zenith, k);
-            let towards_sun = d.dot(st.sun_dir).max(0.0);
-            let glow = towards_sun.powf(6.0) * low_sun * sun_set * (1.0 - 0.6 * e);
-            c += Vec3::new(1.0, 0.55, 0.25) * glow * 0.45;
-            // display-authored policy colour -> native scene unit (`native_units.rs`)
-            let n = crate::native_units::display_native(c.clamp(Vec3::ZERO, Vec3::ONE));
-            [n.x, n.y, n.z, 1.0]
-        })
-        .collect()
-}
-
-/// The zenith colour (sRGB) at an hour: noon's deep blue scaled by how the game's table
-/// changes there, faded into the night's.
-fn zenith_colour(st: &SkyState, atm: Option<&jc2_formats::weather::Atmosphere>, hour: f32) -> Vec3 {
-    const ZENITH_NOON: Vec3 = Vec3::new(0.16, 0.36, 0.78);
-    const ZENITH_NIGHT: Vec3 = Vec3::new(0.004, 0.008, 0.022);
-    let ratio = atm
-        .map(|a| {
-            let at = |h: f32| Vec3::from(a.sky_colour(h, 0.02)).max(Vec3::splat(0.03));
-            (at(hour) / at(12.0)).clamp(Vec3::splat(0.25), Vec3::splat(1.5))
-        })
-        .unwrap_or(Vec3::ONE);
-    ZENITH_NIGHT.lerp(
-        (ZENITH_NOON * ratio).clamp(Vec3::ZERO, Vec3::ONE),
-        st.daylight,
-    )
-}
-
-fn star_mesh() -> Mesh {
-    let mut rng = Rng(0x57a4_5eed);
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut uvs: Vec<[f32; 2]> = Vec::new();
-    let mut colours: Vec<[f32; 4]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-    for _ in 0..STARS {
-        // uniform on the sphere
-        let y = rng.next() * 2.0 - 1.0;
-        let az = rng.next() * TAU;
-        let r = (1.0 - y * y).sqrt();
-        let dir = Vec3::new(r * az.cos(), y, r * az.sin());
-        let up = if dir.y.abs() > 0.99 { Vec3::X } else { Vec3::Y };
-        let right = dir.cross(up).normalize();
-        let top = right.cross(dir);
-        // brightness: a few bright ones, many faint
-        let m = rng.next();
-        let bright = 0.18 + 0.82 * m.powf(5.0);
-        let size = 150.0 + 520.0 * m.powf(4.0);
-        let tint = match (rng.next() * 4.0) as u32 {
-            0 => Vec3::new(1.0, 0.85, 0.7),
-            1 => Vec3::new(0.75, 0.85, 1.0),
-            _ => Vec3::ONE,
-        };
-        let centre = dir * STAR_RADIUS;
-        let base = positions.len() as u32;
-        for (sx, sy, u, v) in [
-            (-1.0, -1.0, 0.0, 1.0),
-            (1.0, -1.0, 1.0, 1.0),
-            (1.0, 1.0, 1.0, 0.0),
-            (-1.0, 1.0, 0.0, 0.0),
-        ] {
-            positions.push((centre + right * sx * size + top * sy * size).to_array());
-            uvs.push([u, v]);
-            colours.push([tint.x * bright, tint.y * bright, tint.z * bright, 1.0]);
-        }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    let n = positions.len();
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; n]);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
-    mesh.insert_indices(Indices::U32(indices));
-    mesh
 }
 
 /// A field of cards: world-space centres, a drift, atlas rectangles and sizes.
@@ -421,41 +284,7 @@ fn setup(
         .as_ref()
         .map(|a| a.settings.clone())
         .unwrap_or_default();
-    // the dome
-    let dome = meshes.add(dome_mesh());
-    let dome_material = standard.add(StandardMaterial {
-        base_color: Color::WHITE,
-        unlit: true,
-        fog_enabled: false,
-        cull_mode: None,
-        ..default()
-    });
-    commands.spawn((
-        SkyDome,
-        Name::new("sky dome"),
-        Mesh3d(dome.clone()),
-        MeshMaterial3d(dome_material),
-        Transform::default(),
-        NotShadowCaster,
-        bevy::camera::visibility::NoFrustumCulling,
-    ));
-
-    // stars
-    let star_tex = texture(&game, &mut images, "textures\\atmosphere\\star_dif.dds");
-    let star_material = standard.add(unlit(star_tex, AlphaMode::Add));
-    if cfg.stars {
-        commands.spawn((
-            StarField,
-            Name::new("stars"),
-            Mesh3d(meshes.add(star_mesh())),
-            MeshMaterial3d(star_material.clone()),
-            Transform::default(),
-            NotShadowCaster,
-            bevy::camera::visibility::NoFrustumCulling,
-        ));
-    }
-
-    // the moon (disc and halo in one texture) and the sun's glow
+    // the moon (disc and halo in one texture)
     let moon_tex = texture(
         &game,
         &mut images,
@@ -470,16 +299,6 @@ fn setup(
         Transform::default(),
         NotShadowCaster,
     ));
-    let sun_tex = texture(&game, &mut images, "textures\\atmosphere\\sun_dif.dds");
-    let sun_material = standard.add(unlit(sun_tex, AlphaMode::Add));
-    commands.spawn((
-        SunGlow,
-        Name::new("sun glow"),
-        Mesh3d(meshes.add(Rectangle::new(1.0, 1.0))),
-        MeshMaterial3d(sun_material.clone()),
-        Transform::default(),
-        NotShadowCaster,
-    ));
 
     // clouds: the cumulus field and the cirrus
     let mut cloud_material = None;
@@ -488,11 +307,13 @@ fn setup(
     if cover > 0.0 {
         let make = |sprites: &mut Assets<SkySpriteMaterial>,
                     standard_tex: Option<Handle<Image>>,
-                    range: Vec4| {
+                    range: Vec4,
+                    fog: Vec4| {
             sprites.add(SkySpriteMaterial {
                 base: unlit_fogged(standard_tex),
                 extension: SkySpriteExt {
-                    params: SkySpriteParams { range },
+                    params: SkySpriteParams { range, fog },
+                    sun_horizon: Handle::default(),
                 },
             })
         };
@@ -514,6 +335,7 @@ fn setup(
                 &mut sprites,
                 Some(tex),
                 Vec4::new(FIELD, 900.0, 2500.0, 14_500.0),
+                CLOUD_FOG,
             );
             commands.spawn((
                 CloudLayer { cirrus: false },
@@ -547,6 +369,7 @@ fn setup(
                 &mut sprites,
                 Some(tex),
                 Vec4::new(FIELD, 3000.0, 7000.0, 20_000.0),
+                CIRRUS_FOG,
             );
             commands.spawn((
                 CloudLayer { cirrus: true },
@@ -561,13 +384,9 @@ fn setup(
         }
     }
     commands.insert_resource(SkyAssets {
-        dome,
-        star_material,
         moon_material,
-        sun_material,
         cloud_material,
         cirrus_material,
-        dome_hour: f32::MAX,
         replaced_moon: false,
     });
 }
@@ -577,7 +396,8 @@ fn unlit_fogged(texture: Option<Handle<Image>>) -> StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: texture,
         unlit: true,
-        // the far cards fade out by themselves (the haze would wash them blue)
+        // Bevy's distance fog is off: the native sky-card fog is applied in `sky_sprite.wgsl`
+        // (`haze_sky_card_factor`, JC2-163)
         fog_enabled: false,
         alpha_mode: AlphaMode::Blend,
         cull_mode: None,
@@ -612,85 +432,30 @@ pub fn cloud_tint(st: &SkyState, cirrus: bool) -> Vec3 {
     c
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn update_sky(
     mut commands: Commands,
     time: Res<TimeOfDay>,
-    data: Res<SkyData>,
     atmosphere: Option<Res<crate::atmosphere::AtmosphereState>>,
     assets: Option<ResMut<SkyAssets>>,
     cams: Query<&GlobalTransform, With<Camera3d>>,
     old_moon: Query<Entity, With<MoonDisc>>,
-    mut meshes: ResMut<Assets<Mesh>>,
     mut standard: ResMut<Assets<StandardMaterial>>,
     mut sprites: ResMut<Assets<SkySpriteMaterial>>,
-    mut dome: Query<&mut Transform, (With<SkyDome>, Without<Camera3d>)>,
-    mut stars: Query<
-        &mut Transform,
-        (
-            With<StarField>,
-            Without<SkyDome>,
-            Without<MoonSprite>,
-            Without<SunGlow>,
-        ),
-    >,
-    mut moon: Query<
-        (&mut Transform, &mut Visibility),
-        (
-            With<MoonSprite>,
-            Without<SkyDome>,
-            Without<StarField>,
-            Without<SunGlow>,
-        ),
-    >,
-    mut glow: Query<
-        (&mut Transform, &mut Visibility),
-        (
-            With<SunGlow>,
-            Without<SkyDome>,
-            Without<StarField>,
-            Without<MoonSprite>,
-        ),
-    >,
+    mut moon: Query<(&mut Transform, &mut Visibility), With<MoonSprite>>,
 ) {
     let Some(mut assets) = assets else { return };
     let Some(cam) = cams.iter().next() else {
         return;
     };
     let eye = cam.translation();
-    let st = SkyState::at(time.hours, data.0.as_ref());
+    let st = SkyState::at(time.hours);
     // the textured moon replaces the plain disc
     if !assets.replaced_moon {
         for e in &old_moon {
             commands.entity(e).despawn();
             assets.replaced_moon = true;
         }
-    }
-
-    // dome: rides with the camera, recoloured when the hour has moved
-    for mut tf in &mut dome {
-        tf.translation = eye;
-    }
-    if (time.hours - assets.dome_hour).abs() > 0.015 {
-        let zenith = zenith_colour(&st, data.0.as_ref(), time.hours);
-        if let Some(mut mesh) = meshes.get_mut(&assets.dome) {
-            let colours = dome_colours(&mesh, &st, zenith);
-            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
-        }
-        assets.dome_hour = time.hours;
-    }
-
-    // stars: turn with the moon's orbit, shine when it is dark
-    let dark = 1.0 - smoothstep(-16.0, -4.0, st.sun_elevation);
-    if let Some(mut m) = standard.get_mut(&assets.star_material) {
-        let b = dark * 2.6;
-        m.base_color = Color::linear_rgb(b, b, b);
-    }
-    let axis = SKY_AXIS.normalize();
-    let spin = Quat::from_axis_angle(axis, time.hours / 12.0 * PI);
-    for mut tf in &mut stars {
-        tf.translation = eye;
-        tf.rotation = spin;
     }
 
     // the moon: a card facing the camera, halo and all
@@ -712,30 +477,11 @@ fn update_sky(
         // faint in daylight, full at night; reddish when it is low
         let low = 1.0 - smoothstep(0.0, 14.0, moon_up);
         let a = 0.10 + 0.90 * (1.0 - st.daylight);
-        // policy display colour -> native unit (the native sprite tint constants, sun 2.0 and
-        // moon 0.4 of `FUN_00a594e0`, are proven but how the sprite shader combines them is not)
+        // policy display colour -> native unit (the moon pass, JC2-130, is not implemented)
         m.base_color = crate::native_units::native_colour(
             Vec3::new(1.0, 1.0 - 0.18 * low, 1.0 - 0.38 * low),
             a,
         );
-    }
-    // the sun's glow: additive, strongest when the sun is low
-    for (mut tf, mut vis) in &mut glow {
-        let pos = eye + st.sun_dir * (DISC_DISTANCE - 200.0);
-        let size = 9000.0;
-        *tf = Transform::from_translation(pos)
-            .looking_at(eye, Vec3::Y)
-            .with_scale(Vec3::new(size, size, 1.0));
-        *vis = if st.sun_elevation > -8.0 {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-    }
-    if let Some(mut m) = standard.get_mut(&assets.sun_material) {
-        let k = smoothstep(-8.0, 3.0, st.sun_elevation);
-        let c = st.sun_colour * (0.55 * k);
-        m.base_color = Color::linear_rgb(c.x, c.y * 0.95, c.z * 0.85);
     }
 
     // clouds: the tint follows the hour
@@ -778,49 +524,10 @@ mod tests {
     }
 
     #[test]
-    fn the_dome_runs_from_the_horizon_colour_to_the_zenith() {
-        let st = SkyState::at(12.0, None);
-        let zenith = Vec3::new(0.1, 0.3, 0.8);
-        let mesh = dome_mesh();
-        let colours = dome_colours(&mesh, &st, zenith);
-        assert_eq!(colours.len(), mesh.count_vertices());
-        let positions = mesh
-            .attribute(Mesh::ATTRIBUTE_POSITION)
-            .and_then(|a| a.as_float3())
-            .unwrap();
-        let lin = crate::native_units::display_native;
-        // the top vertex is the zenith colour, one on the horizon the sky colour
-        let top = positions
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1[1].total_cmp(&b.1[1]))
-            .unwrap()
-            .0;
-        let c = Vec3::new(colours[top][0], colours[top][1], colours[top][2]);
-        assert!((c - lin(zenith)).length() < 0.02, "{c:?}");
-        let horizon = positions
-            .iter()
-            .enumerate()
-            .min_by(|a, b| a.1[1].abs().total_cmp(&b.1[1].abs()))
-            .unwrap()
-            .0;
-        let h = Vec3::new(
-            colours[horizon][0],
-            colours[horizon][1],
-            colours[horizon][2],
-        );
-        assert!(
-            (h - lin(st.sky)).length() < 0.05,
-            "{h:?} vs {:?}",
-            lin(st.sky)
-        );
-    }
-
-    #[test]
     fn clouds_are_white_by_day_orange_at_dusk_and_dark_at_night() {
-        let noon = cloud_tint(&SkyState::at(12.0, None), false);
-        let dusk = cloud_tint(&SkyState::at(18.3, None), false);
-        let night = cloud_tint(&SkyState::at(0.0, None), false);
+        let noon = cloud_tint(&SkyState::at(12.0), false);
+        let dusk = cloud_tint(&SkyState::at(18.3), false);
+        let night = cloud_tint(&SkyState::at(0.0), false);
         assert!(noon.min_element() > 0.9);
         assert!(dusk.x > dusk.z + 0.15, "{dusk:?}");
         assert!(night.max_element() < 0.3, "{night:?}");
@@ -851,17 +558,5 @@ mod tests {
             assert!(c[1] >= 2000.0 && c[1] <= 2800.0);
             assert!(c[0].abs() <= FIELD * 0.5 && c[2].abs() <= FIELD * 0.5);
         }
-    }
-
-    #[test]
-    fn stars_cover_the_sphere() {
-        let m = star_mesh();
-        assert_eq!(m.count_vertices(), STARS * 4);
-        let p = m
-            .attribute(Mesh::ATTRIBUTE_POSITION)
-            .and_then(|a| a.as_float3())
-            .unwrap();
-        let up = p.iter().filter(|v| v[1] > 0.0).count();
-        assert!(up > STARS * 4 * 4 / 10 && up < STARS * 4 * 6 / 10, "{up}");
     }
 }

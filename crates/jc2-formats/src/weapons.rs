@@ -57,6 +57,21 @@ pub struct Weapon {
     /// `DUAL_WEAPON_MODIFIER_GRENADE_LAUNCHER`; empty on the two-handed guns): one-handed
     /// weapons can be wielded in either hand.
     pub hand: String,
+    /// `#04374f9d` (native type +0x2e8, loader stores it at +0xba): the muzzle effect id in
+    /// `effectsettings.bin`, -1 = none (`research/formats/weapon-fire-effects.md` section 1).
+    pub muzzle_effect: i32,
+    /// `#469ba70d` (native type +0x2e4): the bullet/projectile impact effect id in
+    /// `effectsettings.bin`, -1 = none (`weapon-fire-effects.md` section 1).
+    pub impact_effect: i32,
+    /// `tracer_fire_velocity` (native type +0x1a0): the speed of the visual `CBulletTrail`
+    /// object (m/s), set on it by the bullet factory 0x004f9560 (weapon-fire-effects.md section 2).
+    pub tracer_fire_velocity: f32,
+    /// `tracer_scale_factor` (native type +0x1ac): loaded but its consumer is not decoded (Gap 4).
+    pub tracer_scale_factor: f32,
+    /// `#04f3f8c6` (native type +0x19c, stored as 1/x): the native factory makes a trail only when
+    /// this divides the weapon's shot counter; every retail value is 1 (a trail per shot) or 0
+    /// (rockets, grenades: none). `true` for the non-zero case.
+    pub tracer_every_shot: bool,
 }
 
 /// The AI block of a weapon (`#9acc62e9`, tagged `AI_MODIFIER_PISTOL` and the like):
@@ -117,6 +132,9 @@ const AMMO_TYPE: u32 = 0xa0d5_8b16;
 const AUTOMATIC: u32 = 0x01db_d94a;
 const HAND_MODIFIER: u32 = 0x62d2_f184;
 const AI_MODIFIER: u32 = 0x4fdb_09b7;
+const MUZZLE_EFFECT: u32 = 0x0437_4f9d;
+const IMPACT_EFFECT: u32 = 0x469b_a70d;
+const TRACER_PERIOD: u32 = 0x04f3_f8c6;
 
 impl Weapon {
     /// The name for the HUD: the short name, else the table name.
@@ -161,6 +179,11 @@ impl Weapon {
                 Some(Variant::Str(s)) => s.clone(),
                 _ => String::new(),
             },
+            muzzle_effect: num(n, MUZZLE_EFFECT).map_or(-1, |v| v as i32),
+            impact_effect: num(n, IMPACT_EFFECT).map_or(-1, |v| v as i32),
+            tracer_fire_velocity: n.float("tracer_fire_velocity").unwrap_or(0.0),
+            tracer_scale_factor: n.float("tracer_scale_factor").unwrap_or(0.0),
+            tracer_every_shot: num(n, TRACER_PERIOD).unwrap_or(0.0) >= 1.0,
         })
     }
 }
@@ -410,6 +433,22 @@ mod tests {
             .find(|w| w.name == "Shotgun (pump action)")
             .unwrap();
         assert_eq!(s.pellets, 10);
+        assert_eq!(b.muzzle_effect, 48); // muzzle_beretta (weapon-fire-effects.md section 1)
+        assert_eq!(b.impact_effect, 2); // bullet_impact_small
+        assert_eq!(w.iter().find(|w| w.id == 11).unwrap().impact_effect, 36); // bullet_impact_medium
+        assert_eq!(w.iter().find(|w| w.id == 5).unwrap().muzzle_effect, 51);
+        // tracers (weapon-fire-effects.md section 2): a trail per shot at tracer_fire_velocity
+        assert!(b.tracer_every_shot);
+        assert_eq!(b.tracer_fire_velocity, 100.0);
+        assert_eq!(b.tracer_scale_factor, 0.3);
+        // rockets make no trail (period 0)
+        assert!(
+            !w.iter()
+                .find(|w| w.name == "PanayRocketLauncher")
+                .unwrap()
+                .tracer_every_shot
+        );
+        assert_eq!(w.iter().find(|w| w.id == 11).unwrap().muzzle_effect, 50);
         let ai = b.ai.as_ref().unwrap();
         assert_eq!((ai.max_range, ai.magazine_size), (50.0, Some(8)));
         assert_eq!((ai.min_burst_delay, ai.max_burst_delay), (0.15, 0.3));

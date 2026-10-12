@@ -69,7 +69,7 @@ fn every_clip_faces_the_same_way() {
     let mut order: Vec<Clip> = vec![Clip::Idle];
     order.extend(Clip::ALL.iter().copied().filter(|c| *c != Clip::Idle));
     for clip in order {
-        if clip == Clip::Dive {
+        if matches!(clip, Clip::Dive | Clip::SwimDiveIdle) {
             continue; // lies flat
         }
         let Some(c) = rig.clips.get(&clip) else {
@@ -93,7 +93,41 @@ fn every_clip_faces_the_same_way() {
         // (the hips tilt in a crouch and turn in a roll or a strafe: same facing, a
         // wider cone)
         let limit = match clip {
-            Clip::Crouch | Clip::LandRoll | Clip::LandHard | Clip::Reel => 0.5,
+            // (JC2-051: crouch_DN measures 0.55, the hips tilt and turn into the crouch)
+            Clip::Crouch
+            | Clip::CrouchDown
+            | Clip::CrouchUp
+            | Clip::EvadeFwd
+            | Clip::LandRoll
+            | Clip::LandHard
+            | Clip::Reel => 0.5,
+            // the standing jump's flight twists the hips about 40° at its middle, the stops
+            // turn them into the idle stance, the chute and fall transitions tilt them
+            // (JC2-238: these still catch a 180° flip)
+            Clip::JumpFlightStanding
+            | Clip::DashToIdle
+            | Clip::RunToIdle
+            | Clip::WalkToIdle
+            | Clip::JumpStartStanding
+            | Clip::JumpStartRun
+            | Clip::JumpTimeBlend
+            | Clip::JumpToSkydive
+            | Clip::FallToSkydive
+            | Clip::ChuteOpen
+            | Clip::ChuteOpenHorizontal
+            | Clip::ChuteDetach
+            | Clip::RunToSwim => 0.5,
+            // the reel's impacts and hangs (JC2-250): the hips tilt and twist against the wall or
+            // the ceiling, but face the same way (a flipped take would be near -1)
+            Clip::ReelStart
+            | Clip::ReelImpactVertical
+            | Clip::ReeledInIdle
+            | Clip::ReelImpactHorizontal
+            | Clip::ReeledInToHang
+            | Clip::HangStuntIdle
+            | Clip::ReelEndLand
+            | Clip::ReeledInReleaseDrop
+            | Clip::HangToFall => 0.5,
             Clip::WalkStrafeLeft | Clip::WalkStrafeRight => 0.7,
             // the heavy landing twists the hips 60° to his right as he goes down, and the
             // soldiers stand and walk side-on, the gun across them

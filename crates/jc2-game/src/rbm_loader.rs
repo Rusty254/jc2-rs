@@ -9,13 +9,24 @@
 use crate::coords::{to_bevy, winding_to_bevy};
 use bevy::asset::io::{AssetSourceId, Reader};
 use bevy::asset::{AssetLoader, LoadContext, RenderAssetUsages};
-use bevy::image::ImageLoaderSettings;
+use bevy::image::{ImageLoaderSettings, ImageSampler};
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
-use jc2_formats::rbm::{GeneralHeader, RbmModel, RenderBlock, general_vertex_colour};
+use jc2_formats::rbm::{self, GeneralHeader, RbmModel, RenderBlock, general_vertex_colour};
 use jc2_formats::texture_policy::{GAMMA_CORRECT_FILE, GammaExceptions, GammaMode, dds_view_pair};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Sampler for UV0 material textures that carry no family-specific state (the grapple wire): wrap in
+/// U and V, trilinear, anisotropic at the native default. Retail meshes tile their textures outside
+/// 0..1 (the Arctic pine bark UV0 spans about -1.3..26.6 by -10..10.8 across a trunk); Bevy's default
+/// image sampler is clamp-to-edge, which smears the border texel across every tile (JC2-251). The
+/// native passes set WRAP with filter fields (7,7) on those slots (`FUN_0096eed0`, `FUN_0095c890`,
+/// ...; `native_sampler.rs`). This used to be `..default()`, i.e. NEAREST min/mag/mip, which made every
+/// magnified model texture a grid of texels (board c728494e).
+pub fn wrap_sampler() -> ImageSampler {
+    crate::native_sampler::WRAP_ANISO.sampler()
+}
 
 /// Provisional silhouette repair. The original shader also scales alpha by
 /// instance fade; its 0.5 reference is not a plain texture-alpha cutoff.
@@ -32,13 +43,91 @@ fn alpha_mode(type_name: &str) -> AlphaMode {
 /// These shaders sample normal RGB as 2*RGB-1. Other block families, packed
 /// properties/AOC maps and the foliage diffuse-as-normal placeholder are not
 /// interpreted here. See material-parameters-next.md for the shader evidence.
+/// The opaque double-sided `SkinnedGeneral` blocks (the parachute canopy) take the native
+/// skinned-general route (`skinned_general_material.rs`); their normal map is tangent space.
+fn is_native_skinned(block: &RenderBlock) -> bool {
+    block.params.first().is_some_and(|f| {
+        crate::skinned_general_material::is_double_sided_opaque(&block.type_name, *f as u32)
+            || is_rico_native_character(block, *f as u32)
+    })
+}
+
+/// Rico's clothes, skin, hair and eyeball tile take the native `SkinnedGeneral` lit-colour
+/// route too (board edb9fdda; the eye gloss cornea keeps the hemisphere route). INFERRED: that
+/// they share the canopy's pixel shader. `JC2_NO_RICO_NATIVE_LIGHT=1` restores the old route
+/// for before captures.
+fn is_rico_native_character(block: &RenderBlock, flags: u32) -> bool {
+    character_state(&block.type_name, flags).is_some_and(|c| !c.eye_gloss)
+        && std::env::var_os("JC2_NO_RICO_NATIVE_LIGHT").is_none()
+}
+
+/// The draw state the native `SkinnedGeneral` main-pass setup (`0x00931080`) derives from the
+/// block flags (header `u32`; research `rbm.md`, board 845e8e4c), for the character blocks
+/// (the double-sided opaque canopy keeps its own route):
+/// * cull: none when the low byte is 1 or bit 16 is set, back faces culled otherwise
+///   (`0x00931080`: code 1 / 3);
+/// * low byte 1 is alpha tested (`FUN_00949aa0(5, ..)`: reference `(2 * code + 1) / 510`,
+///   code 0xc4 (393/510 = 0.7706) for a block without bit 18, code 1 (3/510 = 0.0059) for the
+///   bit-18 block, the hair's second pass; research `rico-eyes.md` section 4; the pixel shader
+///   discards when `alpha * cb1[1].w < cb4[4].x`, `cb4[3].w` enabling the test);
+/// * low byte 4 is the blended branch: Rico's eye block (`ava_eye02` white diffuse) is the
+///   `SkinnedGeneralEyeGloss` cornea over the iris drawn by the head block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CharacterState {
+    pub cull_back: bool,
+    pub alpha_ref: Option<f32>,
+    /// The bit-18 hair pass (reference 3/510 natively): drawn here as a blended fringe with
+    /// that explicit test (`blend_ref`; the native depth state of that pass is not decoded).
+    pub soft_fringe: bool,
+    /// The alpha-test reference of a blended pass (Bevy's `Blend` has no cutoff of its own).
+    pub blend_ref: Option<f32>,
+    /// Hair (low byte 1): the native hair shader gates its specular by the mpm map; the
+    /// project has no hair shader yet, so the sheen is switched off (inferred).
+    pub hair: bool,
+    pub eye_gloss: bool,
+}
+
+/// Native alpha references `(2 * code + 1) / 510` (`0x00949aa0`, research `rico-eyes.md` s4).
+const HAIR_ALPHA_REF: f32 = 393.0 / 510.0;
+const BIT18_ALPHA_REF: f32 = 3.0 / 510.0;
+
+pub(crate) fn character_state(type_name: &str, flags: u32) -> Option<CharacterState> {
+    if type_name != "SkinnedGeneral" || crate::skinned_general_material::is_double_sided_opaque(type_name, flags) {
+        return None;
+    }
+    let low = flags & 0xff;
+    let soft_fringe = low == 1 && flags & 0x40000 != 0;
+    let alpha_ref = (low == 1 && !soft_fringe).then_some(HAIR_ALPHA_REF);
+    let blend_ref = soft_fringe.then_some(BIT18_ALPHA_REF);
+    Some(CharacterState {
+        cull_back: !(low == 1 || flags & 0x10000 != 0),
+        alpha_ref,
+        soft_fringe,
+        blend_ref,
+        hair: low == 1,
+        eye_gloss: low == 4,
+    })
+}
+
+/// Rico's `SkinnedGeneral` character blocks (clothes, skin, hair) apply their tangent-space normal
+/// map: the native pixel shader samples t1 as `2 * rgb - 1` on the tangent frame stored in every
+/// vertex (research `rico-model-detail.md`; the shader identity with the canopy's is inferred).
+/// The eye gloss cornea has no tangent frame natively (`rico-eyes.md` section 3). Board 2280444f;
+/// `JC2_NO_RICO_NORMALS=1` restores the flat look for before captures.
+fn is_character_normal_mapped(block: &RenderBlock) -> bool {
+    block.params.first().is_some_and(|f| {
+        character_state(&block.type_name, *f as u32).is_some_and(|c| !c.eye_gloss)
+    }) && std::env::var_os("JC2_NO_RICO_NORMALS").is_none()
+}
+
 fn normal_texture_name(block: &RenderBlock, has_tangents: bool) -> Option<&str> {
     let normal = &block.material.normal;
     (has_tangents
-        && matches!(
+        && (matches!(
             block.type_name.as_str(),
             "General" | "CarPaint" | "VegetationBark"
-        )
+        ) || is_native_skinned(block)
+            || is_character_normal_mapped(block))
         && !normal.is_empty()
         && !normal.eq_ignore_ascii_case(&block.material.diffuse))
     .then_some(normal)
@@ -89,6 +178,12 @@ pub struct RbmBlock {
     pub foliage: Option<RbmFoliage>,
     /// The native General route (JC2-085); `None` keeps `material` (legacy fallback).
     pub general: Option<RbmGeneral>,
+    /// The native hemisphere-ambient route (JC2-177) for the plain families; `None` for the
+    /// uniform-ambient ones (foliage, impostors) and the General native route.
+    pub hemisphere: Option<Handle<crate::hemisphere_material::HemisphereMaterial>>,
+    /// The native opaque double-sided `SkinnedGeneral` route (parachute canopy, JC2-9431).
+    pub skinned_general:
+        Option<Handle<crate::skinned_general_material::SkinnedGeneralMaterial>>,
     pub mesh: Handle<Mesh>,
     pub material: Handle<StandardMaterial>,
     pub triangles: usize,
@@ -123,6 +218,12 @@ impl RbmBlock {
             general: (standard_id == self.material.id())
                 .then(|| self.general.as_ref().map(|g| g.material.clone()))
                 .flatten(),
+            hemisphere: (standard_id == self.material.id())
+                .then(|| self.hemisphere.clone())
+                .flatten(),
+            skinned_general: (standard_id == self.material.id())
+                .then(|| self.skinned_general.clone())
+                .flatten(),
         }
     }
 }
@@ -155,8 +256,9 @@ pub struct RbmLoader {
     mode: GammaMode,
     /// Native General route (JC2-085). `JC2_GENERAL_LEGACY` turns it off (comparison).
     general_route: bool,
-    /// `JC2_GENERAL_SPEC_STANDIN`: the unresolved specular colour cb0[1] as the Sun's.
-    spec_standin: bool,
+    /// Hemisphere-ambient route (JC2-177). `JC2_NO_HEMISPHERE` turns it off (before / after
+    /// captures).
+    hemisphere_route: bool,
     // Per-loader, per-source: never share a process-global exception list across
     // independently mounted GameFs instances/AssetServers. Mounts are immutable;
     // refreshing the exception asset requires a fresh loader/application.
@@ -174,7 +276,7 @@ impl RbmLoader {
         Self {
             mode,
             general_route: std::env::var_os("JC2_GENERAL_LEGACY").is_none(),
-            spec_standin: std::env::var_os("JC2_GENERAL_SPEC_STANDIN").is_some(),
+            hemisphere_route: std::env::var_os("JC2_NO_HEMISPHERE").is_none(),
             policies: Mutex::new(HashMap::new()),
         }
     }
@@ -232,6 +334,57 @@ impl RbmLoader {
 }
 
 /// A linear (data) image next to the model: MPM and UV1 AO are numeric, not colour.
+/// True for the 40-byte VegetationBark layout (`flags & 4 == 0`: no packed colour, so none decoded),
+/// whose native `_Dirt` vertex and pixel shaders read the second UV set and the dirt texture pair
+/// in the `properties` / `deformed_diffuse` slots (lighting-gaps-next.md G9).
+fn is_bark_dirt(block: &RenderBlock) -> bool {
+    block.type_name == "VegetationBark"
+        && block.mesh.packed_colours.len() != block.mesh.positions.len()
+        && block.mesh.uv1.len() == block.mesh.positions.len()
+        && block.mesh.uv1.iter().flatten().all(|v| v.is_finite())
+        && !block.material.properties.is_empty()
+}
+
+/// Loads a wrapping dirt texture (colour = sRGB view, normal = linear), cached per model.
+async fn load_dirt_image(
+    cx: &mut LoadContext<'_>,
+    parent: &std::path::Path,
+    source: &AssetSourceId<'_>,
+    name: &str,
+    srgb: bool,
+    cache: &mut HashMap<(String, bool), Option<Handle<Image>>>,
+    label: String,
+) -> Option<Handle<Image>> {
+    if name.is_empty() {
+        return None;
+    }
+    let key = (name.to_ascii_lowercase(), srgb);
+    if let Some(handle) = cache.get(&key) {
+        return handle.clone();
+    }
+    let tex_path = bevy::asset::AssetPath::from_path_buf(parent.join(name.replace('\\', "/")))
+        .with_source(source.clone_owned());
+    let image = cx
+        .load_builder()
+        .with_settings(move |settings: &mut ImageLoaderSettings| {
+            settings.is_srgb = srgb;
+            // Bark slots 2 and 3 (dirt diffuse, dirt normal): WRAP, fields (3,2), anisotropy 1
+            // (`FUN_0095c890`), unlike the anisotropic slots 0 and 1
+            settings.sampler = crate::native_sampler::WRAP_TRILINEAR.sampler();
+        })
+        .load_value::<Image>(tex_path)
+        .await;
+    let handle = match image {
+        Ok(image) => Some(cx.add_labeled_asset(label, image.take())),
+        Err(error) => {
+            warn!("RBM {}: bark dirt texture {name} unavailable: {error}; plain bark", cx.path());
+            None
+        }
+    };
+    cache.insert(key, handle.clone());
+    handle
+}
+
 async fn load_data_image(
     cx: &mut LoadContext<'_>,
     parent: &std::path::Path,
@@ -239,6 +392,7 @@ async fn load_data_image(
     name: &str,
     cache: &mut HashMap<String, Option<Handle<Image>>>,
     label: String,
+    sampler: ImageSampler,
 ) -> Option<Handle<Image>> {
     if name.is_empty() {
         return None;
@@ -251,7 +405,10 @@ async fn load_data_image(
         .with_source(source.clone_owned());
     let image = cx
         .load_builder()
-        .with_settings(|settings: &mut ImageLoaderSettings| settings.is_srgb = false)
+        .with_settings(move |settings: &mut ImageLoaderSettings| {
+            settings.is_srgb = false;
+            settings.sampler = sampler.clone();
+        })
         .load_value::<Image>(tex_path)
         .await;
     let handle = match image {
@@ -280,6 +437,28 @@ pub enum RbmLoadError {
         asset_path: String,
         message: String,
     },
+}
+
+fn file_name_of(path: &bevy::asset::AssetPath<'_>) -> String {
+    path.path()
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The mean of a BillboardFoliage block's card centres in model space: the native loader
+/// (`0x960490`) stores it at block +0x28 and the draw upload (`0x954340`) sends it as the vertex
+/// shader's `cb2[5].xyz`; each vertex adds `centre / max(count, 1)`. The parser keeps
+/// `position = centre + offset` and the offset in `uv1`.
+pub fn billboard_centroid(block: &RenderBlock) -> Vec3 {
+    let md = &block.mesh;
+    let inv = 1.0 / md.positions.len().max(1) as f32;
+    md.positions
+        .iter()
+        .zip(&md.uv1)
+        .fold(Vec3::ZERO, |sum, (p, o)| {
+            sum + Vec3::new(p[0] - o[0], p[1] - o[1], p[2]) * inv
+        })
 }
 
 pub fn block_to_mesh(block: &RenderBlock) -> Mesh {
@@ -313,6 +492,12 @@ pub fn block_to_mesh(block: &RenderBlock) -> Mesh {
     }
     if md.uv1.len() == n && md.uv1.iter().flatten().all(|v| v.is_finite()) {
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, md.uv1.clone());
+    } else if block.type_name.starts_with("SkinnedGeneral") && md.uv1.is_empty() {
+        // The native vertex shader passes the raw model-space height v0.y to the pixel shader
+        // (o4.w) for the lit-colour ramp `s = sat(6 - 3.3333 y)` (parachute-canopy-shading.md);
+        // the SkinnedGeneral vertex has no second UV set, so UV1.x carries it (`y`, rest pose).
+        let heights: Vec<[f32; 2]> = md.positions.iter().map(|p| [p[1], 0.0]).collect();
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, heights);
     }
     if md.joints.len() == n && md.weights.len() == n {
         // skinned: a vertex nobody weights hangs off its first joint
@@ -353,7 +538,7 @@ impl AssetLoader for RbmLoader {
     ) -> Result<RbmAsset, RbmLoadError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
-        let model = RbmModel::parse(&bytes)?;
+        let mut model = RbmModel::parse(&bytes)?;
 
         // "container.ee/model.rbm" -> textures are "container.ee/<name>"; a bare
         // "model.rbm" at the top level resolves textures at the top level too.
@@ -365,11 +550,48 @@ impl AssetLoader for RbmLoader {
             .map(|p| p.to_path_buf())
             .unwrap_or_default();
 
+        // Merged mode-0 blocks (`*_batchN`, `*_partN`) hold only placements of ranges of the
+        // sibling `*_base_N` model: expand them into geometry (JC2 city buildings).
+        if model
+            .blocks
+            .iter()
+            .any(|b| rbm::merged_base_name(&file_name_of(&path), b).is_some())
+        {
+            let mut expanded = Vec::with_capacity(model.blocks.len());
+            let mut bases: HashMap<String, Option<RenderBlock>> = HashMap::new();
+            for block in std::mem::take(&mut model.blocks) {
+                let Some(base_name) = rbm::merged_base_name(&file_name_of(&path), &block) else {
+                    expanded.push(block);
+                    continue;
+                };
+                if !bases.contains_key(&base_name) {
+                    let base_path = bevy::asset::AssetPath::from_path_buf(parent.join(&base_name))
+                        .with_source(source.clone());
+                    let base = match cx.read_asset_bytes(base_path).await {
+                        Ok(bytes) => RbmModel::parse(&bytes)
+                            .ok()
+                            .and_then(|m| m.blocks.into_iter().next()),
+                        Err(_) => None,
+                    };
+                    if base.is_none() {
+                        warn!("RBM {path}: merged base model {base_name} is missing or unreadable");
+                    }
+                    bases.insert(base_name.clone(), base);
+                }
+                match &bases[&base_name] {
+                    Some(base) => expanded.extend(rbm::expand_merged_instances(&block, base)),
+                    None => expanded.push(block),
+                }
+            }
+            model.blocks = expanded;
+        }
+
         let policy = self.source_policy(cx).await;
 
         let mut blocks = Vec::with_capacity(model.blocks.len());
         let mut normal_images: HashMap<String, Option<Handle<Image>>> = HashMap::new();
         let mut data_images: HashMap<String, Option<Handle<Image>>> = HashMap::new();
+        let mut dirt_images: HashMap<(String, bool), Option<Handle<Image>>> = HashMap::new();
         let mut colour_images: HashMap<ColourImageKey, (Option<Handle<Image>>, RbmTextureView)> =
             HashMap::new();
         for (i, block) in model.blocks.iter().enumerate() {
@@ -404,6 +626,24 @@ impl AssetLoader for RbmLoader {
                     mesh_value.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
                 } else {
                     warn!("RBM {path}: General block {i} has a non-finite vertex colour; ignored");
+                }
+            }
+            // VegetationBark (32 B layout): the pixel shader multiplies the diffuse by the packed vertex
+            // colour of `v0.w` (`vegetationbark` PS, `mul r1.xyz, diffuse, v6`), the baked darkening of
+            // the trunks (lighting-gaps-next.md). The 40 B layout has no decoded colour: unchanged.
+            if block.type_name == "VegetationBark"
+                && block.mesh.packed_colours.len() == block.mesh.positions.len()
+            {
+                let colours: Vec<[f32; 4]> = block
+                    .mesh
+                    .packed_colours
+                    .iter()
+                    .map(|c| rbm::vegetation_bark_colour(*c))
+                    .collect();
+                if colours.iter().flatten().all(|v| v.is_finite()) {
+                    mesh_value.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
+                } else {
+                    warn!("RBM {path}: VegetationBark block {i} has a non-finite vertex colour; ignored");
                 }
             }
             let has_tangents = mesh_value.contains_attribute(Mesh::ATTRIBUTE_TANGENT)
@@ -480,13 +720,15 @@ impl AssetLoader for RbmLoader {
                         }
                     }
                     let is_srgb = view.is_srgb;
+                    let colour_sampler = crate::native_sampler::colour(&block.type_name).sampler();
                     // Settings are not part of a deferred image path's identity.
                     // A directly loaded value and RBM-local label isolate this
                     // colour view from normal/data/default-path image handles.
                     let image = cx
                         .load_builder()
                         .with_settings(move |settings: &mut ImageLoaderSettings| {
-                            settings.is_srgb = is_srgb
+                            settings.is_srgb = is_srgb;
+                            settings.sampler = colour_sampler.clone();
                         })
                         .load_value::<Image>(tex_path)
                         .await;
@@ -531,10 +773,13 @@ impl AssetLoader for RbmLoader {
                     // Settings do not participate in Bevy's deferred path-handle
                     // identity. Load a value and label it under this RBM, so even
                     // the same DDS used elsewhere as colour cannot alias this view.
+                    let normal_sampler =
+                        crate::native_sampler::normal_or_property(&block.type_name).sampler();
                     let image = cx
                         .load_builder()
-                        .with_settings(|settings: &mut ImageLoaderSettings| {
-                            settings.is_srgb = false
+                        .with_settings(move |settings: &mut ImageLoaderSettings| {
+                            settings.is_srgb = false;
+                            settings.sampler = normal_sampler.clone();
                         })
                         .load_value::<Image>(tex_path)
                         .await;
@@ -554,7 +799,23 @@ impl AssetLoader for RbmLoader {
             } else {
                 None
             };
-            let (mpm_image, ao_image) = if general_header.is_some() {
+            let bark_dirt = if is_bark_dirt(block) {
+                let diffuse = load_dirt_image(
+                    cx, &parent, &source, &block.material.properties, true,
+                    &mut dirt_images, format!("dirt_dif{i}"),
+                )
+                .await;
+                let normal = load_dirt_image(
+                    cx, &parent, &source, &block.material.deformed_diffuse, false,
+                    &mut dirt_images, format!("dirt_nrm{i}"),
+                )
+                .await;
+                diffuse.map(|d| (d, normal))
+            } else {
+                None
+            };
+            let native_skinned = is_native_skinned(block);
+            let (mpm_image, ao_image) = if general_header.is_some() || native_skinned {
                 (
                     load_data_image(
                         cx,
@@ -563,6 +824,7 @@ impl AssetLoader for RbmLoader {
                         &block.material.properties,
                         &mut data_images,
                         format!("mpm{i}"),
+                        crate::native_sampler::normal_or_property(&block.type_name).sampler(),
                     )
                     .await,
                     load_data_image(
@@ -572,22 +834,35 @@ impl AssetLoader for RbmLoader {
                         &block.material.deformed_diffuse,
                         &mut data_images,
                         format!("ao{i}"),
+                        crate::native_sampler::ambient_occlusion(&block.type_name).sampler(),
                     )
                     .await,
                 )
             } else {
                 (None, None)
             };
+            let character = character_state(
+                &block.type_name,
+                block.params.first().map_or(0, |f| *f as u32),
+            );
+            let eye_gloss = character.is_some_and(|c| c.eye_gloss);
             let material = StandardMaterial {
-                base_color: if texture.is_some() {
+                // the cornea adds only light: no diffuse (its texture is plain white)
+                base_color: if eye_gloss {
+                    Color::BLACK
+                } else if texture.is_some() {
                     Color::WHITE
                 } else {
                     Color::srgb(0.7, 0.7, 0.75)
                 },
-                base_color_texture: texture,
+                base_color_texture: if eye_gloss { None } else { texture },
                 normal_map_texture,
                 perceptual_roughness: if block.type_name.starts_with("CarPaint") {
                     0.35
+                } else if eye_gloss {
+                    0.15
+                } else if character.is_some_and(|c| c.hair) {
+                    1.0
                 } else {
                     0.7
                 },
@@ -596,27 +871,97 @@ impl AssetLoader for RbmLoader {
                 } else {
                     0.0
                 },
-                alpha_mode: alpha_mode(&block.type_name),
-                cull_mode: None,
-                double_sided: true,
+                alpha_mode: match character {
+                    Some(c) if c.eye_gloss => AlphaMode::Add,
+                    Some(c) if c.soft_fringe => AlphaMode::Blend,
+                    Some(CharacterState { alpha_ref: Some(r), .. }) => AlphaMode::Mask(r),
+                    _ => alpha_mode(&block.type_name),
+                },
+                cull_mode: if character.is_some_and(|c| c.cull_back) {
+                    Some(bevy::render::render_resource::Face::Back)
+                } else {
+                    None
+                },
+                // the native `vegetationbark` PS has no specular term at all (diffuse * (sun N.L +
+                // hemisphere ambient) * vertex colour, then fog): F0 0 removes Bevy's highlight
+                reflectance: if character.is_some_and(|c| c.hair) || block.type_name == "VegetationBark" {
+                    0.0
+                } else {
+                    0.5
+                },
+                double_sided: !character.is_some_and(|c| c.cull_back),
                 ..default()
+            };
+            // VegetationFoliage PS: t1 = the normal map (RGB - 0.5, A = translucency weight; for some
+            // models the file repeats the diffuse, the shader reads it all the same), t2 = the
+            // `*_aoc.dds` at UV1 (R scales the ambient), cb1[1].xy = header floats 0 and 1.
+            let foliage_native = if block.foliage_flags.is_some() {
+                Some(crate::foliage_alpha::NativeFoliage {
+                    normal: load_data_image(
+                        cx,
+                        &parent,
+                        &source,
+                        &block.material.normal,
+                        &mut data_images,
+                        format!("foliage_nrm{i}"),
+                        crate::native_sampler::normal_or_property(&block.type_name).sampler(),
+                    )
+                    .await,
+                    aoc: load_data_image(
+                        cx,
+                        &parent,
+                        &source,
+                        &block.material.properties,
+                        &mut data_images,
+                        format!("foliage_aoc{i}"),
+                        crate::native_sampler::ambient_occlusion(&block.type_name).sampler(),
+                    )
+                    .await,
+                    spec_amplitude: block.params.first().copied().unwrap_or(0.0),
+                    spec_power: block.params.get(1).copied().unwrap_or(0.0),
+                })
+            } else {
+                None
             };
             let foliage = block.foliage_flags.map(|flags| {
                 let state = jc2_formats::foliage::FoliageAlpha::initialized(flags);
-                let source = crate::foliage_alpha::source_material(material.clone(), state);
+                let mut source = crate::foliage_alpha::source_material(material.clone(), state);
+                if let Some(native) = foliage_native.clone() {
+                    source.extension.set_native(native);
+                }
                 debug!("RBM {path}: ordinary foliage flags={flags:#x} enabled={} instance_byte=255 reference={} distance_factor=1 (original scheduler unresolved086)",
                     state.enabled(),state.reference());
                 RbmFoliage {material:cx.add_labeled_asset(format!("foliage{i}"),source),state}
+            });
+            // BillboardFoliage (f012a36f): the camera-facing vertex stage, native pixel shader
+            // and 4x alpha test of the foliage material. `JC2_NO_NATIVE_BILLBOARD=1` keeps the
+            // static quads in the model's XY plane with Bevy lighting (the before captures).
+            let foliage = foliage.or_else(|| {
+                (block.type_name == "BillboardFoliage"
+                    && std::env::var_os("JC2_NO_NATIVE_BILLBOARD").is_none())
+                .then(|| {
+                    let state = jc2_formats::foliage::FoliageAlpha::initialized(0);
+                    let mut source =
+                        crate::foliage_alpha::source_material(material.clone(), state);
+                    source.extension.set_billboard(billboard_centroid(block));
+                    debug!(
+                        "RBM {path}: BillboardFoliage block {i} native camera-facing route ({} vertices)",
+                        block.mesh.positions.len()
+                    );
+                    RbmFoliage {
+                        material: cx.add_labeled_asset(format!("foliage{i}"), source),
+                        state,
+                    }
+                })
             });
             let general = general_header.map(|header| {
                 let params = crate::general_material::GeneralParams::new(
                     header,
                     mpm_image.is_some(),
                     ao_image.is_some(),
-                    self.spec_standin,
                 );
                 debug!(
-                    "RBM {path}: General block {i} native route flags={:#x} power={} mpm={} ao={} channel_textures={} channel_ao={} (unproven: reflection t4, specular colour cb0[1], point lights; snow off)",
+                    "RBM {path}: General block {i} native route flags={:#x} power={} mpm={} ao={} channel_textures={} channel_ao={} (unproven: point lights; snow off)",
                     header.render_flags,
                     header.specular_power,
                     mpm_image.is_some(),
@@ -641,11 +986,50 @@ impl AssetLoader for RbmLoader {
                     header: header.clone(),
                 }
             });
-            if block.type_name == "BillboardFoliage" {
+            if block.type_name == "BillboardFoliage" && foliage.is_none() {
                 warn!(
                     "RBM {path}: billboard x4 shader evidence exists, instance/enable ownership unsupported; retaining legacy alpha fallback"
                 );
             }
+            let skinned_general = native_skinned.then(|| {
+                debug!("RBM {path}: SkinnedGeneral block {i} native opaque double-sided route");
+                // block +0x30: the second header float (rim scale)
+                let rim_scale = block.params.get(2).copied().unwrap_or(1.0);
+                let source = if character.is_some() {
+                    crate::skinned_general_material::character_material(
+                        material.clone(),
+                        mpm_image.clone(),
+                        rim_scale,
+                        character.and_then(|c| c.blend_ref),
+                    )
+                } else {
+                    crate::skinned_general_material::source_material(
+                        material.clone(),
+                        mpm_image.clone(),
+                        rim_scale,
+                    )
+                };
+                cx.add_labeled_asset(format!("skinned_general{i}"), source)
+            });
+            let hemisphere = (foliage.is_none()
+                && general.is_none()
+                && skinned_general.is_none()
+                && self.hemisphere_route
+                && crate::hemisphere_material::is_hemisphere_family(&block.type_name))
+            .then(|| {
+                let mut source =
+                    crate::hemisphere_material::source_material(material.clone(), &block.type_name);
+                if let Some((dirt, dirt_normal)) = bark_dirt.clone() {
+                    source.extension.set_dirt(dirt, dirt_normal);
+                }
+                cx.add_labeled_asset(
+                    format!("hemisphere{i}"),
+                    crate::hemisphere_material::with_alpha_reference(
+                        source,
+                        character.and_then(|c| c.blend_ref),
+                    ),
+                )
+            });
             let material = cx.add_labeled_asset(format!("material{i}"), material);
             blocks.push(RbmBlock {
                 type_name: block.type_name.clone(),
@@ -653,6 +1037,8 @@ impl AssetLoader for RbmLoader {
                 diffuse_view,
                 foliage,
                 general,
+                hemisphere,
+                skinned_general,
                 mesh,
                 material,
                 triangles: block.mesh.triangle_count(),
@@ -688,6 +1074,7 @@ impl AssetLoader for RbmLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::image::{ImageAddressMode, ImageFilterMode};
     use crate::archive_source::JcAssetReader;
     use bevy::asset::io::{
         AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, VecReader,
@@ -727,6 +1114,77 @@ mod tests {
             extra_attribute_streams: 0,
             instances: Vec::new(),
         }
+    }
+
+    #[test]
+    fn rico_block_flags_select_the_native_draw_state() {
+        // clothes / head: opaque, back faces culled
+        for f in [0x10_0000u32, 0x8_0000] {
+            let c = character_state("SkinnedGeneral", f).unwrap();
+            assert!(c.cull_back && c.alpha_ref.is_none() && !c.eye_gloss && !c.hair);
+        }
+        // eyes: the blended cornea
+        assert!(character_state("SkinnedGeneral", 4).unwrap().eye_gloss);
+        // the normal map is applied to every character block but the cornea (board 2280444f)
+        let block = |flags: u32| {
+            RenderBlock {
+                type_name: "SkinnedGeneral".into(),
+                type_hash: 0,
+                version: 3,
+                material: jc2_formats::rbm::Material {
+                    normal: "n.dds".into(),
+                    diffuse: "d.dds".into(),
+                    ..Default::default()
+                },
+                mesh: Default::default(),
+                params: vec![flags as f32],
+                foliage_flags: None,
+                general: None,
+                extra_attribute_streams: 0,
+                instances: Vec::new(),
+            }
+        };
+        for f in [0x10_0000u32, 0x8_0000, 0x1_0001, 0x5_0001] {
+            assert!(normal_texture_name(&block(f), true).is_some(), "{f:#x}");
+        }
+        assert!(normal_texture_name(&block(4), true).is_none());
+        assert!(normal_texture_name(&block(0x10_0000), false).is_none());
+        // hair: two sided, tested; the bit-18 pass is the soft fringe
+        let h = character_state("SkinnedGeneral", 0x10001).unwrap();
+        assert!(!h.cull_back && h.hair && h.alpha_ref == Some(393.0 / 510.0) && !h.soft_fringe);
+        let h2 = character_state("SkinnedGeneral", 0x50001).unwrap();
+        assert!(h2.soft_fringe && h2.alpha_ref.is_none() && h2.blend_ref == Some(3.0 / 510.0));
+        // the canopy keeps its own route
+        assert!(character_state("SkinnedGeneral", 0x1_0000).is_none());
+    }
+
+    /// f012a36f: a card's four vertices store `centre + offset` in the XY plane and the offset
+    /// in UV1; the centroid is the mean of the centres (block +0x28 of the native loader), and
+    /// the mesh keeps the offsets for the vertex shader.
+    #[test]
+    fn billboard_centroid_is_the_mean_of_the_card_centres() {
+        let mut block = triangle_block();
+        block.type_name = "BillboardFoliage".into();
+        block.mesh.positions = vec![
+            [3.0, 5.0, 1.0],
+            [-1.0, 5.0, 1.0],
+            [3.0, 1.0, 1.0],
+            [-1.0, 1.0, 1.0],
+        ];
+        // the card centre is (1, 3, 1) with offsets (+-2, +-2)
+        block.mesh.uv1 = vec![[2.0, 2.0], [-2.0, 2.0], [2.0, -2.0], [-2.0, -2.0]];
+        block.mesh.normals.clear();
+        block.mesh.tangents.clear();
+        block.mesh.uv0 = vec![[0.0, 0.0]; 4];
+        block.mesh.indices = vec![0, 1, 2, 2, 1, 3];
+        assert_eq!(billboard_centroid(&block), Vec3::new(1.0, 3.0, 1.0));
+        let mesh = block_to_mesh(&block);
+        let VertexAttributeValues::Float32x2(corner) =
+            mesh.attribute(Mesh::ATTRIBUTE_UV_1).unwrap()
+        else {
+            panic!("UV1 must carry the corner offset");
+        };
+        assert_eq!(corner[3], [-2.0, -2.0]);
     }
 
     #[test]
@@ -1143,12 +1601,119 @@ mod tests {
             .init_asset::<RbmAsset>()
             .init_asset::<crate::foliage_alpha::FoliageMaterial>()
             .init_asset::<crate::general_material::GeneralMaterial>()
+            .init_asset::<crate::hemisphere_material::HemisphereMaterial>()
             // Headless loading retains original BC pixels; no GPU is needed to
             // inspect the colour/data views. DDS does not decompress BC on an
             // unsupported device, so NONE would reject the retail maps.
             .register_asset_loader(ImageLoader::new(CompressedImageFormats::BC))
             .register_asset_loader(loader);
         app
+    }
+
+    #[test]
+    fn retail_tiled_bark_and_normal_images_wrap() {
+        // JC2-251: the pine bark UV0 spans about -1.3..26.6; clamp-to-edge smeared it.
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = Arc::new(GameFs::open(dir).unwrap());
+        let mut app = app_with_reader(AssetSourceBuilder::new(move || {
+            Box::new(JcAssetReader::new(fs.clone()))
+        }));
+        let handle: Handle<RbmAsset> = app
+            .world()
+            .resource::<AssetServer>()
+            .load("jc2://vegetation_1.blz/Arctic_T22_PineL_LOD1-Whole.rbm");
+        wait_for_asset(&mut app, &handle);
+        let model = app
+            .world()
+            .resource::<Assets<RbmAsset>>()
+            .get(&handle)
+            .unwrap();
+        let bark = model
+            .blocks
+            .iter()
+            .find(|b| b.type_name == "VegetationBark")
+            .unwrap();
+        let VertexAttributeValues::Float32x2(uv) = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&bark.mesh)
+            .unwrap()
+            .attribute(Mesh::ATTRIBUTE_UV_0)
+            .unwrap()
+            .clone()
+        else {
+            panic!("UV0 is not Float32x2");
+        };
+        assert!(
+            uv.iter().any(|t| t[0] > 4.0),
+            "the bark really tiles beyond 0..1"
+        );
+        let material = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&bark.material)
+            .unwrap();
+        let images = app.world().resource::<Assets<Image>>();
+        for (what, handle) in [
+            ("colour", material.base_color_texture.as_ref()),
+            ("normal", material.normal_map_texture.as_ref()),
+        ] {
+            let Some(handle) = handle else { continue };
+            let ImageSampler::Descriptor(d) = &images.get(handle).unwrap().sampler else {
+                panic!("{what} image keeps the default clamp sampler");
+            };
+            assert_eq!(d.address_mode_u, ImageAddressMode::Repeat, "{what} U");
+            assert_eq!(d.address_mode_v, ImageAddressMode::Repeat, "{what} V");
+            // native filter fields (7,7): trilinear + anisotropic, never Bevy's NEAREST default
+            // (board c728494e: the blocky magnified textures)
+            assert_eq!(d.mag_filter, ImageFilterMode::Linear, "{what} mag");
+            assert_eq!(d.min_filter, ImageFilterMode::Linear, "{what} min");
+            assert_eq!(d.mipmap_filter, ImageFilterMode::Linear, "{what} mip");
+            assert!(d.anisotropy_clamp > 1, "{what} anisotropy");
+        }
+        assert!(material.base_color_texture.is_some());
+    }
+
+    #[test]
+    fn retail_40_byte_bark_blocks_carry_the_dirt_blend() {
+        // lighting-gaps-next.md G9: the `_Dirt` pixel shader blends t2 / t3 at UV1 on the 40-byte layout.
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = Arc::new(GameFs::open(dir).unwrap());
+        let mut app = app_with_reader(AssetSourceBuilder::new(move || {
+            Box::new(JcAssetReader::new(fs.clone()))
+        }));
+        let handle: Handle<RbmAsset> = app
+            .world()
+            .resource::<AssetServer>()
+            .load("jc2://vegetation_1.blz/Arctic_T22_PineL_LOD1-Whole.rbm");
+        wait_for_asset(&mut app, &handle);
+        let model = app.world().resource::<Assets<RbmAsset>>().get(&handle).unwrap();
+        let materials = app
+            .world()
+            .resource::<Assets<crate::hemisphere_material::HemisphereMaterial>>();
+        let dirt: Vec<_> = model
+            .blocks
+            .iter()
+            .filter_map(|b| b.hemisphere.as_ref())
+            .filter_map(|h| materials.get(h))
+            .filter(|m| m.extension.dirt_flags.x > 0.5)
+            .collect();
+        assert!(!dirt.is_empty(), "the Arctic pine has 40-byte bark blocks");
+        let images = app.world().resource::<Assets<Image>>();
+        for m in dirt {
+            let diffuse = images.get(m.extension.dirt_diffuse.as_ref().unwrap()).unwrap();
+            assert!(diffuse.texture_descriptor.format.is_srgb(), "dirt diffuse is a colour view");
+            let ImageSampler::Descriptor(d) = &diffuse.sampler else {
+                panic!("dirt diffuse keeps the clamp sampler");
+            };
+            assert_eq!(d.address_mode_u, ImageAddressMode::Repeat);
+            let normal = images.get(m.extension.dirt_normal.as_ref().unwrap()).unwrap();
+            assert!(!normal.texture_descriptor.format.is_srgb(), "dirt normal is linear data");
+        }
     }
 
     #[test]
@@ -1257,6 +1822,7 @@ mod tests {
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
         .init_asset::<crate::general_material::GeneralMaterial>()
+        .init_asset::<crate::hemisphere_material::HemisphereMaterial>()
         .register_asset_loader(ImageLoader::new(CompressedImageFormats::BC))
         .register_asset_loader(RbmLoader::default());
         let one: Handle<RbmAsset> = app
@@ -1479,6 +2045,7 @@ mod tests {
             AssetSourceBuilder::new(move || Box::new(JcAssetReader::new(fs.clone()))),
             RbmLoader {
                 general_route: false,
+                hemisphere_route: true,
                 ..RbmLoader::default()
             },
         );

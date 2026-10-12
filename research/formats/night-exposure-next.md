@@ -219,6 +219,9 @@ in 1.4 gives `A` as a function of it.
 
 ## 7. Gaps (native details still unknown)
 
+Update (JC2-135, `post-manager-defaults-next.md`): gaps 1 (still inferred), 2, 3, 5, 6, 7 and 9 are resolved or narrowed there (smoothed clock dt, meter
+geometry, ring cadence, defaults, selector, S0..S3 consumers); the text below is the original JC2-124 state.
+
 1. **Alternate-mode flags `P[9]` and `P+0x25`** (`FUN_0096f360`): who sets them and their defaults. If either is set the tone-mapping pass, sun
    halo, `FUN_0096a420`, `FUN_00966a40` are skipped. Blocks: certainty that auto-exposure runs in the shipped PC build (assumed on).
 2. **Post-manager defaults and locks:** the constructor values of `S(0..27)` before the first block application, `S(21..24)` consumers and

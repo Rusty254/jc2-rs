@@ -20,8 +20,10 @@
 //!   frame):** the tap geometry, i.e. [`TAP_OFFSETS`] (in units of source texels, added to the
 //!   target pixel centre, bilinear sampler), the `0.5 uv + 0.25` mapping of the final stage,
 //!   the map sizes 64 / 16 / 4 and that the first stage reads the full swap-chain-sized frame.
-//! * **Inferred (brief Gap 3):** `dt` is the real frame delta in seconds (the exe's
-//!   `FUN_004d3690(0)`).
+//! * **Native (JC2-135, `post-manager-defaults-next.md` section 2):** `dt` is the smoothed game
+//!   clock of `FUN_004d3690(0)`, see [`ClockModel`]. **Inferred:** the elapsed milliseconds
+//!   come from Bevy's real-time delta rounded to whole ms (native `timeGetTime`), and the time
+//!   scale is 1.0 (slow motion is not ported).
 //! * **Inferred (brief Gap 7):** one frame of latency (the pass runs after the composite, so
 //!   the composite of frame N uses the value metered from frame N-1). The native ring texture
 //!   may add a second frame of lag; that is not modelled.
@@ -74,6 +76,43 @@ pub fn exposure_target(taps: [f32; 4], x: f32, y: f32, key: f32) -> f32 {
         .map(|l| (key / l.max(LUMINANCE_FLOOR)).max(0.0))
         .fold(f32::MIN, f32::max);
     1.0 + y * ((r_avg + x * (r_max - r_avg)) - 1.0)
+}
+
+/// Clamp of one elapsed sample in the game clock tick `FUN_004e1d90`, milliseconds.
+pub const CLOCK_SAMPLE_MAX_MS: f32 = 67.0;
+/// Smoothing divisor of the game clock (smoothing factor 10, divisor 11).
+pub const CLOCK_SMOOTHING_DIVISOR: f32 = 11.0;
+/// Value of `FUN_004d3690(0)` while the tutorial pause flag is set (the exposure pass clamps
+/// it to [`DT_MIN`]).
+pub const CLOCK_PAUSED_DT: f32 = 1e-6;
+
+/// The game clock's dt (timer+0x14 of the `CClock` singleton, tick `FUN_004e1d90`), the value
+/// the post pass receives. **Native** (JC2-135): constructor 1/60; each tick moves the stored
+/// dt 1/11 of the way to `min(elapsed_ms, 67) * 0.001 * time_scale`, without a floor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockModel {
+    /// The stored smoothed dt in seconds.
+    pub dt: f32,
+}
+
+impl Default for ClockModel {
+    fn default() -> Self {
+        Self { dt: 1.0 / 60.0 }
+    }
+}
+
+impl ClockModel {
+    /// One frame's tick; returns the new dt. `elapsed_ms` is 0 for the very first tick.
+    pub fn tick(&mut self, elapsed_ms: f32, time_scale: f32) -> f32 {
+        let sample = elapsed_ms.min(CLOCK_SAMPLE_MAX_MS) * 0.001 * time_scale;
+        self.dt += (sample - self.dt) / CLOCK_SMOOTHING_DIVISOR;
+        self.dt
+    }
+
+    /// What `FUN_004d3690(0)` returns: the stored dt, or 1e-6 while paused.
+    pub fn post_dt(&self, paused: bool) -> f32 {
+        if paused { CLOCK_PAUSED_DT } else { self.dt }
+    }
 }
 
 /// `CalculateAdaptedLum`: one adaptation step from `prev` toward `target` over `dt` seconds.
@@ -173,13 +212,7 @@ pub fn final_taps(map4: &[f32]) -> [f32; 4] {
 
 /// The whole chain on a scene given as a function `uv -> linear colour` (the bilinear sampled
 /// 8-bit frame of `size` pixels): the target `T` for the block values `x`, `y`, `key`.
-pub fn meter_target(
-    scene: impl Fn(Vec2) -> Vec3,
-    size: Vec2,
-    x: f32,
-    y: f32,
-    key: f32,
-) -> f32 {
+pub fn meter_target(scene: impl Fn(Vec2) -> Vec3, size: Vec2, x: f32, y: f32, key: f32) -> f32 {
     let mut map64 = vec![0.0; MAP_INITIAL * MAP_INITIAL];
     for j in 0..MAP_INITIAL {
         for i in 0..MAP_INITIAL {
@@ -209,6 +242,35 @@ mod tests {
     }
 
     /// The probe's steady-state table (brief 1.4): `A = T` for a uniform scene.
+    #[test]
+    fn the_clock_smooths_clamps_and_scales_like_the_tick() {
+        let mut c = ClockModel::default();
+        // the very first tick (elapsed 0) moves 1/60 to 0.0151515
+        assert!((c.tick(0.0, 1.0) - 0.015_151_5).abs() < 1e-6);
+        // steady 17 ms frames converge to 0.017
+        let mut c = ClockModel::default();
+        for _ in 0..300 {
+            c.tick(17.0, 1.0);
+        }
+        assert!((c.dt - 0.017).abs() < 1e-5);
+        // a 500 ms hitch moves dt by (0.067 - 1/60) / 11 only
+        let mut c = ClockModel::default();
+        let want = 1.0 / 60.0 + (0.067 - 1.0 / 60.0) / 11.0;
+        assert!((c.tick(500.0, 1.0) - want).abs() < 1e-7);
+        // time scale 0.5 halves the steady dt
+        let mut c = ClockModel::default();
+        for _ in 0..300 {
+            c.tick(20.0, 0.5);
+        }
+        assert!((c.dt - 0.010).abs() < 1e-5);
+        // paused: 1e-6, which the exposure step clamps to 0.01
+        assert_eq!(c.post_dt(true), CLOCK_PAUSED_DT);
+        assert_eq!(
+            adapt_exposure(1.0, 2.0, c.post_dt(true)),
+            adapt_exposure(1.0, 2.0, DT_MIN)
+        );
+    }
+
     #[test]
     fn the_steady_state_table_matches_the_probe() {
         let means = [0.02, 0.05, 0.1, 0.2, 0.32, 0.5, 0.8];
@@ -256,7 +318,10 @@ mod tests {
             a = adapt_exposure(a, 2.0, 1.0 / 60.0);
         }
         // 60 *discrete* steps of 1 - exp(-1.74878/60) are exactly the continuous exponential
-        assert!((a - (1.0 + (1.0 - (-ADAPT_RATE).exp()))).abs() < 1e-4, "{a}");
+        assert!(
+            (a - (1.0 + (1.0 - (-ADAPT_RATE).exp()))).abs() < 1e-4,
+            "{a}"
+        );
         // dt clamps to 0.5 at most (factor 0.582), result clamps 0..4
         let k5 = 1.0 - (-ADAPT_RATE * 0.5).exp();
         assert!((adapt_exposure(1.0, 3.0, 100.0) - (1.0 + 2.0 * k5)).abs() < 1e-6);

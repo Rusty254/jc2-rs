@@ -34,7 +34,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     pbr_functions::visibility_range_dither(in.position, in.visibility_range_dither);
 #endif
     let fade = foliage_distance_fade(in.world_position.xyz, in.instance_index);
-    if foliage_should_discard(ordinary_alpha(in), fade) { discard; }
+    if foliage_should_discard(ordinary_alpha(in), fade, in.instance_index) { discard; }
     var out: FragmentOutput;
 #ifdef UNCLIPPED_DEPTH_ORTHO_EMULATION
     out.frag_depth = in.unclipped_depth;
@@ -59,6 +59,6 @@ fn fragment(in: VertexOutput) {
     pbr_functions::visibility_range_dither(in.position, in.visibility_range_dither);
 #endif
     let fade = foliage_distance_fade(in.world_position.xyz, in.instance_index);
-    if foliage_should_discard(ordinary_alpha(in), fade) { discard; }
+    if foliage_should_discard(ordinary_alpha(in), fade, in.instance_index) { discard; }
 }
 #endif

@@ -168,3 +168,16 @@ plus the wrappers `FUN_006b63b0` (CMaterialSystem vtable `0xeb91e8` slot 4, retu
 6. **MPM alpha / framebuffer alpha** `o0.w` consumer.
 7. **Row 1 in the height / underwater / rain / snow branches** of `FUN_00a5d390` (inherits `night-light-next.md` gap 2) and under cutscene override.
 8. **Brown instance variant** (byte >= 128): what authored system uses it.
+
+## JC2-236 addendum: units of the post-lighting additions (defect fixed)
+
+`general_main.wgsl` added three native-unit terms after `apply_pbr_lighting` and multiplied each by `view.exposure` (`e0`, about 1/1000):
+the environment reflection `cube * (cb0[3] + cb0[10])` (section 1), the specular `cb0[1] * pow(N.H, p) * ...` and the instance tint lerp target.
+`GeneralLight` and the tint bytes are native colours (`LightState` is native, `native_units.rs`). Only Bevy's own lighting is scaled
+(sun lux = native * pi / e0, ambient = native / e0, then times `e0` inside Bevy), so the colour on the scene target is already native when these
+terms are added; the native PS adds them with no exposure factor (section 1 formula; PS order: lighting, reflection, specular, snow, fog, tint).
+Multiplying by `e0` made all three about 1000 times too dark. Fixed by dropping the factor on the three terms.
+The sun shadow correction and `ambient_tilt` keep `view.exposure`: their inputs are in Bevy units (unscaled `directional_light` output, `ambient_per_unit` tilt).
+Visible check: world 31,13, `--drive lave.v046_buscoach.ee`, 12:00, Rico's shotgun: before/after in `_extract/JC2-236` (car_before.png / car_after.png;
+the weapon's metal shows its reflection and highlight after). The model viewer capture of the bus is pixel-identical before/after (it does not reach this branch).
+Native-proven: formula and order (listing, JC2-110); units chain (native_units.rs tests). Not verified: per-material tint values on retail instances.

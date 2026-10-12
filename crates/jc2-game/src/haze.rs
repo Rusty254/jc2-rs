@@ -40,9 +40,11 @@
 use crate::atmosphere::{AtmosphereState, GradientData};
 use crate::sky::TimeOfDay;
 use crate::sky_light::{SkyLighting, ZoneGradientData};
-use bevy::asset::load_embedded_asset;
+use crate::sun_horizon::HorizonShadow;
+use bevy::asset::{AssetEventSystems, load_embedded_asset};
 use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
+use bevy::render::storage::ShaderBuffer;
 use jc2_formats::weather::{GradientTables, HazeSettings, RgbTable};
 
 /// Keeps the shared `jc2::haze_fog` shader module loaded.
@@ -282,6 +284,88 @@ pub fn update_haze_fog(
     }
 }
 
+/// The sky-card factor `F` (fraction of the fog colour mixed in) of the `cirrusclouds` / `clouds`
+/// vertex shaders (JC2-163): radial distance from the camera scaled by `scale` (0.25 cirrus,
+/// 0.7 clouds), the height scaled about the camera height, the exponent saturated, and for clouds
+/// remapped `max(2 (e - 0.5), 0)`. CPU mirror of `haze_sky_card_factor` in `haze_fog.wgsl`.
+#[allow(dead_code)] // CPU mirror of haze_fog.wgsl (tests, inspection)
+pub fn sky_card_factor(
+    c12: Vec4,
+    c13: Vec4,
+    len: f32,
+    y: f32,
+    cam_y: f32,
+    scale: f32,
+    cloud: bool,
+) -> f32 {
+    let len = len * scale;
+    let y = (y - cam_y) * scale + cam_y;
+    let h = y * c13.z - c13.x;
+    let mut e = sat(len * c12.z + (sat(len * c13.w) * (1.0 - h.min(c13.y)) - c12.x));
+    if cloud {
+        e = ((e - 0.5) * 2.0).max(0.0);
+    }
+    1.0 - (-e).exp2()
+}
+
+/// The constants bound when there is no terrain horizon (model viewer, fixtures): all zero, i.e.
+/// no fog.
+#[derive(Resource)]
+pub struct HazeFallback(pub Handle<ShaderBuffer>);
+
+fn make_haze_fallback(mut commands: Commands, buffers: Option<ResMut<Assets<ShaderBuffer>>>) {
+    if let Some(mut buffers) = buffers {
+        commands.insert_resource(HazeFallback(
+            buffers.add(ShaderBuffer::from(crate::sun_horizon::SunHorizon::default())),
+        ));
+    }
+}
+
+/// A custom material that binds the shared `SunHorizon` buffer (binding 101) for the haze fog
+/// fields; see [`add_haze_binding`].
+pub trait HazeBound: Asset {
+    fn haze_buffer(&self) -> &Handle<ShaderBuffer>;
+    fn set_haze_buffer(&mut self, buffer: Handle<ShaderBuffer>);
+}
+
+#[derive(Resource)]
+struct HazeFallbackRegistered;
+
+/// Register the all-zero fallback buffer (once) and the system that points every `M` at the
+/// shared `SunHorizon` buffer.
+pub fn add_haze_binding<M: HazeBound>(app: &mut App) {
+    if !app.world().contains_resource::<HazeFallbackRegistered>() {
+        app.insert_resource(HazeFallbackRegistered);
+        app.add_systems(Startup, make_haze_fallback);
+    }
+    app.add_systems(PostUpdate, bind_haze::<M>.before(AssetEventSystems));
+}
+
+/// Point every `M` at the shared `SunHorizon` buffer (whose fog fields
+/// `sun_horizon::update_horizon` writes every frame): the terrain's when there is one and it is
+/// enabled, otherwise the all-zero fallback. Writes only materials that differ.
+fn bind_haze<M: HazeBound>(
+    horizon: Option<Res<HorizonShadow>>,
+    fallback: Option<Res<HazeFallback>>,
+    mut materials: ResMut<Assets<M>>,
+) {
+    let Some(fallback) = fallback else { return };
+    let buffer = match &horizon {
+        Some(h) if h.enabled => h.params.clone(),
+        _ => fallback.0.clone(),
+    };
+    let stale: Vec<_> = materials
+        .iter()
+        .filter(|(_, m)| m.haze_buffer().id() != buffer.id())
+        .map(|(id, _)| id)
+        .collect();
+    for id in stale {
+        if let Some(mut m) = materials.get_mut(id) {
+            m.set_haze_buffer(buffer.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +531,54 @@ mod tests {
             assert!((got - e).abs() < 1e-4, "h{h} d{d}: e {got} vs {e}");
             assert!((transmittance(got) - t).abs() < 1e-4, "h{h} d{d}: T");
         }
+    }
+
+    /// The shared WGSL module (all fog functions, the sky-card one included) parses and validates.
+    #[test]
+    fn the_fog_module_validates() {
+        let src: String = include_str!("haze_fog.wgsl")
+            .lines()
+            .filter(|l| !l.starts_with("#define_import_path"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let module = naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        assert!(src.contains("fn haze_sky_card_factor"));
+    }
+
+    /// JC2-163: the cloud and cirrus factor (VS 104892 / 106016 of the shader bundle).
+    #[test]
+    fn sky_card_factors_follow_the_cloud_and_cirrus_shaders() {
+        let (c12, c13) = vs_constants(retail_settings().params(12.0, 0.0, 0.0), 202.0);
+        // no fog constants: no fog
+        let z = Vec4::ZERO;
+        assert_eq!(
+            sky_card_factor(z, z, 9_000.0, 3_000.0, 202.0, 0.7, true),
+            0.0
+        );
+        assert_eq!(
+            sky_card_factor(z, z, 9_000.0, 3_000.0, 202.0, 0.25, false),
+            0.0
+        );
+        // cirrus: len 20000 -> 5000 (density ramp 1); y 5202 -> 1452, above the camera's own
+        // height factor, so the height term is 1 - hc
+        let e = (5_000.0f32 * c12.z + (1.0 - c13.y) - c12.x).clamp(0.0, 1.0);
+        let f = sky_card_factor(c12, c13, 20_000.0, 5_202.0, 202.0, 0.25, false);
+        assert!((f - (1.0 - (-e).exp2())).abs() < 1e-5, "{f} vs e {e}");
+        // clouds: near cards sit in the dead zone (e < 0.5 gives 0), far ones do not
+        assert_eq!(
+            sky_card_factor(c12, c13, 1_000.0, 3_000.0, 202.0, 0.7, true),
+            0.0
+        );
+        let far = sky_card_factor(c12, c13, 40_000.0, 4_000.0, 202.0, 0.7, true);
+        assert!(far > 0.0 && far < 1.0, "{far}");
+        assert!(far >= sky_card_factor(c12, c13, 20_000.0, 4_000.0, 202.0, 0.7, true));
     }
 
     #[test]

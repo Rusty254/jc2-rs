@@ -9,7 +9,8 @@ GitHub repo only ever receives commits made by this script on the orphan `public
   git push github public:main                 # publish (after reviewing the commit)
 
 Excluded entirely: research/analysis/** (extracts of the executable), research/tools/**
-except our own generic tools, research/ghidra/**, notes/task-board*.json. In every other
+except our own generic tools, research/ghidra/**, notes/task-board*.json and the private build log
+(notes/jc2-rs Build Log.html, notes/progress.pdf, notes/build-log-parts/**). In every other
 text file, fenced code blocks and lines that quote decompiler output (Ghidra-style tokens)
 are removed; prose, file-format descriptions and native addresses stay.
 """
@@ -19,7 +20,7 @@ ROOT = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=Tru
 EXCLUDE_DIRS = ("research/analysis/", "research/ghidra/", "research/tools/")
 KEEP_TOOLS = {"research/tools/jenkins.py", "research/tools/render_obj.py",
               "research/tools/ghidra_scripts/ExportDecompProject.java"}
-EXCLUDE_FILES = re.compile(r"^notes/task-board.*\.json$")
+EXCLUDE_FILES = re.compile(r"^(notes/task-board.*\.json|notes/jc2-rs Build Log\.html|notes/progress\.pdf|notes/build-log-parts/.*)$")
 TOKENS = re.compile(r"\bundefined[1-8]?\b|\b(?:uVar|iVar|fVar|pcVar|puVar|piVar|lVar|bVar|cVar|sVar|local_|param_|in_stack_|extraout_|unaff_|pfVar|ppuVar)\w*|\(\*\*?\(code \*\*?\)|\bFUN_[0-9a-f]{8}\s*\(")
 TEXT_EXT = (".md", ".txt", ".rs", ".wgsl", ".toml", ".py", ".ps1", ".sh", ".json", ".csv", ".java")
 NOTE = ("\n> Public snapshot: research extracted from JustCause2.exe (function/string lists, "

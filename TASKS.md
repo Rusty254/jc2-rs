@@ -54,11 +54,9 @@ Invoke-RestMethod "$api/tasks/$($task.id)" -Method Patch `
 ```
 
 Supported states: `backlog`, `ready`, `in_progress`, `blocked`, `done`.
-For review, keep work `in_progress`, add an `awaiting-review` tag (preserving other
-tags), and post commit/branch, checks/results and a reviewer handoff comment.
-The coordinator (`claude/orchestrator`, see AGENTS.md "Coordinator and review") reviews,
-merges and marks done with progress 100 after review/integration and required checks;
-agents never merge to master or mark their own work done. Research completion does not imply runtime implementation completion.
+When finished, follow AGENTS.md "Coordinator and merging" (no review step since
+11 October 2026): pass the required checks, merge into master under the merge lock (`scripts/with-merge-lock.sh`),
+post the handoff comment, set `done` with progress 100 and tag `merged`. Research completion does not imply runtime implementation completion.
 Record blockers in comments and keep the assignee. Verify stale work before
 releasing/reassigning it; board access is coordination, not proof of authority.
 

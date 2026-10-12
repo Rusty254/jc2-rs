@@ -982,13 +982,12 @@ mod tests {
             (CONVOY_MIN - 5.0..CONVOY_MAX + 5.0).contains(&d0),
             "asked for {d0:.0} m away"
         );
-        for _ in 0..3 {
-            app.update();
-        }
-        assert!(
-            app.world().get::<Crew>(car).is_some(),
-            "no soldier at the wheel"
-        );
+        // the driver is added once its model has loaded on another thread: wait for the
+        // condition, not for a number of frames
+        testing::wait_until(&mut app, "a soldier at the wheel", |app| {
+            set_heat(app, 30.0);
+            app.world().get::<Crew>(car).is_some()
+        });
         let mut out = false;
         for _ in 0..64 * 40 {
             set_heat(&mut app, 30.0);
@@ -1017,6 +1016,11 @@ mod tests {
             heli.is_some()
         });
         let heli = heli.unwrap();
+        // its pilot comes with its model (loaded on another thread)
+        testing::wait_until(&mut app, "the helicopter's pilot", |app| {
+            set_heat(app, 50.0);
+            app.world().get::<HeliPilot>(heli).is_some()
+        });
         let mut ring = (f32::MAX, f32::MIN);
         let mut height = (f32::MAX, f32::MIN);
         for i in 0..64 * 40 {

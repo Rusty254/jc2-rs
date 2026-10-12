@@ -55,6 +55,25 @@ pub enum Clip {
     Reel,
     /// Climbing over a ledge out of the hang (`ANIM_REELED_IN_JUMP`: `grpl_reel_bounce`).
     GrappleClimb,
+    // --- the reel's own states (`basestatemachine`, JC2-250; `grapple/anim.rs`) ---
+    /// `S_REEL_START` (`reel_in_start`): the take-off from the ground, before the flight.
+    ReelStart,
+    /// `S_REEL_IMPACT_VERTICAL` (`grpl_reel_impact`): hitting a wall …
+    ReelImpactVertical,
+    /// … and `S_REELED_IN_IDLE` (`grpl_reeled_timeblend`): hanging on it.
+    ReeledInIdle,
+    /// `S_REEL_IMPACT_HORIZONTAL` (`reel_impact_horizontal`): hitting a ceiling …
+    ReelImpactHorizontal,
+    /// … `S_REELED_IN_TO_HANG` (`reel_impact_to_hang`) …
+    ReeledInToHang,
+    /// … and `S_HANGSTUNT_IDLE` (`heli_default_timeblend_hori`, the first of its two clips).
+    HangStuntIdle,
+    /// `S_REEL_END_LAND` (`grpl_reel_hori_land`): arriving on a floor.
+    ReelEndLand,
+    /// `S_REELED_IN_RELEASE_DROP` (`grpl_reeled_release`): letting go of a wall.
+    ReeledInReleaseDrop,
+    /// `S_HANG_TO_FALL` (`heli_default_exit_to_fall`): letting go of a ceiling.
+    HangToFall,
     /// Under the canopy (`ANIM_PARACHUTE`): a two-axis time blend; the speed axis
     /// (`rico_speed_tb_up`: 0.5 s is hands on the handles, 0 leaning back, 1 diving) …
     Chute,
@@ -65,8 +84,40 @@ pub enum Clip {
     Swim,
     /// Free fall: the skydive (`ANIM_SKYDIVE`: `mhfreefall`).
     Dive,
-    /// Crouched on a speeding vehicle's roof (`cr_idle`).
+    // --- the rest of the on-foot machine's states (`kc001_base.asb`, JC2-238) ---
+    /// `S_JUMP_START_STANDING` (`std_still_jump_start`) and its flight (`S_JUMP_FLIGHT_STANDING`,
+    /// `std_still_jump_flight`, played at 0.3).
+    JumpStartStanding,
+    JumpFlightStanding,
+    /// `S_JUMP_START_SPRINT_FORWARD` (`run_jump_start`), then `S_JUMP_TO_FALL_TRANSITION`
+    /// (`run_jump_timeblend`, played at 1.2) or `S_JUMP_TO_SKYDIVE` (`run_jump_to_freefall`).
+    JumpStartRun,
+    JumpTimeBlend,
+    JumpToSkydive,
+    /// `S_FALL_TO_SKYDIVE` (`falling_to_freefall`).
+    FallToSkydive,
+    /// The pulled chord and the unfolding canopy: `S_PULL_OPEN_PARACHUTE_VERTICAL` and
+    /// `S_UNFOLD_PARACHUTE_VERTICAL` (`rico_open_chute`), `S_UNFOLD_PARACHUTE_HORIZONTAL`
+    /// (`rico_reel_open`), and letting go of the canopy (`S_PARACHUTE_DETACH_TO_FREEFALL`:
+    /// `detatch_chute`).
+    ChuteOpen,
+    ChuteOpenHorizontal,
+    ChuteDetach,
+    /// Coming to a stop (`S_UPRIGHT_STOP`: `wk_to_idle_rgt` / `run_to_idle`; `S_DASH_STOP`:
+    /// `dash_to_idle`).
+    WalkToIdle,
+    RunToIdle,
+    DashToIdle,
+    /// Running into the sea (`S_SWIM_RUN_TO_SWIM`) and diving idle (`S_SWIM_DIVE_IDLE`).
+    RunToSwim,
+    SwimDiveIdle,
+    /// Crouched on a speeding vehicle's roof (`cr_idle`); on foot, `S_CROUCH`.
     Crouch,
+    /// `S_DOWN_TO_CROUCH` (`crouch_DN`, 0.4 s), `S_UP_FROM_CROUCH` (`crouch_UP`, 0.5 s) and the
+    /// evasive roll `S_EVADE` / `S_EVADE_INTERRUPT` (`evade_fwd`, 0.933 s; JC2-051).
+    CrouchDown,
+    CrouchUp,
+    EvadeFwd,
     /// Sitting at the wheel (`mv_driving_fwd`): soldiers driving and flying.
     Drive,
     // --- upper-body layers: how a gun is held (spine, head, arms, fingers) ---
@@ -120,6 +171,13 @@ pub enum Clip {
     GrappleFire,
     /// … and in the air (`grpl_freefall_fire_ani_con`).
     GrappleFireAir,
+    /// `LA_S_GRAPPLE_DETACH` / `LA_S_HOOK_MISSED` / `LA_S_GRAPPLE_TO_IDLE`: the arm drops
+    /// back (`la_grpl_idle_recoil`).
+    GrappleRecoil,
+    /// `LA_S_GRAPPLE_PULL` (`grpl_idle_to_pull`): pulling a light thing or a soldier in.
+    GrapplePull,
+    /// `LA_S_DUAL_GRAPPLE` (`grpl_fire_dualhook_con`): the second hook.
+    GrappleDual,
     // --- soldiers (on the same `biped.bsk`) ---
     NpcIdle,
     NpcWalk,
@@ -131,6 +189,8 @@ pub enum Clip {
     NpcReload,
     /// A soldier dragged by the hook (`UB_ANIM_GRAPPLED`: `stumble_grpl`).
     NpcStumble,
+    /// `UB_S_REMOVE_GRAPPLINGHOOK` (`stumble_grpl_release`): the hook comes off him.
+    NpcStumbleRelease,
     /// The civilians' own clips, on `civilian_biped.bsk` (not in `ALL`: `Rig::load_with`).
     CivIdle,
     CivWalk,
@@ -143,6 +203,20 @@ impl Clip {
     /// Everything on `biped.bsk`: Rico's clips and the soldiers'.
     pub const ALL: &[Clip] = &[
         Clip::Dive,
+        Clip::JumpStartStanding,
+        Clip::JumpFlightStanding,
+        Clip::JumpStartRun,
+        Clip::JumpTimeBlend,
+        Clip::JumpToSkydive,
+        Clip::FallToSkydive,
+        Clip::ChuteOpen,
+        Clip::ChuteOpenHorizontal,
+        Clip::ChuteDetach,
+        Clip::WalkToIdle,
+        Clip::RunToIdle,
+        Clip::DashToIdle,
+        Clip::RunToSwim,
+        Clip::SwimDiveIdle,
         Clip::Walk,
         Clip::Idle,
         Clip::Run,
@@ -162,12 +236,24 @@ impl Clip {
         Clip::Hang,
         Clip::Reel,
         Clip::GrappleClimb,
+        Clip::ReelStart,
+        Clip::ReelImpactVertical,
+        Clip::ReeledInIdle,
+        Clip::ReelImpactHorizontal,
+        Clip::ReeledInToHang,
+        Clip::HangStuntIdle,
+        Clip::ReelEndLand,
+        Clip::ReeledInReleaseDrop,
+        Clip::HangToFall,
         Clip::Chute,
         Clip::ChuteTurn,
         Clip::ChuteLand,
         Clip::SwimIdle,
         Clip::Swim,
         Clip::Crouch,
+        Clip::CrouchDown,
+        Clip::CrouchUp,
+        Clip::EvadeFwd,
         Clip::Drive,
         Clip::Wield1HRun,
         Clip::Wield1HAlert,
@@ -200,6 +286,9 @@ impl Clip {
         Clip::GrappleAim,
         Clip::GrappleFire,
         Clip::GrappleFireAir,
+        Clip::GrappleRecoil,
+        Clip::GrapplePull,
+        Clip::GrappleDual,
         Clip::NpcIdle,
         Clip::NpcWalk,
         Clip::NpcRun,
@@ -209,6 +298,7 @@ impl Clip {
         Clip::NpcRecoilSmg,
         Clip::NpcReload,
         Clip::NpcStumble,
+        Clip::NpcStumbleRelease,
     ];
 
     pub fn file(self) -> &'static str {
@@ -232,13 +322,39 @@ impl Clip {
             Clip::Hang => "grpl_hang.ban",
             Clip::Reel => "grpl_reel_flight_part2.ban",
             Clip::GrappleClimb => "grpl_reel_bounce.ban",
+            Clip::ReelStart => "reel_in_start.ban",
+            Clip::ReelImpactVertical => "grpl_reel_impact.ban",
+            Clip::ReeledInIdle => "grpl_reeled_timeblend.ban",
+            Clip::ReelImpactHorizontal => "reel_impact_horizontal.ban",
+            Clip::ReeledInToHang => "reel_impact_to_hang.ban",
+            Clip::HangStuntIdle => "heli_default_timeblend_hori.ban",
+            Clip::ReelEndLand => "grpl_reel_hori_land.ban",
+            Clip::ReeledInReleaseDrop => "grpl_reeled_release.ban",
+            Clip::HangToFall => "heli_default_exit_to_fall.ban",
             Clip::Chute => "rico_speed_tb_up.ban",
             Clip::ChuteTurn => "rico_turn_tb_up.ban",
             Clip::Dive => "mhfreefall.ban",
+            Clip::JumpStartStanding => "std_still_jump_start.ban",
+            Clip::JumpFlightStanding => "std_still_jump_flight.ban",
+            Clip::JumpStartRun => "run_jump_start.ban",
+            Clip::JumpTimeBlend => "run_jump_timeblend.ban",
+            Clip::JumpToSkydive => "run_jump_to_freefall.ban",
+            Clip::FallToSkydive => "falling_to_freefall.ban",
+            Clip::ChuteOpen => "rico_open_chute.ban",
+            Clip::ChuteOpenHorizontal => "rico_reel_open.ban",
+            Clip::ChuteDetach => "detatch_chute.ban",
+            Clip::WalkToIdle => "wk_to_idle_rgt.ban",
+            Clip::RunToIdle => "run_to_idle.ban",
+            Clip::DashToIdle => "dash_to_idle.ban",
+            Clip::RunToSwim => "run_to_swim.ban",
+            Clip::SwimDiveIdle => "swim_dive_idle.ban",
             Clip::ChuteLand => "land_chute.ban",
             Clip::SwimIdle => "swim_idle.ban",
             Clip::Swim => "swim_fwd.ban",
             Clip::Crouch => "cr_idle.ban",
+            Clip::CrouchDown => "crouch_dn.ban",
+            Clip::CrouchUp => "crouch_up.ban",
+            Clip::EvadeFwd => "evade_fwd.ban",
             Clip::Drive => "mv_driving_fwd.ban",
             Clip::Wield1HRun => "one_handed_run_fwd.ban",
             Clip::Wield1HAlert => "ub_idle_alerted_var1.ban",
@@ -271,6 +387,9 @@ impl Clip {
             Clip::GrappleAim => "grpl_fire_aim_con.ban",
             Clip::GrappleFire => "grpl_fire_ani_con.ban",
             Clip::GrappleFireAir => "grpl_freefall_fire_ani_con.ban",
+            Clip::GrappleRecoil => "la_grpl_idle_recoil.ban",
+            Clip::GrapplePull => "grpl_idle_to_pull.ban",
+            Clip::GrappleDual => "grpl_fire_dualhook_con.ban",
             Clip::NpcIdle => "npc_std_idle.ban",
             Clip::NpcWalk => "npc_wk_fwd.ban",
             Clip::NpcRun => "npc_tactical_fwd.ban",
@@ -280,6 +399,7 @@ impl Clip {
             Clip::NpcRecoilSmg => "npc_two_handed_smg_recoil_con.ban",
             Clip::NpcReload => "npc_ub_single_pistol_reload.ban",
             Clip::NpcStumble => "stumble_grpl.ban",
+            Clip::NpcStumbleRelease => "stumble_grpl_release.ban",
             Clip::CivIdle => "pose_shared_idle.ban",
             Clip::CivWalk => "pose_shared_walk.ban",
             Clip::CivRun => "pose_shared_panicrun.ban",
@@ -316,7 +436,34 @@ impl Clip {
                 | Clip::LandRoll
                 | Clip::LandHard
                 | Clip::GrappleClimb
+                | Clip::ReelStart
+                | Clip::ReelImpactVertical
+                | Clip::ReelImpactHorizontal
+                | Clip::ReeledInToHang
+                | Clip::ReelEndLand
+                | Clip::ReeledInReleaseDrop
+                | Clip::HangToFall
+                | Clip::GrappleRecoil
+                | Clip::GrapplePull
+                | Clip::GrappleDual
+                | Clip::NpcStumbleRelease
                 | Clip::ChuteLand
+                | Clip::JumpStartStanding
+                | Clip::JumpFlightStanding
+                | Clip::JumpStartRun
+                | Clip::JumpTimeBlend
+                | Clip::JumpToSkydive
+                | Clip::FallToSkydive
+                | Clip::ChuteOpen
+                | Clip::ChuteOpenHorizontal
+                | Clip::ChuteDetach
+                | Clip::WalkToIdle
+                | Clip::RunToIdle
+                | Clip::DashToIdle
+                | Clip::RunToSwim
+                | Clip::CrouchDown
+                | Clip::CrouchUp
+                | Clip::EvadeFwd
                 | Clip::Recoil1H
                 | Clip::Recoil1HLeft
                 | Clip::Recoil2H
@@ -358,6 +505,22 @@ impl RigData {
 
     pub fn has(&self, clip: Clip) -> bool {
         self.clips.contains_key(&clip)
+    }
+
+    /// The ground distance (m) the clip's extracted root motion has covered at clip time
+    /// `t`: the planar length of the frame-to-frame steps summed up to `t` (linear between
+    /// frames, clamped to the clip). Zero for a clip that stays in place.
+    pub fn root_distance(&self, clip: Clip, t: f32) -> f32 {
+        let Some(c) = self.clips.get(&clip) else { return 0.0 };
+        let (rm, fd) = (&c.anim.root_motion, c.anim.frame_duration);
+        if rm.len() < 2 || fd <= 0.0 {
+            return 0.0;
+        }
+        let pos = (t / fd).clamp(0.0, (rm.len() - 1) as f32);
+        let whole = (pos.floor() as usize).min(rm.len() - 2);
+        let step = |i: usize| ((rm[i + 1][0] - rm[i][0]).powi(2) + (rm[i + 1][2] - rm[i][2]).powi(2)).sqrt();
+        let before: f32 = (0..whole).map(step).sum();
+        before + step(whole) * (pos - whole as f32)
     }
 }
 
@@ -1166,7 +1329,7 @@ fn aim_spine(skeleton: &Skeleton, local: &mut [Transform], bone: usize, aim: &Ai
 
 /// Turn bone `b` by `delta` (in the model's space, about the bone's own origin), keeping
 /// its children attached; `global` is brought up to date.
-fn rotate_bone(
+pub(crate) fn rotate_bone(
     skeleton: &Skeleton,
     local: &mut [Transform],
     global: &mut Vec<Transform>,

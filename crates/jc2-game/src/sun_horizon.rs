@@ -63,6 +63,9 @@ pub struct SunHorizon {
     /// xyz: `(sky - ground) / 2` ambient in Bevy ambient units (`SkyLighting`): the part of the
     /// native hemisphere ambient `lerp(cb0[11], cb0[10], N.y / 2 + 1/2)` that Bevy's uniform
     /// `AmbientLight` (the mean of the two) lacks, added as `tilt * N.y`. Zero = uniform.
+    /// `w`: the elapsed time in seconds ([`update_horizon`], every frame): the BillboardFoliage
+    /// vertex stage's sway clock (`foliage_billboard.wgsl`), which also runs in the depth and
+    /// shadow prepasses where Bevy binds no `globals`.
     pub tilt: Vec4,
     /// Haze fog (JC2-155, `haze.rs`): vertex `cb0[12]` = `(p0/(p1-p0), p1, 1/(p1-p0), camY)`.
     /// All three fog vectors zero = no fog. Rides in this buffer because every custom-WGSL
@@ -164,6 +167,60 @@ impl HorizonShadow {
     }
 }
 
+/// Keeps the embedded `sun_correction.wgsl` module (`jc2::sun_correction`) loaded.
+#[derive(Resource)]
+struct SunCorrectionShader(#[allow(dead_code)] Handle<Shader>);
+
+/// Load `sun_horizon.wgsl` and `sun_correction.wgsl` (once) for a custom-WGSL material that
+/// imports `jc2::sun_correction` (grass, tree impostors).
+pub fn ensure_correction_shader(app: &mut App) {
+    if !app
+        .world()
+        .contains_resource::<crate::terrain_material::SunHorizonShader>()
+    {
+        bevy::asset::embedded_asset!(app, "sun_horizon.wgsl");
+        let horizon: Handle<Shader> = bevy::asset::load_embedded_asset!(app, "sun_horizon.wgsl");
+        app.insert_resource(crate::terrain_material::SunHorizonShader(horizon));
+    }
+    if !app.world().contains_resource::<SunCorrectionShader>() {
+        bevy::asset::embedded_asset!(app, "sun_correction.wgsl");
+        let shader: Handle<Shader> = bevy::asset::load_embedded_asset!(app, "sun_correction.wgsl");
+        app.insert_resource(SunCorrectionShader(shader));
+    }
+}
+
+/// A custom material that binds the terrain AO map (`t11`) next to the shared `SunHorizon` buffer;
+/// see [`add_ao_binding`].
+pub trait AoBound: Asset {
+    fn ao_map(&self) -> &Handle<Image>;
+    fn set_ao_map(&mut self, map: Handle<Image>);
+}
+
+/// Point every `M` at the terrain AO map once there is one and it is enabled (without it the
+/// default white image stays bound: AO 1). Writes only the materials that differ.
+pub fn add_ao_binding<M: AoBound>(app: &mut App) {
+    app.add_systems(
+        PostUpdate,
+        bind_ao::<M>.before(bevy::asset::AssetEventSystems),
+    );
+}
+
+fn bind_ao<M: AoBound>(horizon: Option<Res<HorizonShadow>>, mut materials: ResMut<Assets<M>>) {
+    let Some(h) = horizon.filter(|h| h.enabled) else {
+        return;
+    };
+    let stale: Vec<_> = materials
+        .iter()
+        .filter(|(_, m)| m.ao_map().id() != h.ao.id())
+        .map(|(id, _)| id)
+        .collect();
+    for id in stale {
+        if let Some(mut m) = materials.get_mut(id) {
+            m.set_ao_map(h.ao.clone());
+        }
+    }
+}
+
 /// The map as a GPU texture: BC3, linear, clamped, no mips.
 pub fn ao_image(img: &DdsImage) -> Result<Image, String> {
     if img.format != DdsFormat::Dxt5 {
@@ -223,11 +280,13 @@ fn clamp_linear() -> ImageSampler {
 /// flip, `k` squared and the floor are applied here as native does; only the light-matching
 /// vector (`sun.xyz`, what `is_sun` compares) is the light's actual direction. Without an
 /// [`AtmosphereState`] the light's own direction is taken as the sun's (the old behaviour).
+#[allow(clippy::too_many_arguments)]
 pub fn update_horizon(
     horizon: Option<Res<HorizonShadow>>,
     atmosphere: Option<Res<AtmosphereState>>,
     lighting: Option<Res<SkyLighting>>,
     haze: Option<Res<HazeFog>>,
+    time: Option<Res<Time>>,
     sun: Query<&Transform, With<Sun>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut last: Local<Option<SunHorizon>>,
@@ -247,6 +306,8 @@ pub fn update_horizon(
     if let Some(l) = &lighting {
         now.tilt = l.bevy().ambient_tilt.extend(0.0);
     }
+    // wraps hourly (Bevy's default): a one-off phase jump of the billboard sway at most
+    now.tilt.w = time.map_or(0.0, |t| t.elapsed_secs_wrapped());
     if let Some(h) = &haze {
         now.fog_a = h.c12;
         now.fog_b = h.c13;

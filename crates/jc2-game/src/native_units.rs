@@ -12,7 +12,7 @@
 //! |---|---|---|---|
 //! | sun / moon (directional) | lux | `pi / e0` per unit | `sky_light::lux_per_unit` (native, JC2-134) |
 //! | ambient | `AmbientLight::brightness` | `1 / e0` per unit | `sky_light::ambient_per_unit` (native) |
-//! | point light | lumens, inverse square | `4 pi * pi / e0` per unit of colour **at 1 m** | [`point_lumens_per_unit`] |
+//! | point light | none: the native window term in the shaders (JC2-221) | native colour units added to the irradiance, times `e0` | `point_lights.rs` / `point_lights.wgsl` |
 //! | emissive of a **lit** material | `emissive` (times `e0` unless its alpha is 0) | `1 / e0` per unit | [`emissive_per_unit`] |
 //! | unlit colour, clear colour | the value is written to the scene target as is | 1 | [`native_colour`] |
 //! | fog colour | native since JC2-155: rows 2/3 of the zone gradient, mixed into the scene colour as is | 1 | `haze.rs` (no policy fog colour or distances remain) |
@@ -30,23 +30,6 @@
 //! unit by `c = d^2`, the inverse of the chain's `sqrt`. That is policy, labelled at each use.
 
 use bevy::prelude::*;
-
-/// Bevy point-light lumens per unit of native point-light colour **at 1 m**.
-///
-/// Bevy stores `lumens / (4 pi)` candela, and the diffuse term of a point light is
-/// `albedo / pi * candela / d^2 * N.L * e0`. The native product is `albedo * c * N.L` for a
-/// colour `c` at distance 1, so `lumens = 4 pi * c * pi / e0 = 4 pi * lux_per_unit * c`.
-/// **Native identity.** The distance fall-off past 1 m is Bevy's inverse square cut at the
-/// light's `range`; the exe's own attenuation (cb0[15+i] position/radius) is not decoded, so
-/// only the value at 1 m is a unit statement (brief `light-tables-next.md` section 4).
-pub fn point_lumens_per_unit() -> f32 {
-    4.0 * std::f32::consts::PI * crate::sky_light::lux_per_unit()
-}
-
-/// `PointLight::intensity` (lumens) for a point light of native colour strength `c` at 1 m.
-pub fn point_lumens(c: f32) -> f32 {
-    c * point_lumens_per_unit()
-}
 
 /// `StandardMaterial::emissive` per unit of native colour for a **lit** material (the shader
 /// multiplies it by `e0` when the emissive alpha is 1, the default of `LinearRgba::rgb`).
@@ -81,36 +64,16 @@ mod tests {
     use super::*;
     use crate::post_effects::{PostPass, encode_roundtrip};
 
-    /// Bevy 0.19.1's diffuse point-light term for albedo 1, `N.L` 1 (`bevy_pbr`
-    /// `render/light.rs`: candela = lumens / 4 pi; `lighting.wgsl`: `Fd_Burley` ends in 1 / pi,
-    /// inverse-square distance attenuation; `pbr_functions.wgsl`: times `view.exposure`).
-    fn bevy_point_diffuse(lumens: f32, d: f32) -> f32 {
-        let candela = lumens / (4.0 * std::f32::consts::PI);
-        crate::sky_light::camera_exposure() * (1.0 / std::f32::consts::PI) * candela / (d * d)
-    }
-
     /// Bevy's directional diffuse for albedo 1, `N.L` 1: `lux / pi * e0`.
     fn bevy_sun_diffuse(lux: f32) -> f32 {
         crate::sky_light::camera_exposure() * lux / std::f32::consts::PI
     }
 
     #[test]
-    fn a_point_light_of_native_colour_c_gives_c_at_one_metre() {
-        for c in [0.25, 1.0, 8.0] {
-            let got = bevy_point_diffuse(point_lumens(c), 1.0);
-            assert!((got - c).abs() < 1e-4 * c.max(1.0), "{c}: {got}");
-        }
-        // inverse square past 1 m
-        let at2 = bevy_point_diffuse(point_lumens(1.0), 2.0);
-        assert!((at2 - 0.25).abs() < 1e-4);
-    }
-
-    #[test]
-    fn the_point_and_sun_scales_agree_on_one_unit() {
-        // the same native strength through a directional light and a point light at 1 m
+    fn the_sun_ambient_and_emissive_scales_agree_on_one_unit() {
+        // a native strength through a directional light
         let sun = bevy_sun_diffuse(crate::sky_light::lux_per_unit());
-        let point = bevy_point_diffuse(point_lumens_per_unit(), 1.0);
-        assert!((sun - 1.0).abs() < 1e-4 && (point - 1.0).abs() < 1e-4);
+        assert!((sun - 1.0).abs() < 1e-4);
         // and ambient: brightness * e0 = c
         let amb = crate::sky_light::ambient_per_unit() * crate::sky_light::camera_exposure();
         assert!((amb - 1.0).abs() < 1e-5);

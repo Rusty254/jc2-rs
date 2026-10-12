@@ -170,6 +170,8 @@ fn downed_cancels_grapple_ledge_pull_and_vehicle_tracking() {
             down: 0.0,
             toward: Vec3::NEG_Z,
             pulled: true,
+            grappled: Default::default(),
+            victim: Default::default(),
         })
         .id();
     {

@@ -15,7 +15,7 @@
 //!   jc2 [<game_dir>] --world 31,14 --plane         a plane (the speed plane)
 //!   jc2 [<game_dir>] --world 31,14 --heli --crewed [--ride spot|wire]
 //!                                                 a pilot circling (Rico under it)
-//!   jc2 [<game_dir>] --world 31,14 --time 22:00 [--day-speed 60] [--sun-shadows]   the hour, the clock's pace
+//!   jc2 [<game_dir>] --world 31,14 --time 22:00 [--day-speed 60] [--no-sun-shadows]   the hour, the clock's pace
 //!   jc2 [<game_dir>] --browse [--browse-select general.blz/gae06_parachute_dif.dds]
 //!                                                 the asset browser (`browser/`)
 //!   jc2 ... --exit-after 45 --screenshot shot.png  smoke test: save the window, then quit
@@ -34,46 +34,69 @@ mod atmosphere;
 mod audio;
 mod audio_dsp;
 mod auto_exposure;
+mod batch_lod;
 mod bitmap_text;
 mod blackmarket;
 mod boat;
 mod browser;
 mod chaos;
 mod character;
+mod chute_capture;
+mod onfoot_capture;
+mod rico_capture;
 mod civilians;
 mod clouds;
 mod combat;
+mod impact_fx;
+mod muzzle_fx;
+mod tracer_fx;
+mod controls;
 mod coords;
 mod crew;
 mod destruction;
+mod effects;
 mod explosion;
 mod fleet;
 mod foliage_alpha;
 mod foliage_fixture;
+mod foot_actions;
+mod foot_machine;
+mod forest_canopy;
 mod gameplay_camera;
 mod general_material;
+mod glow;
 mod grapple;
+mod ground_ik;
 mod grass;
 mod haze;
 mod heat;
 mod heli;
+mod hemisphere_material;
+mod skinned_general_material;
 mod horizon;
 mod hud;
+mod identity;
 mod impostors;
 mod location_activation;
+mod loadscreen;
 mod locations;
 mod map;
 mod mission_browser;
 mod missions;
 mod music;
+mod native_sampler;
+mod native_sky;
 mod native_units;
 mod npc;
+mod ocean_inputs;
 mod parachute;
+mod parachute_flight;
 mod particle_fixture;
 mod physics;
 mod pickups;
 mod plane;
 mod plant_lod;
+mod point_lights;
 mod poses;
 mod post_effects;
 mod post_effects_render;
@@ -81,19 +104,29 @@ mod ragdoll;
 mod rbm_loader;
 mod rig;
 mod scenery;
+mod sea;
+mod sea_wave;
+mod water_normal;
 mod sky;
 mod sky_light;
+mod display;
 mod smoke;
 mod stunts;
 mod sun_horizon;
+mod sun_shadow;
 mod terrain_material;
 mod traffic;
 mod veg_fade;
 mod vegdata;
 mod vehicle;
+mod vehicle_capture;
+mod vehicle_contact_fx;
+mod vehicle_damage;
+mod vehicle_death;
 mod viewer;
 mod weapon_attach;
 mod world;
+mod world_particles;
 
 use archive_source::JcAssetReader;
 use bevy::asset::io::AssetSourceBuilder;
@@ -210,6 +243,9 @@ struct Cli {
     /// World viewer: LOD level of the vegetation models (0 = native distance selection, 1 = full detail)
     #[arg(long, default_value_t = 0)]
     vegetation_lod: usize,
+    /// World viewer: LOD level of placed static objects (0 = native distance selection, 1 = full detail)
+    #[arg(long, default_value_t = 0)]
+    object_lod: usize,
     /// World viewer: graphics setting `/lodfactor` 0-3 (native id 0x17, "Geometric detail",
     /// default 0): vegetation fade distances and the model-LOD distance unit (1 / 1.5 / 2 / 3)
     #[arg(long, value_name = "0..3", default_value_t = 0)]
@@ -312,9 +348,15 @@ struct Cli {
     /// real second (60 = a game hour a second, 0 = stopped)
     #[arg(long, value_name = "FACTOR", default_value_t = 1.0)]
     day_speed: f32,
-    /// World viewer: cast shadows from the sun
-    #[arg(long)]
+    /// World viewer: cast shadows from the sun (the default; accepted for old command lines)
+    #[arg(long, hide = true)]
     sun_shadows: bool,
+    /// World viewer: no cascade shadows from the sun. The default draws them: the native pixel
+    /// shaders carry the cascade block (research/formats/lighting-gaps-next.md G1); this is
+    /// the cheaper mode (jungle tile 40,40 on the reference machine: frame time 16.7 ms without
+    /// shadows, 20.1 ms with)
+    #[arg(long)]
+    no_sun_shadows: bool,
     /// World viewer: open the map (`M`) right away, e.g. for a `--screenshot`
     #[arg(long)]
     open_map: bool,
@@ -349,6 +391,10 @@ struct Cli {
     /// seated)
     #[arg(long, value_name = "STATE")]
     pose: Option<String>,
+    /// Ground foot placement (JC2-075): `native` (default; only where the original enables
+    /// it: on a vehicle's roof), `all` (also while walking on the ground; not native) or `off`
+    #[arg(long, value_name = "MODE", default_value = "native")]
+    ground_ik: String,
     /// Debug only: the gun in his hand (1-5, as the keys)
     #[arg(long, value_name = "N")]
     weapon: Option<usize>,
@@ -368,6 +414,25 @@ struct Cli {
     /// die meanwhile)
     #[arg(long, value_name = "N", default_value_t = 0)]
     pose_soldiers: u32,
+    /// Window size in pixels, e.g. 1920x1080 (a size given here is the real frame size whatever
+    /// the desktop's DPI scaling; captures use it, e.g. 2561x1429)
+    #[arg(long, value_name = "WxH", value_parser = display::parse_size, conflicts_with_all = ["width", "height"])]
+    resolution: Option<(u32, u32)>,
+    /// Window width in pixels (the height stays at the saved or default value)
+    #[arg(long, value_name = "PIXELS", value_parser = display::parse_dim)]
+    width: Option<u32>,
+    /// Window height in pixels (the width stays at the saved or default value)
+    #[arg(long, value_name = "PIXELS", value_parser = display::parse_dim)]
+    height: Option<u32>,
+    /// Borderless fullscreen on the current monitor (F11 toggles in game)
+    #[arg(long, conflicts_with_all = ["windowed", "exclusive"])]
+    fullscreen: bool,
+    /// Exclusive fullscreen at the monitor's current video mode
+    #[arg(long, conflicts_with = "windowed")]
+    exclusive: bool,
+    /// A window, overriding a saved fullscreen choice
+    #[arg(long)]
+    windowed: bool,
     /// Quit cleanly after this many seconds (for automated smoke tests)
     #[arg(long, value_name = "SECONDS")]
     exit_after: Option<f32>,
@@ -375,6 +440,27 @@ struct Cli {
     /// `--exit-after`, or after 20 s if that is not given)
     #[arg(long, value_name = "PATH.png")]
     screenshot: Option<PathBuf>,
+    /// Parachute capture (JC2-950d): place Rico for a reference scenario, run its scripted
+    /// inputs, save a frame at each named instant and quit. One of jungle-deploy-day,
+    /// base-night-behind, bank-hard, landing-collapse, canopy-from-above, freefall-poses
+    #[arg(long, value_name = "SCENARIO")]
+    chute_scenario: Option<String>,
+    /// Where `--chute-scenario` writes its frames (default `<game>/jc2-rs/_extract/parachute`)
+    #[arg(long, value_name = "DIR", requires = "chute_scenario")]
+    chute_out: Option<PathBuf>,
+    /// On-foot camera capture (board c0c2758e): save `standing.png` and `running.png` into this
+    /// folder and quit (`onfoot_capture.rs`)
+    #[arg(long, value_name = "DIR")]
+    onfoot_capture: Option<PathBuf>,
+    /// Vehicle enter capture (board 27da3660): with `--heli`/`--boat`/`--plane`/`--drive`, save
+    /// `outside.png`, enter the vehicle, save `inside.png` from the same fixed camera and write
+    /// `slots.txt` (`vehicle_capture.rs`)
+    #[arg(long, value_name = "DIR")]
+    vehicle_capture: Option<PathBuf>,
+    /// Rico model close-ups (board 845e8e4c): save face and chest shots into this folder and
+    /// quit (`rico_capture.rs`)
+    #[arg(long, value_name = "DIR")]
+    rico_capture: Option<PathBuf>,
 }
 
 fn find_game_dir(explicit: Option<PathBuf>) -> PathBuf {
@@ -401,7 +487,7 @@ fn find_game_dir(explicit: Option<PathBuf>) -> PathBuf {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let game_dir = find_game_dir(cli.game_dir);
     let game_dir = std::fs::canonicalize(&game_dir).unwrap_or(game_dir);
     let fs = match GameFs::open(&game_dir) {
@@ -445,6 +531,26 @@ fn main() {
             None => eprintln!("mission {id}: no script or no start point found"),
         }
     }
+    // `--chute-scenario`: the scenario's tile, start point, clock and clouds; nothing else moves
+    let chute = cli.chute_scenario.as_deref().map(|name| {
+        chute_capture::Scenario::parse(name).unwrap_or_else(|| {
+            eprintln!(
+                "--chute-scenario {name}: no such scenario (jungle-deploy-day, base-night-behind, bank-hard, landing-collapse, canopy-from-above, freefall-poses)"
+            );
+            std::process::exit(2);
+        })
+    });
+    if let Some(s) = chute {
+        let site = s.site();
+        world_arg = Some(format!("{},{}", site.tile.0, site.tile.1));
+        start_at = Some(site.xz);
+        cli.time.get_or_insert_with(|| site.clock.to_string());
+        cli.day_speed = 0.0;
+        cli.cloud_cover = cli.cloud_cover.or(site.cloud_cover);
+        cli.no_npcs = true;
+        cli.no_civilians = true;
+        cli.no_traffic = true;
+    }
     let reader_fs = fs.clone();
     let title = match (&cli.model, &world_arg) {
         _ if cli.foliage_check => "jc2-rs — native foliage alpha fixture".to_string(),
@@ -454,6 +560,18 @@ fn main() {
         (None, Some(w)) => format!("jc2-rs — world viewer: tile {w}"),
         (None, None) => "jc2-rs — milestone 1: assets from the archives".to_string(),
     };
+    let display_path = display::default_path();
+    let display_options = display::resolve(
+        &display::DisplayFlags {
+            resolution: cli.resolution,
+            width: cli.width,
+            height: cli.height,
+            fullscreen: cli.fullscreen,
+            exclusive: cli.exclusive,
+            windowed: cli.windowed,
+        },
+        display_path.as_ref(),
+    );
     let mut app = App::new();
     app.register_asset_source(
         "jc2",
@@ -463,7 +581,7 @@ fn main() {
     .add_plugins(
         DefaultPlugins
             .set(WindowPlugin {
-                primary_window: Some(Window { title, ..default() }),
+                primary_window: Some(display::window(&display_options, title)),
                 ..default()
             })
             // everything comes through `jc2://`; no `assets/` folder to watch
@@ -472,11 +590,19 @@ fn main() {
                 ..default()
             }),
     )
+    .add_plugins(display::DisplayPlugin {
+        options: display_options,
+        path: display_path,
+    })
     .init_asset::<rbm_loader::RbmAsset>()
     .register_asset_loader(rbm_loader::RbmLoader::default())
     .add_plugins((
         foliage_alpha::FoliageMaterialPlugin,
         general_material::GeneralMaterialPlugin,
+        hemisphere_material::HemisphereMaterialPlugin,
+        skinned_general_material::SkinnedGeneralMaterialPlugin,
+        point_lights::PointLightPlugin,
+        effects::EffectsPlugin,
     ));
     if cli.exit_after.is_some() || cli.screenshot.is_some() {
         app.add_plugins(smoke::SmokePlugin {
@@ -554,7 +680,7 @@ fn main() {
                 config: sky::SkyConfig {
                     start_hour,
                     speed: cli.day_speed.max(0.0),
-                    sun_shadows: cli.sun_shadows,
+                    sun_shadows: cli.sun_shadows || !cli.no_sun_shadows,
                 },
             })
             // the native final colour chain (clamp, saturation clamp, tint, sqrt encode)
@@ -566,16 +692,23 @@ fn main() {
                 tile,
                 radius: cli.radius.min(8),
                 lod: cli.lod.parse().unwrap_or(1),
+                object_lod: cli.object_lod,
+                lodfactor: cli.lodfactor,
                 models: !cli.no_models,
                 physics,
                 flat_terrain: cli.flat_terrain,
             })
+            .insert_resource(world::WcByActivation)
             .add_plugins((
                 terrain_material::TerrainMaterialPlugin,
                 world::WorldPlugin,
                 locations::LocationsPlugin,
                 horizon::HorizonPlugin,
+                forest_canopy::ForestCanopyPlugin,
+                sea::SeaPlugin,
+                glow::GlowPlugin,
                 veg_fade::VegetationFadePlugin,
+                world_particles::WorldParticlesPlugin,
             ))
             .insert_resource(veg_fade::LodFactor::new(cli.lodfactor))
             .insert_resource(scenery::SceneryConfig {
@@ -586,13 +719,17 @@ fn main() {
                 far_lod: !cli.no_impostors,
                 ..default()
             })
-            .add_plugins((scenery::SceneryPlugin, map::MapPlugin));
+            .add_plugins((
+                scenery::SceneryPlugin,
+                map::MapPlugin,
+                loadscreen::LoadScreenPlugin,
+            ));
             app.insert_resource(clouds::CloudConfig {
                 clouds: !cli.no_clouds,
                 stars: !cli.no_stars,
                 cover: cli.cloud_cover.map(|c| c.clamp(0.0, 1.0)),
             })
-            .add_plugins(clouds::CloudPlugin);
+            .add_plugins((clouds::CloudPlugin, native_sky::NativeSkyPlugin));
             if !cli.no_impostors {
                 app.insert_resource(impostors::ImpostorConfig {
                     radius: cli.impostor_radius.clamp(1, 12),
@@ -627,8 +764,16 @@ fn main() {
                 if let Some(id) = &cli.mission {
                     app.insert_resource(missions::MissionStart(id.clone()));
                 }
+                if cli.no_hero && std::env::var_os("JC2_VEHICLE_FIRE_FIXTURE").is_some() {
+                    // capture fixture: the damage model without Rico and the combat plugin
+                    app.add_plugins(vehicle_damage::VehicleDamagePlugin);
+                    // ... and the death routine (explosion effect, wheels, events), so the burn
+                    // timer can end the vehicle (FX-VEH-2 captures)
+                    app.add_plugins(explosion::ExplosionPlugin);
+                }
                 if !cli.no_hero {
                     app.add_plugins((
+                        controls::ControlsPlugin::with_user_settings(),
                         character::CharacterPlugin,
                         combat::CombatPlugin,
                         stunts::StuntPlugin,
@@ -637,6 +782,26 @@ fn main() {
                         hud::HudPlugin,
                         blackmarket::BlackMarketPlugin,
                     ));
+                    if let Some(s) = chute {
+                        app.add_plugins(chute_capture::ChuteCapturePlugin(
+                            chute_capture::ChuteCapture {
+                                scenario: s,
+                                out: cli
+                                    .chute_out
+                                    .clone()
+                                    .unwrap_or_else(|| chute_capture::default_out(&game_dir)),
+                            },
+                        ));
+                    }
+                    if let Some(dir) = &cli.onfoot_capture {
+                        app.add_plugins(onfoot_capture::OnfootCapturePlugin(dir.clone()));
+                    }
+                    if let Some(dir) = &cli.vehicle_capture {
+                        app.add_plugins(vehicle_capture::VehicleCapturePlugin(dir.clone()));
+                    }
+                    if let Some(dir) = &cli.rico_capture {
+                        app.add_plugins(rico_capture::RicoCapturePlugin(dir.clone()));
+                    }
                     if let Some(how) = &cli.ride {
                         app.insert_resource(stunts::RideAtStart {
                             wire: how.eq_ignore_ascii_case("wire"),
@@ -653,6 +818,11 @@ fn main() {
                             fired: false,
                         });
                     }
+                    app.insert_resource(match cli.ground_ik.as_str() {
+                        "all" => ground_ik::GroundIkMode::AllGrounded,
+                        "off" => ground_ik::GroundIkMode::Off,
+                        _ => ground_ik::GroundIkMode::Native,
+                    });
                     if cli.black_market {
                         app.insert_resource(blackmarket::OpenMarketAtStart);
                     }
@@ -710,7 +880,14 @@ fn main() {
                     music: cli.music_volume.clamp(0.0, 4.0),
                     music_on: !cli.no_music,
                 });
-                let mut fleet = fleet::Fleet::new(cli.lod.parse().unwrap_or(1), !cli.no_traffic);
+                // vehicles follow `--object-lod` (0 = native slots), else the `--lod` level
+                let vehicle_lod = if cli.object_lod == 0 {
+                    0
+                } else {
+                    cli.lod.parse().unwrap_or(1)
+                };
+                let mut fleet = fleet::Fleet::new(vehicle_lod, !cli.no_traffic);
+                fleet.lodfactor = cli.lodfactor;
                 // what the command line asks for; without Rico the last one is driven
                 let mut asks: Vec<(String, fleet::Place, crew::CrewKind)> = Vec::new();
                 use crew::CrewKind::{Civilian, Soldier};

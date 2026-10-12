@@ -137,8 +137,198 @@ pub struct PhysicalBase {
     pub center_of_mass: [f32; 3],
 }
 
+/// The doll's `CVehicleDamageModule` (vehicle node key `#a6db0131`), read by the PD variant loader
+/// 0x008cb720 into variant +0x210..+0x237 (`research/formats/vehicle-damage-effects.md` section 1).
+/// A missing node (only `lave.v006_moped` in retail) leaves the loader defaults ([`Default`]).
+/// Field names are working labels; the keys and defaults are native.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DamageModule {
+    /// `#f42307c2` (variant +0x210, default 500): `SetMaxHealth`, then `SetHealth(max)` (slot 69, 0x0056dcd0).
+    pub max_health: f32,
+    /// `#1a4be591` (+0x214, default 300): the instant-wreck threshold (vehicle +0x388).
+    pub instant_wreck: f32,
+    /// `#2b8a8075` (+0x218, default 10): the damage type 1 threshold.
+    pub type1_threshold: f32,
+    /// `#05de7e98` (+0x21c, default 50): the damage type 3 (collision) threshold.
+    pub type3_threshold: f32,
+    /// `#57739d9c` (+0x220, default 50): not read by 0x0056dcd0.
+    pub unread_220: f32,
+    /// +0x224 (default 75): not read from data.
+    pub unread_224: f32,
+    /// `#63298a34` (+0x228, default 10): vehicle +0x38c (meaning not decoded).
+    pub value_228: f32,
+    /// `#e11f2a5e` (+0x22c, default 2): vehicle +0x390 (meaning not decoded).
+    pub value_22c: f32,
+    /// `#254b9014` (+0x230, default 1/900): not read by 0x0056dcd0.
+    pub unread_230: f32,
+    /// `#e8cbda9d` (+0x234, default 1.0): vehicle +0x338, the collision damage multiplier.
+    pub collision_multiplier: f32,
+}
+
+impl Default for DamageModule {
+    /// The defaults of 0x008cb720 when the node is missing.
+    fn default() -> Self {
+        Self {
+            max_health: 500.0,
+            instant_wreck: 300.0,
+            type1_threshold: 10.0,
+            type3_threshold: 50.0,
+            unread_220: 50.0,
+            unread_224: 75.0,
+            value_228: 10.0,
+            value_22c: 2.0,
+            unread_230: 1.0 / 900.0,
+            collision_multiplier: 1.0,
+        }
+    }
+}
+
+impl DamageModule {
+    fn from_node(node: &Node) -> Self {
+        let d = Self::default();
+        Self {
+            max_health: f(node, DMG_MAX_HEALTH).unwrap_or(d.max_health),
+            instant_wreck: f(node, DMG_INSTANT_WRECK).unwrap_or(d.instant_wreck),
+            type1_threshold: f(node, DMG_TYPE1).unwrap_or(d.type1_threshold),
+            type3_threshold: f(node, DMG_TYPE3).unwrap_or(d.type3_threshold),
+            unread_220: f(node, DMG_220).unwrap_or(d.unread_220),
+            unread_224: d.unread_224,
+            value_228: f(node, DMG_228).unwrap_or(d.value_228),
+            value_22c: f(node, DMG_22C).unwrap_or(d.value_22c),
+            unread_230: f(node, DMG_230).unwrap_or(d.unread_230),
+            collision_multiplier: f(node, DMG_MULTIPLIER).unwrap_or(d.collision_multiplier),
+        }
+    }
+}
+
+/// The damage tuning keys of the vehicle `.epe` (loader 0x00780ab0; `vehicle-fire-explosion.md`
+/// section 4.2): `#01429682` smoke threshold (ratio, constructor default 0.4), `#189e862f` burn
+/// threshold (default 0.1), `#4476a911` burn seconds (default 8.0) and `#9011eda3` post-explosion
+/// fire seconds (no constructor default: `None` when the key is missing).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BurnTuning {
+    pub smoke_threshold: f32,
+    pub threshold: f32,
+    pub seconds: f32,
+    pub post_explosion_seconds: Option<f32>,
+}
+
+impl Default for BurnTuning {
+    fn default() -> Self {
+        Self {
+            smoke_threshold: 0.4,
+            threshold: 0.1,
+            seconds: 8.0,
+            post_explosion_seconds: None,
+        }
+    }
+}
+
+impl BurnTuning {
+    /// From the bytes of `<container>.epe`; the first node carrying a key supplies it.
+    pub fn from_epe(data: &[u8]) -> Self {
+        let mut t = Self::default();
+        let Ok(file) = PropertyFile::parse_any(data) else {
+            return t;
+        };
+        let (mut smoke, mut threshold, mut seconds, mut post) = (None, None, None, None);
+        for root in &file.nodes {
+            root.walk(&mut |n| {
+                smoke = smoke.or(f(n, SMOKE_THRESHOLD));
+                threshold = threshold.or(f(n, BURN_THRESHOLD));
+                seconds = seconds.or(f(n, BURN_SECONDS));
+                post = post.or(f(n, POST_EXPLOSION_SECONDS));
+            });
+        }
+        t.smoke_threshold = smoke.unwrap_or(t.smoke_threshold);
+        t.threshold = threshold.unwrap_or(t.threshold);
+        t.seconds = seconds.unwrap_or(t.seconds);
+        t.post_explosion_seconds = post;
+        t
+    }
+}
+
+/// The collision effect ids of the vehicle `.epe` (`vehicle-damage-effects.md` section 2.2): the contact
+/// entries' impact, slide and roll effects (loader 0x0056ea20; a missing key or -1 means none) and the
+/// land vehicles' chassis scrape (loader 0x007557e0, default 293).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContactFxIds {
+    pub impact: Option<u32>,
+    pub slide: Option<u32>,
+    pub roll: Option<u32>,
+    pub scrape: u32,
+}
+
+impl Default for ContactFxIds {
+    fn default() -> Self {
+        Self {
+            impact: None,
+            slide: None,
+            roll: None,
+            scrape: DEFAULT_SCRAPE_EFFECT,
+        }
+    }
+}
+
+/// The chassis scrape default of the CLandVehicle loader (`lave_chassis_impact`).
+pub const DEFAULT_SCRAPE_EFFECT: u32 = 293;
+
+impl ContactFxIds {
+    /// From the bytes of `<container>.epe`; the first node carrying a key supplies it.
+    pub fn from_epe(data: &[u8]) -> Self {
+        let mut t = Self::default();
+        let Ok(file) = PropertyFile::parse_any(data) else {
+            return t;
+        };
+        let (mut impact, mut slide, mut roll, mut scrape) = (None, None, None, None);
+        for root in &file.nodes {
+            root.walk(&mut |n| {
+                impact = impact.or(i(n, CONTACT_IMPACT));
+                slide = slide.or(i(n, CONTACT_SLIDE));
+                roll = roll.or(i(n, CONTACT_ROLL));
+                scrape = scrape.or(i(n, CHASSIS_SCRAPE));
+            });
+        }
+        let id = |v: Option<i32>| v.and_then(|v| u32::try_from(v).ok());
+        t.impact = id(impact);
+        t.slide = id(slide);
+        t.roll = id(roll);
+        t.scrape = id(scrape).unwrap_or(t.scrape);
+        t
+    }
+}
+
+/// The effect slots of a vehicle's `CEffectProp`s (enum string at 0x00e5ee60,
+/// `vehicle-fire-explosion.md` section 2).
+pub mod effect_slot {
+    pub const EXPLOSION: i32 = 1;
+    pub const ENGINE_IDLE: i32 = 2;
+    pub const ENGINE_RUNNING: i32 = 3;
+    pub const CONTRAIL: i32 = 4;
+    pub const WATER_EXPLOSION: i32 = 5;
+    pub const SHOTDOWN: i32 = 8;
+    pub const WATER_FRONT_DRIVE: i32 = 9;
+    pub const WATER_FRONT_COLLISION: i32 = 10;
+    pub const WATER_SIDE_TRAILS: i32 = 11;
+    pub const ENGINE_SMOKING: i32 = 12;
+    pub const ENGINE_BURNING: i32 = 13;
+    pub const ENGINE_SMOKE_BURST: i32 = 14;
+    pub const POST_EXPLOSION_FIRE: i32 = 15;
+}
+
+/// A `CEffectProp` of the doll: effect `id` mounted in `slot` at `local` (vehicle frame, engine
+/// axes; the native instance composes it with the vehicle matrix every frame, 0x00631d00).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EffectProp {
+    pub slot: i32,
+    pub id: u32,
+    pub local: Transform3,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VehicleDoll {
+    /// The `CVehicleDamageModule`, when the doll has one (88 of 90 retail vehicles).
+    pub damage: Option<DamageModule>,
     pub parts: Vec<VehiclePart>,
     pub axles: Vec<Axle>,
     pub engine: Option<Engine>,
@@ -162,6 +352,9 @@ pub struct VehicleDoll {
     /// `CBellyStuntController` under the hull instead, and the chopper and the military
     /// helicopter a `CThreeNodeClingController` at the nose as well.
     pub stunts: Vec<StuntPosition>,
+    /// The `CEffectProp`s (doc order): the effect mount points of `vehicle-fire-explosion.md`
+    /// section 1.
+    pub effects: Vec<EffectProp>,
     /// The seats: the other smart objects named `SO_*` (`SO_Driver`, `SO_Shotgun`,
     /// `SO_L1`, …) in the order of the file, each name once.
     pub seats: Vec<Seat>,
@@ -328,8 +521,48 @@ pub struct Boat {
     pub max_steer_deg: f32,
     /// `#11d7375d` of the rudder module: where the propeller pushes (engine axes).
     pub rudder: [f32; 3],
-    /// The `CBoyancyModule` points: `position` and `radius` (0 for most).
+    /// The `CBoyancyModule` points: `position` and `radius` (0 for most), in module order
+    /// (`CBoyancyModule_0`, `_1`, ...).
     pub floats: Vec<([f32; 3], f32)>,
+    /// The hull parameters the native loader (`FUN_0099f8a0`, `FUN_009b6c70`) reads from
+    /// `CBoyancyModule_0` only and applies to every sphere (JC2-216, water-buoyancy.md).
+    pub hull: BoatHull,
+    /// `CBoatGeneralModule` `#d9336205`, `#a94eda6c`, `#c1f9d442`: the inertia tensor is
+    /// `diag(x, y, z) * mass` (body x, y, z; `pfxSeaVehicle` set-up `FUN_009ad7c0`, axis order
+    /// inferred, water-buoyancy.md answer 6).
+    pub inertia_factors: [f32; 3],
+    /// `CBoatGeneralModule` `#8d840498` (`pfxSeaVehicle` +0x24) and `drag` (+0x28): the whole-hull
+    /// quadratic drag at the centre of mass is `-(drag * this * |v|) * v`.
+    pub drag_area: f32,
+    pub drag: f32,
+}
+
+/// The shared buoyancy-sphere parameters of a boat (`CBoyancyModule_0`). The key spellings of
+/// `side_area`, `bottom_area` and `up_velocity_cap` are inferred by hash match.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoatHull {
+    /// `radius`: one radius for every sphere.
+    pub radius: f32,
+    /// `drag`: the water drag coefficient.
+    pub drag: f32,
+    /// `side_area` (`#30a35b86`): the coefficient of the drag along the body x axis.
+    pub side_area: f32,
+    /// `bottom_area` (`#578ccc6b`): the coefficient along body y; the loader presets 1.0.
+    pub bottom_area: f32,
+    /// `up_velocity_cap` (`#dc7c4744`): the clamp of the body y velocity in the drag; preset 20.0.
+    pub up_velocity_cap: f32,
+}
+
+impl Default for BoatHull {
+    fn default() -> Self {
+        Self {
+            radius: 0.0,
+            drag: 0.0,
+            side_area: 0.0,
+            bottom_area: 1.0,
+            up_velocity_cap: 20.0,
+        }
+    }
 }
 
 impl Default for Boat {
@@ -345,6 +578,10 @@ impl Default for Boat {
             max_steer_deg: 30.0,
             rudder: [0.0, -0.5, 4.0],
             floats: Vec::new(),
+            hull: BoatHull::default(),
+            inertia_factors: [3.5, 2.75, 1.75],
+            drag_area: 1.0,
+            drag: 0.0,
         }
     }
 }
@@ -415,6 +652,15 @@ const BOAT_THRUST: u32 = 0x7b40_a502;
 const BOAT_REVERSE: u32 = 0xed1d_ff74;
 const BOAT_STEER: u32 = 0x6fd2_bd7f;
 const BOAT_RUDDER: u32 = 0x11d7_375d;
+const BOAT_INERTIA_X: u32 = 0xd933_6205;
+const BOAT_INERTIA_Y: u32 = 0xa94e_da6c;
+const BOAT_INERTIA_Z: u32 = 0xc1f9_d442;
+const BOAT_DRAG_AREA: u32 = 0x8d84_0498;
+/// `CGroupModule_CBoyancyModule`: the number of `CBoyancyModule_<i>` children (name unresolved).
+const BUOY_COUNT: u32 = 0x21af_1963;
+const BUOY_SIDE_AREA: u32 = 0x30a3_5b86;
+const BUOY_BOTTOM_AREA: u32 = 0x578c_cc6b;
+const BUOY_UP_CAP: u32 = 0xdc7c_4744;
 
 fn f(n: &Node, key: u32) -> Option<f32> {
     match n.value_hash(key)? {
@@ -490,6 +736,26 @@ const CENTER_OF_MASS: u32 = 0x3e5f5109; // by value
 const TRIGGER_EXTENTS: u32 = 0x2be1_0cce; // by value: a smart-object trigger's box
 const SEAT_CAMERA_ID: u32 = 0x742c_dd23;
 const SEAT_CAMERA_REVERSE: u32 = 0xb4ad_6a59;
+// CVehicleDamageModule keys (descriptor DATs 0x00f0bba4..0x00f0bbc0, loader 0x008cb720)
+const DMG_MAX_HEALTH: u32 = 0xf423_07c2;
+const DMG_INSTANT_WRECK: u32 = 0x1a4b_e591;
+const DMG_TYPE1: u32 = 0x2b8a_8075;
+const DMG_TYPE3: u32 = 0x05de_7e98;
+const DMG_220: u32 = 0x5773_9d9c;
+const DMG_228: u32 = 0x6329_8a34;
+const DMG_22C: u32 = 0xe11f_2a5e;
+const DMG_230: u32 = 0x254b_9014;
+const DMG_MULTIPLIER: u32 = 0xe8cb_da9d;
+const CONTACT_IMPACT: u32 = 0xa132_f7da; // vehicle .epe, effect id (0x0106c174)
+const CONTACT_SLIDE: u32 = 0xeb00_1f37; // 0x0106c178
+const CONTACT_ROLL: u32 = 0x396c_6abd; // 0x0106c17c
+const CHASSIS_SCRAPE: u32 = 0xe896_22fb; // CLandVehicle loader 0x007557e0
+const BURN_THRESHOLD: u32 = 0x189e_862f; // vehicle .epe, ratio
+const BURN_SECONDS: u32 = 0x4476_a911; // vehicle .epe
+const SMOKE_THRESHOLD: u32 = 0x0142_9682; // vehicle .epe, ratio
+const POST_EXPLOSION_SECONDS: u32 = 0x9011_eda3; // vehicle .epe
+const EFFECT_ID: u32 = 0x8370_ea1c; // CEffectProp: effect id
+const EFFECT_SLOT: u32 = 0x9cd3_4fdc; // CEffectProp: slot
 const STUNT_ZONE: u32 = 0xcceaa327; // by value: a stunt controller's area tag ("CAB")
 
 fn collect(node: &Node, depth: usize, doll: &mut VehicleDoll) {
@@ -589,6 +855,40 @@ fn collect(node: &Node, depth: usize, doll: &mut VehicleDoll) {
             b.buoyancy = node.float("boyancy").unwrap_or(b.buoyancy);
             b.linear_damping = node.float("linear_damping").unwrap_or(b.linear_damping);
             b.angular_damping = node.float("angular_damping").unwrap_or(b.angular_damping);
+            b.inertia_factors = [
+                f(node, BOAT_INERTIA_X).unwrap_or(b.inertia_factors[0]),
+                f(node, BOAT_INERTIA_Y).unwrap_or(b.inertia_factors[1]),
+                f(node, BOAT_INERTIA_Z).unwrap_or(b.inertia_factors[2]),
+            ];
+            b.drag_area = f(node, BOAT_DRAG_AREA).unwrap_or(b.drag_area);
+            b.drag = node.float("drag").unwrap_or(b.drag);
+        }
+        "CGroupModule" if s(node, NAME) == "CGroupModule_CBoyancyModule" => {
+            // the native loader picks the children by the hashed name `CBoyancyModule_<i>`;
+            // only child 0 supplies the shared sphere parameters
+            let count = i(node, BUOY_COUNT).unwrap_or(0).max(0) as usize;
+            let b = doll.boat.get_or_insert_with(Boat::default);
+            for index in 0..count {
+                let key = crate::hash::hash_str(&format!("CBoyancyModule_{index}"));
+                let Some((_, module)) = node.children.iter().find(|(k, _)| k.hash() == key) else {
+                    continue;
+                };
+                let Some(Variant::Vec3(p)) = module.value("position") else {
+                    continue;
+                };
+                let radius = module.float("radius").unwrap_or(0.0);
+                if index == 0 {
+                    b.hull = BoatHull {
+                        radius,
+                        drag: module.float("drag").unwrap_or(0.0),
+                        side_area: f(module, BUOY_SIDE_AREA).unwrap_or(0.0),
+                        bottom_area: f(module, BUOY_BOTTOM_AREA).unwrap_or(1.0),
+                        up_velocity_cap: f(module, BUOY_UP_CAP).unwrap_or(20.0),
+                    };
+                }
+                b.floats.push((*p, radius));
+            }
+            return;
         }
         "CBoatEngineModule" => {
             let b = doll.boat.get_or_insert_with(Boat::default);
@@ -609,8 +909,22 @@ fn collect(node: &Node, depth: usize, doll: &mut VehicleDoll) {
                 b.floats.push((*p, node.float("radius").unwrap_or(0.0)));
             }
         }
+        "CVehicleDamageModule" => {
+            if doll.damage.is_none() {
+                doll.damage = Some(DamageModule::from_node(node));
+            }
+        }
         "CAirPlaneController" => {
             doll.plane = true;
+        }
+        "CEffectProp" => {
+            if let (Some(id), Some(slot)) = (i(node, EFFECT_ID), i(node, EFFECT_SLOT)) {
+                doll.effects.push(EffectProp {
+                    slot,
+                    id: id as u32,
+                    local: mat(node, "local").unwrap_or(Transform3::IDENTITY),
+                });
+            }
         }
         "CHelicopterAerodynamicModule" | "CHelicopterRudderModule" => {
             let foil = Airfoil {
@@ -935,6 +1249,58 @@ mod tests {
         assert!(doll.parts.iter().any(|p| p.name == "RotorStill4"));
     }
 
+    /// The 14 retail boats carry the shared sphere parameters of `CBoyancyModule_0` (JC2-216
+    /// table in water-buoyancy.md): sphere count, radius, drag, side/bottom area, cap, boyancy
+    /// and mass. Needs JC2_TEST_DIR.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn retail_boat_hulls() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        // (container, spheres, radius, drag, side, bottom, boyancy, mass)
+        let rows: [(&str, usize, f32, f32, f32, f32, f32, f32); 14] = [
+            ("seve.v011_charter.ee", 9, 0.85, 20.0, 60.0, 120.0, 2.25, 10000.0),
+            ("seve.v011_houseboat.ee", 9, 0.85, 20.0, 60.0, 120.0, 2.25, 10000.0),
+            ("seve.v011_sailboat.ee", 9, 0.85, 20.0, 60.0, 120.0, 2.25, 10000.0),
+            ("seve.v011_yacht.ee", 9, 0.85, 20.0, 60.0, 120.0, 2.25, 10000.0),
+            ("seve.v082_motorboat_standard_small.ee", 9, 0.75, 20.0, 50.0, 100.0, 2.4, 5000.0),
+            ("seve.v083_motorboat_small.ee", 9, 0.7, 20.0, 75.0, 125.0, 2.4, 2500.0),
+            ("seve.v086_barge.ee", 8, 1.65, 75.0, 25.0, 150.0, 2.4, 60000.0),
+            ("seve.v087_catamaran_speedboat.ee", 10, 1.0, 15.0, 75.0, 150.0, 1.9, 7000.0),
+            ("seve.v088_djonk.ee", 9, 1.0, 20.0, 75.0, 100.0, 2.0, 9000.0),
+            ("seve.v089_raceboat.ee", 10, 0.6, 15.0, 70.0, 250.0, 2.25, 3000.0),
+            ("seve.v095_swamp_boat.ee", 9, 0.35, 25.0, 15.0, 1.0, 2.5, 890.0),
+            ("seve.v098_indo.ee", 9, 1.2, 40.0, 75.0, 125.0, 2.0, 20000.0),
+            ("seve.v104_attack_boat.ee", 9, 0.75, 20.0, 75.0, 150.0, 1.9, 4000.0),
+            ("seve.v105_military_boat.ee", 9, 1.4, 20.0, 75.0, 125.0, 1.75, 20000.0),
+        ];
+        for (name, n, r, drag, side, bottom, boy, mass) in rows {
+            let Ok(data) = fs.read_inflated(name) else {
+                continue;
+            };
+            let sarc = crate::sarc::SmallArchive::parse(&data).unwrap();
+            let e = sarc
+                .entries
+                .iter()
+                .find(|e| e.name.to_ascii_lowercase().ends_with("vdoll"))
+                .unwrap();
+            let doll = VehicleDoll::parse(sarc.data(&data, e).unwrap()).unwrap();
+            let b = doll.boat.expect(name);
+            assert_eq!(b.floats.len(), n, "{name} spheres");
+            assert_eq!(b.hull.radius, r, "{name} radius");
+            assert_eq!(b.floats[0].1, r, "{name}: module 0 is first");
+            assert_eq!(b.hull.drag, drag, "{name} drag");
+            assert_eq!(b.hull.side_area, side, "{name} side area");
+            assert_eq!(b.hull.bottom_area, bottom, "{name} bottom area");
+            assert_eq!(b.hull.up_velocity_cap, 20.0, "{name} cap");
+            assert!((b.buoyancy - boy).abs() < 1e-6, "{name} boyancy");
+            assert_eq!(b.mass, mass, "{name} mass");
+            assert!(b.inertia_factors.iter().all(|f| *f > 0.0), "{name} inertia");
+        }
+    }
+
     /// Needs JC2_TEST_DIR with `arve.v071_jet_fighter.ee` and `arve.v067_speedplane.ee`.
     #[test]
     fn plane_modules() {
@@ -1045,6 +1411,151 @@ mod tests {
         };
         if let Some(j) = ids("lave.v014_jeep.ee") {
             assert_eq!(j, (Some(62), Some(74)));
+        }
+    }
+
+    /// `CVehicleDamageModule`: present keys override, missing ones keep the loader defaults
+    /// (0x008cb720: 500, 300, 10, 50, 50, 75, 10, 2, 1/900, 1.0).
+    #[test]
+    fn damage_module_keys_and_defaults() {
+        let mut m = Node::default();
+        m.values.push((
+            Key::Name("_class".into()),
+            Variant::Str("CVehicleDamageModule".into()),
+        ));
+        m.values.push((Key::Hash(DMG_MAX_HEALTH), Variant::Float(750.0)));
+        m.values.push((Key::Hash(DMG_INSTANT_WRECK), Variant::Int(100)));
+        m.values.push((Key::Hash(DMG_MULTIPLIER), Variant::Float(0.75)));
+        let mut root = Node::default();
+        root.children.push((Key::Hash(1), m));
+        let doll = VehicleDoll::from_property(&PropertyFile { nodes: vec![root] });
+        let d = doll.damage.expect("module");
+        assert_eq!(
+            (d.max_health, d.instant_wreck, d.collision_multiplier),
+            (750.0, 100.0, 0.75)
+        );
+        // keys not in the node keep their defaults
+        assert_eq!((d.type1_threshold, d.type3_threshold), (10.0, 50.0));
+        assert_eq!(DamageModule::default().max_health, 500.0);
+        assert!(VehicleDoll::default().damage.is_none());
+    }
+
+    /// Retail census (research `vehicle_damage_templates`): the jeep is `CarDamage_Medium`
+    /// (750 hp, instant wreck 100, type 1 / 3 thresholds 5 / 7, multiplier 0.75); the moped
+    /// has no module. Needs JC2_TEST_DIR.
+    #[test]
+    fn retail_damage_modules() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let damage = |name: &str| {
+            let data = fs.read_inflated(name).ok()?;
+            let sarc = crate::sarc::SmallArchive::parse(&data).ok()?;
+            let e = sarc.entries.iter().find(|e| e.name.ends_with("vdoll"))?;
+            Some(VehicleDoll::parse(sarc.data(&data, e).ok()?).ok()?.damage)
+        };
+        if let Some(j) = damage("lave.v014_jeep.ee") {
+            let j = j.expect("jeep module");
+            assert_eq!(
+                (
+                    j.max_health,
+                    j.instant_wreck,
+                    j.type1_threshold,
+                    j.type3_threshold,
+                    j.collision_multiplier
+                ),
+                (750.0, 100.0, 5.0, 7.0, 0.75)
+            );
+        }
+        if let Some(m) = damage("lave.v006_moped.ee") {
+            assert!(m.is_none());
+        }
+        // the burn keys come from the container's .epe: 8 s on the jeep's neighbours, 4 s on the lorry
+        let burn = |name: &str| {
+            let data = fs.read_inflated(name).ok()?;
+            let sarc = crate::sarc::SmallArchive::parse(&data).ok()?;
+            let e = sarc.get(&format!("{name}.epe"))?;
+            let d = crate::compress::maybe_inflate(sarc.data(&data, e).ok()?).ok()?;
+            Some(BurnTuning::from_epe(&d))
+        };
+        if let Some(b) = burn("lave.v014_jeep.ee") {
+            assert!(b.seconds == 8.0 || b.seconds == 4.0, "{b:?}");
+            assert!(b.threshold > 0.0 && b.threshold <= 0.25, "{b:?}");
+        }
+    }
+
+    /// `CEffectProp`s (`vehicle-fire-explosion.md` sections 1 and 3): the jeep has explosion 128,
+    /// smoke 150, fire 151, burst 153 and post-explosion fire 406; a moped smokes with 166 and has
+    /// no burst; a helicopter has the shot-down slot. Needs JC2_TEST_DIR.
+    #[test]
+    fn retail_effect_props() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let effects = |name: &str| {
+            let data = fs.read_inflated(name).ok()?;
+            let sarc = crate::sarc::SmallArchive::parse(&data).ok()?;
+            let e = sarc.entries.iter().find(|e| e.name.ends_with("vdoll"))?;
+            Some(VehicleDoll::parse(sarc.data(&data, e).ok()?).ok()?.effects)
+        };
+        let id = |v: &[EffectProp], slot: i32| {
+            v.iter().find(|e| e.slot == slot).map(|e| e.id)
+        };
+        if let Some(j) = effects("lave.v014_jeep.ee") {
+            assert_eq!(id(&j, effect_slot::EXPLOSION), Some(128));
+            assert_eq!(id(&j, effect_slot::ENGINE_SMOKING), Some(150));
+            assert_eq!(id(&j, effect_slot::ENGINE_BURNING), Some(151));
+            assert_eq!(id(&j, effect_slot::ENGINE_SMOKE_BURST), Some(153));
+            assert_eq!(id(&j, effect_slot::POST_EXPLOSION_FIRE), Some(406));
+            // the smoke mount: (-0.98, 0.88, -1.32)
+            let s = j.iter().find(|e| e.slot == 12).unwrap().local.translation();
+            assert!((s[0] + 0.98).abs() < 0.01 && (s[2] + 1.32).abs() < 0.01, "{s:?}");
+        }
+        if let Some(m) = effects("lave.v006_moped.ee") {
+            assert_eq!(id(&m, effect_slot::ENGINE_SMOKING), Some(166));
+            assert_eq!(id(&m, effect_slot::ENGINE_SMOKE_BURST), None);
+        }
+        if let Some(h) = effects("arve.v059_civilian_helicopter.ee") {
+            assert_eq!(id(&h, effect_slot::EXPLOSION), Some(157));
+            assert_eq!(id(&h, effect_slot::SHOTDOWN), Some(87));
+        }
+        // the .epe tuning keys, container name without the extension
+        let tuning = |name: &str| {
+            let data = fs.read_inflated(&format!("{name}.ee")).ok()?;
+            let sarc = crate::sarc::SmallArchive::parse(&data).ok()?;
+            let e = sarc.get(&format!("{name}.epe"))?;
+            let d = crate::compress::maybe_inflate(sarc.data(&data, e).ok()?).ok()?;
+            Some(BurnTuning::from_epe(&d))
+        };
+        if let Some(t) = tuning("lave.v014_jeep") {
+            assert!(t.smoke_threshold == 0.4 || t.smoke_threshold == 0.6, "{t:?}");
+            assert!(t.smoke_threshold > t.threshold, "{t:?}");
+            assert_eq!(t.post_explosion_seconds, Some(8.0), "{t:?}");
+        }
+    }
+
+    /// The `.epe` contact effect ids (`vehicle-damage-effects.md` section 2.2). Needs JC2_TEST_DIR.
+    #[test]
+    fn retail_contact_fx_ids() {
+        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
+            return;
+        };
+        let fs = crate::GameFs::open(dir).unwrap();
+        let ids = |name: &str| {
+            let data = fs.read_inflated(&format!("{name}.ee")).ok()?;
+            let sarc = crate::sarc::SmallArchive::parse(&data).ok()?;
+            let e = sarc.get(&format!("{name}.epe"))?;
+            let d = crate::compress::maybe_inflate(sarc.data(&data, e).ok()?).ok()?;
+            Some(ContactFxIds::from_epe(&d))
+        };
+        if let Some(j) = ids("lave.v014_jeep") {
+            assert_eq!((j.impact, j.slide, j.roll, j.scrape), (Some(67), Some(68), Some(69), 293), "{j:?}");
+        }
+        if let Some(b) = ids("seve.v082_motorboat_standard_small") {
+            assert_eq!(b.impact, Some(254), "{b:?}");
+            assert_eq!(b.slide, Some(294), "{b:?}");
         }
     }
 

@@ -16,6 +16,9 @@
 // Fragment: StandardMaterial lighting with a normal that points up. The cut-out stays the
 // provisional `Mask(0.4)` (the native blend / coverage state is unresolved, JC2-126 Gap 4).
 
+#import jc2::haze_fog::haze_fog
+#import jc2::sun_horizon::{ao_uv, horizon_shadow}
+#import jc2::sun_correction::sun_correction
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{alpha_discard, visibility_range_dither},
@@ -51,6 +54,27 @@ fn card_alpha(centre: vec3<f32>) -> f32 {
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> impostor: ImpostorParams;
+
+// The shared per-frame constants (sun_horizon.rs); the cards read only the haze fog fields
+// (haze.rs, haze_fog.wgsl), all zero = no fog. The native `treeimpostortop`, `treeimpostortrunk`
+// and `treesingleimpostor*` pixel shaders end with the same `exp(-w)`, `min(., 1)` mix toward
+// `cb0[13].xyz` as the terrain (shader bundle PS 7471432 and the family scan, JC2-163).
+struct SunHorizon {
+    cb0: vec4<f32>,
+    sun: vec4<f32>,
+    tilt: vec4<f32>,
+    fog_a: vec4<f32>,
+    fog_b: vec4<f32>,
+    fog_colour: vec4<f32>,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> horizon: SunHorizon;
+
+// t11: the terrain AmbientOcclusionMap, bound by `sun_horizon::add_ao_binding`. The native top and
+// trunk pixel shaders (PS 7471432 and the family scan, `sun_terms_probe.py`: treeimpostor
+// 3 of 3, treesingleimpostor 3 of 5 with horizon and `t11.x / 2 + 1/2`, no cascade block) scale
+// the Sun by `horizon * (t11.x / 2 + 1/2)` and the ambient by `t11.x`.
+@group(#{MATERIAL_BIND_GROUP}) @binding(102) var horizon_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var horizon_sampler: sampler;
 
 @vertex
 fn vertex(v: Vertex) -> VertexOutput {
@@ -114,8 +138,20 @@ fn fragment(
     pbr_input.material.base_color.a = saturate(pbr_input.material.base_color.a * in.uv_b.x - CARD_CLIP);
 #endif
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
+    let t11 = textureSample(horizon_tex, horizon_sampler, ao_uv(in.world_position.xz));
+    pbr_input.diffuse_occlusion = pbr_input.diffuse_occlusion * t11.x;
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
+    // the Sun: horizon shadow and `t11.x / 2 + 1/2`; no cascade block in the native shaders, so
+    // Bevy's cascade is cancelled (sun_correction.wgsl, `cascaded = false`)
+    let sun_factor = horizon_shadow(t11, horizon.cb0, horizon.sun) * (t11.x * 0.5 + 0.5);
+    out.color = vec4<f32>(
+        out.color.rgb + sun_correction(pbr_input, sun_factor, horizon.sun, false), out.color.a);
+    // the native atmospheric fog (haze_fog.wgsl); Bevy's own fog is off for this material
+    let haze_clip = view.clip_from_view * (view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0));
+    out.color = vec4<f32>(
+        haze_fog(out.color.rgb, haze_clip, in.world_position.y, horizon.fog_a, horizon.fog_b, horizon.fog_colour),
+        out.color.a);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
     return out;
 }

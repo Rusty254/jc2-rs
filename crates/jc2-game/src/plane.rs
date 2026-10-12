@@ -218,17 +218,20 @@ pub fn build_plane(
             if let Some(sc) = pp.part.scale {
                 tf.scale *= Vec3::from(sc);
             }
-            parent
-                .spawn((tf, Visibility::default(), Name::new(pp.part.name.clone())))
-                .with_children(|c| {
-                    for b in &rbm.blocks {
-                        c.spawn((
-                            Mesh3d(b.mesh.clone()),
-                            b.material_component(),
-                            Transform::IDENTITY,
-                        ));
-                    }
-                });
+            let mut part =
+                parent.spawn((tf, Visibility::default(), Name::new(pp.part.name.clone())));
+            if let Some(l) = pp.plant_lod() {
+                part.insert(l);
+            }
+            part.with_children(|c| {
+                for b in &rbm.blocks {
+                    c.spawn((
+                        Mesh3d(b.mesh.clone()),
+                        b.material_component(),
+                        Transform::IDENTITY,
+                    ));
+                }
+            });
         }
     });
     let id = entity.id();

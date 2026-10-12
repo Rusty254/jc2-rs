@@ -1070,6 +1070,7 @@ mod tests {
                 radius: 5.0,
                 damage: 80.0,
                 impulse: 0.0,
+                effect: None,
             });
             app.finish();
             app.update();

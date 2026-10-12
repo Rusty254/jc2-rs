@@ -152,6 +152,7 @@ The manager's default transition (no mapping found) is 0.5 / 0.5 (`00762eb0`: `[
    was not decoded.
 
 ## Corrections to existing research and code
+* "camera tables hold only FOV, filter and spring" (JC2-1a28 note) is wrong: `camera_settings.bin` records also carry pivot/camera/target offsets, yaw/pitch limits and filter types; see `parachute-camera-placement.md`.
 * `tree-impostors-next.md` "f = 1 for any FOV >= 1 rad" and the table fixtures with `f = 1`: native `f = max(fov^2, 0.38)` has no
   native on-foot 40 deg `f = 0.487388`, the lodfactor 0 foliage fade runs 112.8 m (full) -> 167.8 m (gone) instead of 55 -> 110 m, and the Top/Trunk
   card starts move out by the same factor 2.05. The document's `f = 1` rows are valid only for a FOV of exactly 1 rad (57.3 deg).

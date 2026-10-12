@@ -342,3 +342,17 @@ original bundle; original billboard depth/shadow records assert discard detectio
 DDS alpha probe exercised on four original textures and a synthetic 1x1 RGBA DDS
 (alpha 127, histogram sum and threshold count checked). No runtime, Cargo or GPU
 validation was performed in this research assignment.
+
+## JC2-251: model textures were clamped, not wrapped
+
+User report: tree bark and the fallen log showed stretched/smeared bands, rocks looked smooth,
+buildings looked wrong. Root cause: `rbm_loader` loaded every colour, normal and MPM image with
+Bevy's default sampler (clamp-to-edge) although the retail meshes tile their textures beyond
+0..1 (Arctic pine bark UV0 spans about -1.3..26.6 by -10..10.8). Every tile outside 0..1 repeated
+the border texel. The loader now sets a wrap (repeat) sampler on those images (`wrap_sampler`);
+the UV1 AO atlas keeps the default. Wrap is inferred from the authored UV range; the native
+D3D10 sampler states for the Bark/Facade/General shaders are not decoded (gap: native
+address/filter modes, anisotropy and mip filter; Bevy's default mip filter is nearest).
+Regression: `retail_tiled_bark_and_normal_images_wrap` in `rbm_loader.rs`. Captures:
+`_extract/JC2-251/{before,after}-pineL.png`, `-log.png`, `-hotel.png`, `-hero-31-14.png`.
+The hotel facade barely changes (its UVs stay mostly inside 0..1); trunks, branches, logs and rocks change a lot.

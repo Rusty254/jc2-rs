@@ -284,7 +284,7 @@ midnight `(0.034483, 9000, 0.000115, 202)` and `(-0.45, 0.5005, 0.00025, 0.007)`
 
 ## 9. Gaps (native details still unknown)
 
-1. **Fog-gradient colour writer** (`cb1[5]` = block field `+0x1c`/`+0x2c`, `FUN_00a44ad0`): nobody found that stores to it for the
+1. **Fog-gradient colour writer** (CLOSED by JC2-151, `sky-gradient-next.md` section 4: `FUN_00a45110` writes `cb1[5]` = fog layer colour, water colour at camera y <= 200; the text below is the original gap) (`cb1[5]` = block field `+0x1c`/`+0x2c`, `FUN_00a44ad0`): nobody found that stores to it for the
    FogGradient block (`FUN_00a44240` writes a sunset-tinted colour into a block at `S+0x18`; whether that is this block is unproven).
    Blocks: the horizon band colour/parity. Next: trace the owner of `FUN_00a49ec0`'s result (`FUN_00a4a6d0`, `FUN_00a4b990`) and its virtual
    `+0x80` writers.
@@ -293,7 +293,7 @@ midnight `(0.034483, 9000, 0.000115, 202)` and `(-0.45, 0.5005, 0.00025, 0.007)`
 3. **Rows 2/3 for height, underwater, rain and snow sets** (sets 8..11 and their weights in `FUN_00a5d390`): `light_state` models only the
    base case (JC2-132 tracks it); the fog colour inherits the same limitation. Blocks fog colour in rain/snow/high altitude/underwater.
 4. **Lightning:** `S+0x250` already includes the lightning override (`S+0xb4 > 0`, direction toward the flash, `FUN_00a58a00`); it is not modelled, so during a flash the sun-facing blend points at the flash.
-5. **Sky dome colours** (`skygradientshader`, no `cb0`): the clear/horizon colours remain policy in `sky.rs`. Blocks: the sky colour the
+5. **Sky dome colours** (`skygradientshader`, no `cb0`; DECODED by JC2-151, `sky-gradient-next.md`: texture lookup by hour and sun azimuth, sRGB, unscaled): the clear/horizon colours remain policy in `sky.rs` until the dome is implemented. Blocks: the sky colour the
    fog meets.
    used by `FUN_004de470`, and the mapping from the cloud column to `P.+0x48`: needed to know when it rains/snows. Blocks the rain/snow
    fog variants (they stay weight 0, i.e. clear).
@@ -334,3 +334,42 @@ Replace the policy fog of `sky.rs` (`FOG_VISIBILITY_*`, `FOG_EXTINCTION`, `FOG_I
 * Do not feed `E`/`F` (`haze_e`, `haze_f` in `AtmosphereState`) into the atmospheric fog: they are the **water** colour (`cb0[14]`), to
   be used by the water/underwater paths (`water-consumers-next.md`).
 * Keep `FogGradient` (horizon band) out of scope until Gap 1.
+
+## 11. Fog families beyond terrain/General (JC2-163)
+
+Scan of every shader in `DX10_Shaders_F.shader_bundle` (disassembled with `research/tools/sm4dis.py`; a vertex shader counts
+as carrying the seven-line exponent when it reads `cb0[12].x/.z` and `cb0[13].w`; a pixel shader counts as the standard mix when it
+has `exp rN, neg(vM.w)` and `cb0[13].xyz`):
+
+| Family (shader names) | VS fog | PS fog | Runtime (JC2-163) |
+|---|---|---|---|
+| `grass`, `grass_lod0/1/2` | seven-line exponent (VS 194644) | standard `2^-e` mix (PS 6102356 ends with the exp of -v4.w, min with 1, mix to `cb0[13]`) | `grass.wgsl` uses `haze_fog` |
+| `treeimpostortop/trunk`, `treesingleimpostortop/trunk` | seven-line exponent (VS 296816) | standard (PS 7471432) | `impostor.wgsl` uses `haze_fog` |
+| `clouds`, `cirrusclouds` | **own variant** (VS 106016 / 104892) | `out.rgb = tex*vcol*(1-F) + fog*F`, alpha untouched (PS 4814844 / 4814356) | `sky_sprite.wgsl`, `haze_sky_card_factor` |
+| `particle` (VS 246068) | seven-line exponent on the world position, `F = max(1 - 2^-e, 0)` | `rgb = lerp(sat(4 tex vcol).rgb, fog, F)` (PS 6734036) | **not done** (Gap 1) |
+| sky dome, `stars`, `sunbeam`, `lensflare`, `softclouds`, `lightning`, `foggradient` | none | none | unchanged |
+| water (`watershader_*`, `nvwater*`) | seven-line exponent | mostly the standard mix; `lod0` of both and `watershader_lod1` read `cb0[13]` differently | the sea has its own exact path since JC2-155 (`sea.wgsl`) |
+
+Sky-card variant (VS 106016 `clouds`, 104892 `cirrusclouds`): the distance is the **radial** camera-to-vertex distance, scaled by 0.7
+(clouds) or 0.25 (cirrus), the height is `y' = (y - camY) * scale + camY`, the exponent is saturated and for clouds remapped:
+
+    len = |scale (p - cam)|     h = y' cb0[13].z - cb0[13].x
+    e   = sat(len cb0[12].z + (sat(len cb0[13].w) (1 - min(h, cb0[13].y)) - cb0[12].x))
+    cirrus F = 1 - 2^-e         clouds F = 1 - 2^-max(2 (e - 0.5), 0)
+
+Runtime: the General, terrain, foliage, forest-canopy and sea materials already used the exact fog; grass, tree impostors and the
+cloud and cirrus cards now bind the same `SunHorizon` buffer (`haze::add_haze_binding`) and apply the exact term per fragment;
+their `fog_enabled` is off. Per-fragment evaluation replaces the native per-vertex evaluation (same inputs, interpolated
+differently). Tests: `haze::tests::sky_card_factors_follow_the_cloud_and_cirrus_shaders`, `the_fog_module_validates`.
+
+**Gaps (JC2-163)**
+
+1. **Particles** (`particle` VS 246068 / PS 6734036; the additive and soft variants read `cb0[13]` differently and were not read one
+   by one): the factor is known (above) but the native particle renderer does not exist; the particle fixture and explosion smoke
+   are `StandardMaterial` and stay on the labelled `DistanceFog` approximation. Blocks fog parity of smoke and fire.
+2. **Cloud and cirrus card placement** is project policy (camera-facing cards, own fade, Bevy lighting); only the fog factor and mix
+   are native. The native vertex positions (the fog input) are not the cards' corners here. Blocks exact cloud haze.
+3. **Water families** other than the one in `sea.wgsl` (`nvwatershader_lod0`, `watershader_lod1`, `waterbelow`, underwater
+   variants) have non-standard fog tails; only the sea family is implemented.
+4. **Per-fragment vs per-vertex evaluation**: the native `e` is interpolated across triangles, ours is exact per pixel; invisible
+   except on very large triangles.

@@ -8,15 +8,15 @@
 //!   engine axes, which are Bevy's — x east, z south, `coords.rs`): rises in the east,
 //!   stands 45° high in the south at noon, 32° below the horizon at
 //!   midnight, up from about 5:40 to 18:20. The moon is the same orbit twelve hours on.
-//! * The sky colour is the game's `skygradient_dif.dds` read at the hour (its horizon
-//!   rows), kept relative to noon so that the midday look stays the one the world
-//!   already had, and dimmed by the sun's elevation. It is the clear colour only (since
-//!   JC2-155 it is no longer the fog colour). The sky's dimming is mine (the data files
-//!   only carry the sky colours): see `weather.md`. The sun and ambient light are native tables.
+//! * **The sky is native since JC2-214** (`native_sky.rs`): the gradient dome, the fog band, the
+//!   stars and the sun disc and glow draw as the exe's passes do. There is no sky colour policy
+//!   any more: the scene is cleared to the native linear (0.498, 0.498, 1.0)
+//!   ([`SCENE_CLEAR`], JC2-203) and the dome adds its colour. The sun and ambient light are native tables.
 //! * **Fog is native since JC2-155** (`haze.rs`): colour, distances, density and height term
 //!   come from the haze section of `landscape_effects.bin` and the zone gradient rows 2/3;
 //!   [`crate::haze::update_haze_fog`] runs in this plugin's chain.
-//! * Two unlit discs mark the sun and the moon far away.
+//! * An unlit disc marks the moon far away until `clouds.rs` replaces it with the textured sprite
+//!   (the moon pass is JC2-130's); the sun disc and glow are `native_sky.rs`'s.
 //! * **One** directional light (the [`Sun`] entity), as in the exe (`FUN_00a58a00`): when the
 //!   sun is below the horizon its direction is negated, so the same light now comes from the
 //!   moon's side (`light-tables-next.md` section 5). The flip has no colour attenuation
@@ -25,43 +25,33 @@
 //!   (`sky_light.rs`, JC2-122; the zone set is a labelled stand-in there). Only the scale from
 //!   native colour units to Bevy lux (`sky_light::lux_per_unit`) is the exposure identity `pi / e0`. There is no
 //!   separate Moon or sky-fill light (the exe has none).
-//! * Still **non-native** policy here: the sky (clear) colour, the discs, and the sun colour /
+//! * Still **non-native** policy here: the moon disc, and the sun colour /
 //!   moon strength the cloud tint reads ([`SkyState::sun_colour`], [`SkyState::moon_lux`];
 //!   `clouds.rs`).
-//! * **Units (JC2-139).** The world camera shows `sqrt(clamp01(scene) * A * tint)`, so the
-//!   clear colour is written in native scene units. The project's sky colour is *authored as a
-//!   display value* (`NOON_SKY` is what the player should see at `A = 1`) and converted by
-//!   `c = d^2` (`native_units::display_native`), the inverse of the chain's `sqrt`: a **policy
-//!   colour in native units**, no native value. The fog colour (JC2-155) is a native scene
+//! * **Units (JC2-139).** The world camera shows `sqrt(clamp01(scene) * A * tint)`; the sky
+//!   passes write native scene units (1.0 = display white). The fog colour (JC2-155) is a native scene
 //!   colour, rows 2/3 of the zone gradient, and is used as is. Tables `E`/`F` of
 //!   `gradients.bmp` are the water colour (`cb0[14]`), not the haze, and stay unused here.
 
 use crate::Game;
 use crate::atmosphere::{
-    AtmosphereState, GradientData, load_gradients, scale_point_lights, update_atmosphere,
+    AtmosphereState, GradientData, load_gradients, update_atmosphere,
 };
 use crate::coords::to_bevy;
 use crate::sky_light::{
     SkyLighting, ZoneGradientData, load_zone_gradients, update_sky_lighting, update_zone_inputs,
 };
-use bevy::light::CascadeShadowConfigBuilder;
+use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
 use bevy::prelude::*;
 use jc2_formats::weather::{Atmosphere, elevation_degrees, moon_direction, sun_direction};
 
-/// The sky's colour at noon (what the world used before it had a clock): clear colour
-/// (the fog colour is native, `haze.rs`).
-const NOON_SKY: Vec3 = Vec3::new(0.58, 0.72, 0.90);
-/// Moonless midnight sky.
-const NIGHT_SKY: Vec3 = Vec3::new(0.010, 0.016, 0.040);
 /// **Non-native, cloud tint only (not the light):** the sun's colour when
 /// high / when on the horizon.
 const SUN_HIGH: Vec3 = Vec3::new(1.0, 0.97, 0.92);
 const SUN_LOW: Vec3 = Vec3::new(1.0, 0.52, 0.25);
 /// **Non-native, cloud tint only:** the moon's relative strength ([`SkyState::moon_lux`]).
 const MOON_LUX: f32 = 2400.0;
-/// Where on the sky table (0 zenith, 1 horizon) the clear colour is read.
-const HORIZON_V: f32 = 0.95;
-/// Distance of the sun and moon discs from the camera (inside the 30 km far plane).
+/// Distance of the moon disc from the camera (inside the 30 km far plane).
 const DISC_DISTANCE: f32 = 25_000.0;
 
 #[derive(Resource, Clone, Debug)]
@@ -119,8 +109,6 @@ pub struct SkyData(pub Option<Atmosphere>);
 #[derive(Component)]
 pub struct Sun;
 #[derive(Component)]
-pub(crate) struct SunDisc;
-#[derive(Component)]
 pub(crate) struct MoonDisc;
 #[derive(Component)]
 struct ClockText;
@@ -141,9 +129,8 @@ pub struct SkyState {
     pub light_dir: Vec3,
     /// **Non-native** moon strength (0..[`MOON_LUX`]) for the cloud tint only.
     pub moon_lux: f32,
-    /// Clear colour (sRGB display value; **non-native**, the fog colour is `haze.rs`'s).
-    pub sky: Vec3,
-    /// 0 at night, 1 by day: how much sky there is.
+    /// 0 at night, 1 by day (**non-native** smoothstep of the sun's elevation, used by the moon
+    /// disc and the cloud tint only).
     pub daylight: f32,
 }
 
@@ -152,32 +139,13 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The horizon colour of the game's sky table at `hour`, smoothed over about an hour
-/// (the table alternates between neighbouring columns around midday).
-fn table_horizon(atm: &Atmosphere, hour: f32) -> Vec3 {
-    let tap = |h: f32| Vec3::from(atm.sky_colour(h, HORIZON_V));
-    tap(hour - 0.5) * 0.25 + tap(hour) * 0.5 + tap(hour + 0.5) * 0.25
-}
-
 impl SkyState {
-    pub fn at(hour: f32, atm: Option<&Atmosphere>) -> Self {
+    pub fn at(hour: f32) -> Self {
         let sun = sun_direction(hour);
         let moon = moon_direction(hour);
         let e = elevation_degrees(sun);
         let moon_e = elevation_degrees(moon);
         let sky_w = smoothstep(-14.0, 8.0, e);
-
-        // the sky's hue relative to noon, from the game's table (or a warm horizon
-        // when the files are missing)
-        let ratio = match atm {
-            Some(a) => {
-                let noon = table_horizon(a, 12.0).max(Vec3::splat(0.05));
-                (table_horizon(a, hour) / noon).clamp(Vec3::splat(0.2), Vec3::splat(1.4))
-            }
-            None => Vec3::new(1.0, 0.7, 0.45).lerp(Vec3::ONE, smoothstep(0.0, 14.0, e)),
-        };
-        let day_sky = (NOON_SKY * ratio).clamp(Vec3::ZERO, Vec3::ONE);
-        let sky = NIGHT_SKY.lerp(day_sky, sky_w);
 
         let sun_dir = to_bevy(sun);
         // native: L = -sun; if L.y > 0 (sun below the horizon) L = -L
@@ -191,16 +159,9 @@ impl SkyState {
             sun_colour,
             light_dir,
             moon_lux: MOON_LUX * (1.0 - smoothstep(-6.0, 6.0, e)) * smoothstep(-2.0, 12.0, moon_e),
-            sky,
             daylight: sky_w,
         }
     }
-}
-
-/// A scene colour (the clear colour) from a project colour authored as a display value:
-/// native units `d^2` (`native_units.rs`). **Policy colour, native unit.**
-fn colour(v: Vec3) -> Color {
-    crate::native_units::native_colour(v, 1.0)
 }
 
 pub struct SkyPlugin {
@@ -232,6 +193,7 @@ impl Plugin for SkyPlugin {
                 )
                     .chain(),
             )
+            .init_resource::<crate::sun_shadow::FrameStats>()
             .add_systems(
                 Update,
                 (
@@ -241,13 +203,19 @@ impl Plugin for SkyPlugin {
                     update_zone_inputs,
                     update_sky_lighting,
                     crate::haze::update_haze_fog,
-                    scale_point_lights,
                     apply_sky,
                     follow_camera,
                     clock_text,
                 )
                     .chain(),
             );
+        if self.config.sun_shadows && !crate::sun_shadow::disabled_by_env() {
+            crate::sun_shadow::insert_shadow_map(app);
+            app.add_systems(Update, crate::sun_shadow::update_cascades.after(follow_camera));
+        }
+        if std::env::var_os("JC2_FRAME_STATS").is_some() {
+            app.add_systems(Update, crate::sun_shadow::frame_stats);
+        }
     }
 }
 
@@ -263,12 +231,11 @@ fn spawn_sky(
     mut commands: Commands,
     cfg: Res<SkyConfig>,
     time: Res<TimeOfDay>,
-    data: Res<SkyData>,
     lighting: Res<SkyLighting>,
     meshes: Option<ResMut<Assets<Mesh>>>,
     materials: Option<ResMut<Assets<StandardMaterial>>>,
 ) {
-    let st = SkyState::at(time.hours, data.0.as_ref());
+    let st = SkyState::at(time.hours);
     let lights = lighting.bevy();
     let mut sun = commands.spawn((
         Sun,
@@ -281,7 +248,8 @@ fn spawn_sky(
         },
         Transform::default().looking_to(-st.light_dir, Vec3::Y),
     ));
-    if cfg.sun_shadows {
+    if cfg.sun_shadows && crate::sun_shadow::disabled_by_env() {
+        // before-capture / comparison: Bevy's own non-native split
         sun.insert(
             CascadeShadowConfigBuilder {
                 num_cascades: 4,
@@ -292,6 +260,14 @@ fn spawn_sky(
             }
             .build(),
         );
+    } else if cfg.sun_shadows {
+        // native cascade set-up (`sun_shadow.rs`); the bounds are refreshed every frame
+        let c = crate::sun_shadow::native_cascades(0.0, 10.0);
+        sun.insert(CascadeShadowConfig {
+            bounds: c.view_bounds().to_vec(),
+            overlap_proportion: 1.0 - crate::sun_shadow::EDGE_FADE_START,
+            minimum_distance: 0.1,
+        });
     }
     commands.spawn((
         ClockText,
@@ -326,16 +302,6 @@ fn spawn_sky(
             )
         };
         commands.spawn((
-            SunDisc,
-            Name::new("sun disc"),
-            disc(
-                440.0,
-                crate::native_units::native_colour(Vec3::new(1.0, 0.95, 0.80), 1.0),
-                false,
-            ),
-            Transform::from_translation(st.sun_dir * DISC_DISTANCE),
-        ));
-        commands.spawn((
             MoonDisc,
             Name::new("moon disc"),
             disc(
@@ -365,15 +331,18 @@ fn tick_clock(real: Res<Time<Real>>, mut time: ResMut<TimeOfDay>) {
     time.advance(real.delta_secs());
 }
 
+/// The scene clear colour, linear: bytes (127, 127, 255, 255) / 255 (`FUN_00928740` truncates
+/// `x * 255`; `FUN_0096a2d0` multiplies by 0.003921569).
+pub const SCENE_CLEAR: Color = Color::linear_rgba(127.0 / 255.0, 127.0 / 255.0, 1.0, 1.0);
+
 fn apply_sky(
     time: Res<TimeOfDay>,
-    data: Res<SkyData>,
     lighting: Res<SkyLighting>,
     mut clear: ResMut<ClearColor>,
     mut sun: Query<(&mut DirectionalLight, &mut Transform), With<Sun>>,
     mut cams: Query<&mut AmbientLight, With<Camera3d>>,
 ) {
-    let st = SkyState::at(time.hours, data.0.as_ref());
+    let st = SkyState::at(time.hours);
     // native colour of the one light and the ambient (sky_light.rs); units are the exposure identity
     let lights = lighting.bevy();
     for (mut l, mut tf) in &mut sun {
@@ -381,8 +350,11 @@ fn apply_sky(
         l.color = lights.sun_color;
         *tf = Transform::default().looking_to(-st.light_dir, Vec3::Y);
     }
-    // policy colours (`st.sky`, authored as display values) in native scene units
-    clear.0 = colour(st.sky);
+    // NATIVE (JC2-203, `sky-gradient-next.md` section 12.4, `FUN_00a52f30`): the CLEAR pass
+    // clears the scene target to the float4 (0.5, 0.5, 1.0, 1.0), stored as bytes
+    // (127, 127, 255, 255) and given as a linear value to the sRGB view. The additive dome then
+    // sums onto it (section 12.5).
+    clear.0 = SCENE_CLEAR;
     // the fog is `haze.rs`'s (native colour and numbers, JC2-155)
     for mut amb in &mut cams {
         amb.color = lights.ambient_color;
@@ -390,37 +362,24 @@ fn apply_sky(
     }
 }
 
-/// The discs ride with the camera at a fixed distance in the sun's and moon's direction.
+/// The moon disc rides with the camera at a fixed distance in the moon's direction.
 #[allow(clippy::type_complexity)]
 fn follow_camera(
     time: Res<TimeOfDay>,
     cam: Query<&GlobalTransform, With<Camera3d>>,
-    mut sun: Query<
-        (&mut Transform, &mut Visibility),
-        (With<SunDisc>, Without<MoonDisc>, Without<Camera3d>),
-    >,
     mut moon: Query<
         (
             &mut Transform,
             &mut Visibility,
             &MeshMaterial3d<StandardMaterial>,
         ),
-        (With<MoonDisc>, Without<SunDisc>, Without<Camera3d>),
+        (With<MoonDisc>, Without<Camera3d>),
     >,
     mut materials: Option<ResMut<Assets<StandardMaterial>>>,
-    data: Res<SkyData>,
 ) {
     let Some(cam) = cam.iter().next() else { return };
-    let st = SkyState::at(time.hours, data.0.as_ref());
+    let st = SkyState::at(time.hours);
     let origin = cam.translation();
-    for (mut tf, mut vis) in &mut sun {
-        tf.translation = origin + st.sun_dir * DISC_DISTANCE;
-        *vis = if st.sun_elevation > -1.0 {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-    }
     for (mut tf, mut vis, mat) in &mut moon {
         tf.translation = origin + st.moon_dir * DISC_DISTANCE;
         *vis = if st.moon_dir.y > -0.02 {
@@ -457,7 +416,6 @@ mod tests {
     use super::*;
     use bevy::pbr::DistanceFog;
     use bevy::time::TimeUpdateStrategy;
-    use jc2_formats::GameFs;
     use std::time::Duration;
 
     /// The sky plugin on a bare app with one camera, stepped in 0.1 s frames. The zone
@@ -492,7 +450,7 @@ mod tests {
         sun_up: f32,
         sun_lux: f32,
         ambient: f32,
-        clear: Vec3,
+        clear: Color,
     }
 
     fn look(app: &mut App) -> Look {
@@ -504,13 +462,11 @@ mod tests {
         let sun_up = -sun_tf.forward().y;
         let sun_lux = sun_l.illuminance;
         let ambient = w.query::<&AmbientLight>().single(w).unwrap().brightness;
-        // the clear colour is a native scene colour; the test reads its display value
-        let c = w.resource::<ClearColor>().0.to_linear();
         Look {
             sun_up,
             sun_lux,
             ambient,
-            clear: crate::native_units::native_display(Vec3::new(c.red, c.green, c.blue)),
+            clear: w.resource::<ClearColor>().0,
         }
     }
 
@@ -536,7 +492,7 @@ mod tests {
         // midnight: the sun is 32 degrees below the horizon, so the light is the negated
         // sun vector (above the horizon on the moon's side), dim but not black
         let midnight = at(&mut a, 0.0);
-        let sun_below = SkyState::at(0.0, None).sun_dir;
+        let sun_below = SkyState::at(0.0).sun_dir;
         assert!(sun_below.y < -0.4);
         assert!(midnight.sun_up > 0.4, "light height {}", midnight.sun_up);
         assert!(
@@ -544,13 +500,13 @@ mod tests {
             "negated sun vector"
         );
         assert!(midnight.sun_lux > 100.0, "{}", midnight.sun_lux);
-        // night is darker: the native table colours (the synthetic fixture here), the sky
-        // colour stays project policy
+        // night is darker: the native table colours (the synthetic fixture here)
         assert!(midnight.sun_lux < noon.sun_lux / 3.0);
         assert!(midnight.ambient < noon.ambient / 2.0);
-        assert!(midnight.clear.length() < noon.clear.length() / 10.0);
-        // the noon sky is the colour the world always had
-        assert!((noon.clear - NOON_SKY).length() < 0.02, "{:?}", noon.clear);
+        // the sky is the native dome's job (`native_sky.rs`): the scene is cleared to the native
+        // linear (127, 127, 255, 255) / 255 (JC2-203) at every hour
+        assert_eq!(noon.clear, SCENE_CLEAR);
+        assert_eq!(midnight.clear, SCENE_CLEAR);
     }
 
     /// The light's colour and the camera ambient are the native table values at the hour,
@@ -591,12 +547,12 @@ mod tests {
     #[test]
     fn the_light_flips_when_the_sun_height_goes_negative() {
         for hour in [0.0, 3.0, 5.0, 19.0, 22.0] {
-            let st = SkyState::at(hour, None);
+            let st = SkyState::at(hour);
             assert!(st.sun_dir.y < 0.0);
             assert!((st.light_dir + st.sun_dir).length() < 1e-5, "{hour}");
         }
         for hour in [6.5, 9.0, 12.0, 17.0] {
-            let st = SkyState::at(hour, None);
+            let st = SkyState::at(hour);
             assert!(st.sun_dir.y > 0.0);
             assert!((st.light_dir - st.sun_dir).length() < 1e-5, "{hour}");
         }
@@ -606,12 +562,12 @@ mod tests {
     /// and goes down in the west; at noon it stands in the south (+z).
     #[test]
     fn the_morning_sun_rises_in_the_east() {
-        let dawn = SkyState::at(6.5, None);
+        let dawn = SkyState::at(6.5);
         assert!(dawn.sun_elevation > 0.0 && dawn.sun_elevation < 20.0);
         assert!(dawn.sun_dir.x > 0.7, "dawn sun {:?}", dawn.sun_dir);
-        let dusk = SkyState::at(17.5, None);
+        let dusk = SkyState::at(17.5);
         assert!(dusk.sun_dir.x < -0.7, "dusk sun {:?}", dusk.sun_dir);
-        let noon = SkyState::at(12.0, None);
+        let noon = SkyState::at(12.0);
         assert!(noon.sun_dir.z > 0.7 && noon.sun_dir.x.abs() < 1e-3);
         // east on the map: walking towards the morning sun moves the map arrow right
         let here = crate::map::bevy_to_map(Vec3::ZERO);
@@ -625,11 +581,7 @@ mod tests {
         let dusk = at(&mut a, 18.5);
         let noon = at(&mut a, 12.0);
         let night = at(&mut a, 23.0);
-        // the table colour is steady through the night hours, so only the sky colour is
-        // ordered across all three
         assert!(dusk.sun_lux < noon.sun_lux / 2.0 && night.sun_lux < noon.sun_lux / 3.0);
-        assert!(dusk.clear.length() < noon.clear.length());
-        assert!(dusk.clear.length() > night.clear.length());
     }
 
     #[test]
@@ -681,29 +633,5 @@ mod tests {
         let t = a.world().resource::<TimeOfDay>();
         assert!((t.hours - 10.5).abs() < 0.01, "{}", t.hours);
         assert!(t.paused);
-    }
-
-    /// With the real sky table the noon look is unchanged and dawn is warmer than dusk's
-    /// night; skipped without the game files.
-    #[test]
-    fn the_games_sky_table_tints_dawn() {
-        let Ok(dir) = std::env::var("JC2_TEST_DIR") else {
-            return;
-        };
-        let Ok(fs) = GameFs::open(dir) else { return };
-        let Ok(atm) = Atmosphere::load(&fs) else {
-            return;
-        };
-        let noon = SkyState::at(12.0, Some(&atm));
-        assert!((noon.sky - NOON_SKY).length() < 0.02, "{:?}", noon.sky);
-        let dawn = SkyState::at(6.3, Some(&atm));
-        // warm: more red than blue relative to noon
-        assert!(
-            dawn.sky.x / dawn.sky.z > noon.sky.x / noon.sky.z,
-            "{:?}",
-            dawn.sky
-        );
-        let night = SkyState::at(1.0, Some(&atm));
-        assert!(night.sky.length() < 0.1, "{:?}", night.sky);
     }
 }

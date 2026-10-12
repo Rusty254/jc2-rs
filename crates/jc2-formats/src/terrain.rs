@@ -164,6 +164,26 @@ pub struct TileSection {
     pub textures: Vec<DdsImage>,
 }
 
+/// Bilinear height in metres of a 132 x 132 raw height grid (`TerrainTile::heights`) at a
+/// position relative to the tile origin; `None` outside the grid.
+pub fn sample_height_grid(heights: &[u16], lx: f32, lz: f32) -> Option<f32> {
+    let c = lx / CELL_SIZE + TILE_MARGIN as f32;
+    let r = lz / CELL_SIZE + TILE_MARGIN as f32;
+    let max = (TILE_SAMPLES - 1) as f32;
+    if !(0.0..max).contains(&c)
+        || !(0.0..max).contains(&r)
+        || heights.len() < TILE_SAMPLES * TILE_SAMPLES
+    {
+        return None;
+    }
+    let (c0, r0) = (c.floor() as usize, r.floor() as usize);
+    let (fc, fr) = (c - c0 as f32, r - r0 as f32);
+    let h = |row: usize, col: usize| height_to_metres(heights[row * TILE_SAMPLES + col]);
+    let top = h(r0, c0) + (h(r0, c0 + 1) - h(r0, c0)) * fc;
+    let bottom = h(r0 + 1, c0) + (h(r0 + 1, c0 + 1) - h(r0 + 1, c0)) * fc;
+    Some(top + (bottom - top) * fr)
+}
+
 /// One 512 m terrain tile.
 #[derive(Clone, Debug)]
 pub struct TerrainTile {
@@ -402,21 +422,7 @@ impl TerrainTile {
     /// Bilinear height at a position relative to the tile origin, in metres. Positions a
     /// little outside the tile are served from the margin.
     pub fn sample_local(&self, lx: f32, lz: f32) -> Option<f32> {
-        let c = lx / CELL_SIZE + TILE_MARGIN as f32;
-        let r = lz / CELL_SIZE + TILE_MARGIN as f32;
-        let max = (TILE_SAMPLES - 1) as f32;
-        if !(0.0..max).contains(&c) || !(0.0..max).contains(&r) {
-            return None;
-        }
-        let (c0, r0) = (c.floor() as usize, r.floor() as usize);
-        let (fc, fr) = (c - c0 as f32, r - r0 as f32);
-        let h00 = self.height(r0, c0);
-        let h01 = self.height(r0, c0 + 1);
-        let h10 = self.height(r0 + 1, c0);
-        let h11 = self.height(r0 + 1, c0 + 1);
-        let top = h00 + (h01 - h00) * fc;
-        let bottom = h10 + (h11 - h10) * fc;
-        Some(top + (bottom - top) * fr)
+        sample_height_grid(&self.heights, lx, lz)
     }
 
     /// Lowest and highest raw height in the tile.

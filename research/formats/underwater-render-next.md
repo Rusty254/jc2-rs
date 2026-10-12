@@ -6,6 +6,10 @@
 and not repeated. Terrain/cloud findings of `cloud-shadow-consumers-next.md` (branch
 `worktree-agent-ab610af73978831af`) are reused for the pixel `cb0` upload.
 
+**Update (JC2-103, `post-composite-variant-next.md`):** the shipped gameplay variant is the `_EdgeFade` family (film grain only in
+cutscenes), the vignette is radial `length(uv - 0.5)` (corrects section 7/8), the sampler enums and the writers of Q+0x68/0x69,
+setting[0x1b] and Q[3] are resolved there.
+
 Executable `JustCause2.exe` sha256 `df99a479354cbd46ed322bcbd6651938c39fc1e7432734586486dd9f53b74f80`
 (14,549,656 bytes). `DX10_Shaders_F.shader_bundle` sha256
 `db8c67a0672668623d7bf9222c008523083b9f4bd01c6665f8dea8cebc292e98`. Addresses are retail VAs; shader offsets index

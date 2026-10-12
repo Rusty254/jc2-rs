@@ -74,13 +74,15 @@ impl Heli {
 
 /// A rotor part: its rest transform and spin axis (main rotor: y, tail: x).
 #[derive(Component)]
-struct Rotor {
-    base: Transform,
+pub(crate) struct Rotor {
+    /// Rest transform in the helicopter's frame.
+    pub(crate) base: Transform,
     axis: Vec3,
     /// `Some(true)`: the blurred disc, shown when spinning; `Some(false)`: the still
     /// blades, shown when slow; `None` (the axle): always.
     blurred: Option<bool>,
-    tail: bool,
+    /// The tail rotor (the main rotor is the one without it).
+    pub(crate) tail: bool,
 }
 
 #[derive(Component)]
@@ -199,6 +201,9 @@ pub fn build_heli(
                     part.insert(Visibility::Hidden);
                 }
                 part.insert(r);
+            }
+            if let Some(l) = pp.plant_lod() {
+                part.insert(l);
             }
             part.with_children(|c| {
                 for b in &rbm.blocks {

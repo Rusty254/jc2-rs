@@ -37,6 +37,21 @@ const K_TRANS_POS: u32 = 0xe380_ec1d;
 const K_TRANS_MODE: u32 = 0x77fd_4815;
 const K_TRANS_FOV: u32 = 0xaa77_3667;
 const K_TRANS_DELAY: u32 = 0x2d94_e355;
+// Placement keys (`00808070`, `research/formats/parachute-camera-placement.md`, JC2-b78c).
+const K_PIVOT: u32 = 0x93d9_cae6;
+const K_CAMERA_OFFSET: u32 = 0x80cf_2614;
+const K_TARGET_OFFSET: u32 = 0x15ed_1fea;
+const K_YAW_LIMITS: u32 = 0x82bb_c61c;
+const K_PITCH_LIMITS: u32 = 0x8fc2_7e6c;
+const K_SMOOTH_TYPE: u32 = 0x5069_2f83;
+const K_SMOOTH_RATE: u32 = 0x8e26_0e93;
+const K_TARGET_NODE: u32 = 0x3e72_7c53;
+const K_CAMERA_NODE: u32 = 0x0a4c_2bdc;
+const K_MOVE_A: u32 = 0xc4af_b170;
+const K_MOVE_B: u32 = 0xc26c_0ec2;
+const K_TARGET_MODE: u32 = 0x1aca_be1c;
+const K_COLLISION: u32 = 0x2945_85fd;
+const K_INPUT_FILTER: u32 = 0xd318_5ed6;
 const PLAYER_NODE: u32 = 0xa0f5_dc0e;
 const SNIPER_SECTION: u32 = 0xa271_2e04;
 
@@ -85,6 +100,52 @@ pub struct CameraSetting {
     pub speed_fov_deg: Option<f32>,
     /// Speed filter: spring `[k, c]` (key `0xa3b42ba2`).
     pub spring: Option<[f32; 2]>,
+    /// The placement vectors and limits (`00838720` / `00688380`), when the record has any.
+    pub placement: Placement,
+}
+
+/// The placement data of a camera record (board b78ce9ba; `parachute-camera-placement.md`).
+/// Angles are radians (`007d44b0`). Every field is `None` when no key sets it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Placement {
+    /// Key `0x93d9cae6` (`def+0x04`): pivot in the node's local frame. The native loader
+    /// reads it only when the target and camera node ids are equal and non-zero; this
+    /// field is filled under that same condition.
+    pub pivot: Option<[f32; 3]>,
+    /// Key `0x80cf2614` (`def+0x84`): camera offset from the pivot, camera-local, +Z behind.
+    pub camera_offset: Option<[f32; 3]>,
+    /// Key `0x15ed1fea` (`def+0x30`): target (look-at) offset.
+    pub target_offset: Option<[f32; 3]>,
+    /// Key `0x82bbc61c`: `[min, max]` yaw offset, radians.
+    pub yaw_limits: Option<[f32; 2]>,
+    /// Key `0x8fc27e6c`: `[min, max]` pitch offset, radians.
+    pub pitch_limits: Option<[f32; 2]>,
+    /// Key `0x50692f83`: camera pivot smoothing type (2 = interpolation, `00660f40`).
+    pub smoothing_type: Option<i32>,
+    /// Key `0x8e260e93`: smoothing rate, 1/s.
+    pub smoothing_rate: Option<f32>,
+    /// Keys `0x3e727c53` / `0x0a4c2bdc`: target node id, camera node id.
+    pub nodes: Option<(i32, i32)>,
+    /// Key `0xc4afb170`: movement parameter A (Parachute: yaw recentre seconds, 12.0).
+    pub move_a: Option<f32>,
+    /// Key `0xc26c0ec2`: movement parameter B (0.1; Freefall: input filter timer).
+    pub move_b: Option<f32>,
+    /// Key `0x1acabe1c` (record `+0xe8`, `00640fd0`): the target-matrix rotation mode of the
+    /// movement class. 1 = the target is also rotated by the yaw and pitch offsets (SkyDive),
+    /// 2 yaw only, 3 pitch only; absent (0) = no rotation.
+    pub target_mode: Option<i32>,
+    /// Key `0x294585fd` (`+0xbc`): collision filter class (1 Full, 8 Parachute; `00771930`).
+    pub collision: Option<i32>,
+    /// Key `0xd3185ed6` (`+0x104`): input filter class (1 Nonlinear, 2 NonlinearAccel;
+    /// `00816230`).
+    pub input_filter: Option<i32>,
+}
+
+impl Placement {
+    /// The interpolation smoothing rate (type 2 only, `00576360`), 1/s.
+    pub fn pivot_smoothing_rate(&self) -> Option<f32> {
+        (self.smoothing_type == Some(2)).then_some(self.smoothing_rate).flatten()
+    }
 }
 
 impl CameraSetting {
@@ -217,6 +278,20 @@ struct Merged {
     speed_range: Option<[f32; 2]>,
     speed_fov: Option<f32>,
     spring: Option<[f32; 2]>,
+    placement: Placement,
+    pivot: Option<[f32; 3]>,
+}
+
+fn variant_vec3(v: &Variant) -> Option<[f32; 3]> {
+    match v {
+        Variant::Vec3(p) => Some(*p),
+        Variant::Floats(f) if f.len() >= 3 => Some([f[0], f[1], f[2]]),
+        _ => None,
+    }
+}
+
+fn degrees_pair(v: &Variant) -> Option<[f32; 2]> {
+    variant_pair(v).map(|[a, b]| [deg_to_rad(a), deg_to_rad(b)])
 }
 
 impl Merged {
@@ -235,6 +310,46 @@ impl Merged {
         }
         if let Some(p) = val(n, K_SPRING).and_then(variant_pair) {
             self.spring = Some(p);
+        }
+        let pl = &mut self.placement;
+        if let Some(v) = val(n, K_PIVOT).and_then(variant_vec3) {
+            self.pivot = Some(v);
+        }
+        if let Some(v) = val(n, K_CAMERA_OFFSET).and_then(variant_vec3) {
+            pl.camera_offset = Some(v);
+        }
+        if let Some(v) = val(n, K_TARGET_OFFSET).and_then(variant_vec3) {
+            pl.target_offset = Some(v);
+        }
+        if let Some(v) = val(n, K_YAW_LIMITS).and_then(degrees_pair) {
+            pl.yaw_limits = Some(v);
+        }
+        if let Some(v) = val(n, K_PITCH_LIMITS).and_then(degrees_pair) {
+            pl.pitch_limits = Some(v);
+        }
+        if let Some(v) = int(n, K_SMOOTH_TYPE) {
+            pl.smoothing_type = Some(v);
+        }
+        if let Some(v) = val(n, K_SMOOTH_RATE).and_then(variant_f32) {
+            pl.smoothing_rate = Some(v);
+        }
+        if let (Some(t), Some(c)) = (int(n, K_TARGET_NODE), int(n, K_CAMERA_NODE)) {
+            pl.nodes = Some((t, c));
+        }
+        if let Some(v) = val(n, K_MOVE_A).and_then(variant_f32) {
+            pl.move_a = Some(v);
+        }
+        if let Some(v) = val(n, K_MOVE_B).and_then(variant_f32) {
+            pl.move_b = Some(v);
+        }
+        if let Some(v) = int(n, K_TARGET_MODE) {
+            pl.target_mode = Some(v);
+        }
+        if let Some(v) = int(n, K_COLLISION) {
+            pl.collision = Some(v);
+        }
+        if let Some(v) = int(n, K_INPUT_FILTER) {
+            pl.input_filter = Some(v);
         }
     }
 }
@@ -273,6 +388,12 @@ impl CameraSettings {
                 }
             }
             m.apply(n);
+            let mut placement = m.placement.clone();
+            // `00808070` reads the pivot only when both node ids are equal and non-zero
+            placement.pivot = match placement.nodes {
+                Some((t, c)) if t == c && t != 0 => m.pivot,
+                _ => None,
+            };
             out.settings.insert(
                 id,
                 CameraSetting {
@@ -284,6 +405,7 @@ impl CameraSettings {
                     speed_range: m.speed_range,
                     speed_fov_deg: m.speed_fov,
                     spring: m.spring,
+                    placement,
                 },
             );
         }
@@ -608,6 +730,32 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn retail_chute_camera_placement() {
+        let Some(d) = data() else { return };
+        let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+        let p = &d.settings.get(1).unwrap().placement;
+        assert!(near(p.pivot.unwrap(), [0.0, 3.75, -0.5]));
+        assert!(near(p.camera_offset.unwrap(), [0.0, 0.0, 6.75]));
+        assert!(near(p.target_offset.unwrap(), [0.0, -1.0, 0.0]));
+        assert_eq!(p.yaw_limits, Some([deg_to_rad(-70.0), deg_to_rad(70.0)]));
+        assert_eq!(p.pitch_limits, Some([deg_to_rad(-65.0), deg_to_rad(75.0)]));
+        assert_eq!(p.pivot_smoothing_rate(), Some(5.0));
+        assert_eq!(p.nodes, Some((2, 2)));
+        assert_eq!(p.move_a, Some(12.0));
+        let p = &d.settings.get(2).unwrap().placement;
+        assert_eq!(p.pivot, None);
+        assert!(near(p.camera_offset.unwrap(), [0.0, 3.0, 2.5]));
+        assert!(near(p.target_offset.unwrap(), [0.0, 0.5, -1.0]));
+        assert_eq!(p.yaw_limits, Some([deg_to_rad(-85.0), deg_to_rad(85.0)]));
+        assert_eq!(p.pitch_limits, Some([deg_to_rad(-25.0), deg_to_rad(45.0)]));
+        assert_eq!(p.pivot_smoothing_rate(), None);
+        // on foot: 3.0 m behind, no pivot
+        let p = &d.settings.get(0).unwrap().placement;
+        assert!(near(p.camera_offset.unwrap(), [0.55, 1.55, 3.0]));
+        assert_eq!(p.pivot, None);
     }
 
     #[test]

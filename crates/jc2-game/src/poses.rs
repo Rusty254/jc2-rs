@@ -426,7 +426,9 @@ impl Stow {
 /// Where each of the guns carried goes: the one in use in the hand (if the gait lets a
 /// hand hold it, else stowed), the others in the first free stowage of their kind —
 /// one two-handed gun on the harness, two pistols on the thighs — and the rest hidden.
-pub fn stowage(classes: &[WeaponClass], current: usize, gait: Gait) -> Vec<Stow> {
+///
+/// `drawn` false (holder draw state 0, holstered): even the current gun is stowed.
+pub fn stowage(classes: &[WeaponClass], current: usize, gait: Gait, drawn: bool) -> Vec<Stow> {
     let mut out = vec![Stow::Hidden; classes.len()];
     let mut back = false;
     let mut thighs = [false; 2];
@@ -449,7 +451,7 @@ pub fn stowage(classes: &[WeaponClass], current: usize, gait: Gait) -> Vec<Stow>
         }
     };
     if let Some(&c) = classes.get(current) {
-        out[current] = if gait.holds(c) {
+        out[current] = if drawn && gait.holds(c) {
             Stow::Hand
         } else if gait == Gait::Seated {
             Stow::Hidden
@@ -638,12 +640,16 @@ fn demo_aim(
     mut orbit: ResMut<crate::character::OrbitCamera>,
     mut heroes: Query<(&crate::character::Hero, &mut Arms)>,
 ) {
-    if let (Some(mut a), Some(w)) = (arsenal, demo.weapon)
-        && w >= 1
-        && w <= a.guns.len()
-        && a.current != w - 1
-    {
-        a.current = w - 1;
+    if let Some(mut a) = arsenal {
+        // the demo shows the gun in hand
+        a.drawn = true;
+        if let Some(w) = demo.weapon
+            && w >= 1
+            && w <= a.guns.len()
+            && a.current != w - 1
+        {
+            a.current = w - 1;
+        }
     }
     let Ok((hero, mut arms)) = heroes.single_mut() else {
         return;
@@ -665,18 +671,18 @@ mod tests {
     fn stowage_puts_one_gun_in_hand_and_the_rest_on_the_body() {
         use WeaponClass::*;
         let classes = [Pistol, Smg, Shotgun, Rifle, Rpg];
-        let s = stowage(&classes, 3, Gait::Run);
+        let s = stowage(&classes, 3, Gait::Run, true);
         assert_eq!(s[3], Stow::Hand);
         assert_eq!(&s[..3], &[Stow::RightUpLeg, Stow::LeftUpLeg, Stow::Harness]);
         assert_eq!(s[4], Stow::Hidden);
         // on the wire the rifle goes on the harness
-        let s = stowage(&classes, 3, Gait::Hang);
+        let s = stowage(&classes, 3, Gait::Hang, true);
         assert_eq!(s[3], Stow::Harness);
         assert_eq!(s[0], Stow::RightUpLeg);
         // the pistol stays in the hand under the chute
-        assert_eq!(stowage(&classes, 0, Gait::Chute)[0], Stow::Hand);
+        assert_eq!(stowage(&classes, 0, Gait::Chute, true)[0], Stow::Hand);
         assert!(
-            stowage(&classes, 0, Gait::Seated)
+            stowage(&classes, 0, Gait::Seated, true)
                 .iter()
                 .all(|s| *s == Stow::Hidden)
         );

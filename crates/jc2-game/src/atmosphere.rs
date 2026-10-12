@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | `cloud_lit` / `cloud_shaded` (`C`, `D`) | cloud card colours (`FUN_00a53a80`) | the cumulus cards' tint (`clouds.rs`, lit colour) |
 //! | `haze_a/b/e/f` (`A`, `B`, `E`, `F`) | haze `FUN_00a432d0` -> `cb0[13]`/`cb0[14]` | `A`/`B` variants 1/2 only in the rain/snow fog colour (`haze.rs`, weights 0 until JC2-156); variant 0 is never read natively. `E`/`F` are the **water** colour `cb0[14]` (JC2-116), **stored only**, not fog |
-//! | `point_light_scale` (`S`) | `FUN_0091dcc0`: point-light colour `* S * CRenderEngine+0x830` | muzzle-flash and explosion lights, whose base strength is in native colour units at 1 m (`native_units::point_lumens`, policy value; `+0x830` is constant 1.0 as far as a displacement sweep shows, `night-light-next.md` section 6) |
+//! | `point_light_scale` (`S`) | `FUN_0091dcc0`: point-light colour `* S * CRenderEngine+0x830` | the native point-light term (`point_lights.rs`, JC2-221; `CLightManager+0x830` is 1.0, `point-light-model.md` section 1) |
 //! | `facade_night` (`S0`) | pixel `cb2[0].x` of the merged/facade render blocks (inferred: a "lights on" factor) | **stored only**: this crate has no facade/merged-block material |
 //!
 //! The six RGB tables of `gradients.bmp` do **not** feed the sun colour or the ambient. Those
@@ -107,6 +107,30 @@ impl AtmosphereState {
         s
     }
 
+    /// The water colour `cb0[14].rgb` for a camera at height `camera_y` (JC2-164; research
+    /// `water-inputs-next.md` section 1): table `E` at or above `y = 200.0`, `F` below (`F`
+    /// differs from `E` only at hours 0..3 and 21..23). Variant-weighted like the other tables
+    /// (rain/snow weights are 0 until JC2-156). Linear, native scene units; without the tables
+    /// the constructor value (1, 1, 1) stands (callers check [`Self::loaded`]).
+    pub fn water_colour(&self, camera_y: f32) -> Vec3 {
+        if camera_y < crate::world::SEA_LEVEL {
+            self.haze_f
+        } else {
+            self.haze_e
+        }
+    }
+
+    /// The optical density `cb0[14].w` (`FUN_00a432d0`: immediates `0x3e99999a` / `0x3e19999a`):
+    /// 0.3 at or above `y = 200.0`, 0.15 below. Not hour- or weather-dependent. The pixel shader
+    /// uses it as the base-2 absorption `1 - 2^(-thickness * density)`.
+    pub fn water_density(camera_y: f32) -> f32 {
+        if camera_y >= crate::world::SEA_LEVEL {
+            f32::from_bits(0x3e99_999a)
+        } else {
+            f32::from_bits(0x3e19_999a)
+        }
+    }
+
     /// The point-light scale for consumers: the table value, or 1 without tables so the
     /// project's own light intensities stand.
     pub fn point_light_factor(&self) -> f32 {
@@ -123,27 +147,6 @@ pub fn load_gradients(game: Option<Res<Game>>, mut data: ResMut<GradientData>) {
     match GradientTables::load(&game.fs) {
         Ok(t) => data.0 = Some(t),
         Err(e) => warn!("atmosphere: gradients.bmp not read ({e}); keeping built-in colours"),
-    }
-}
-
-/// A point light whose project-tuned intensity is multiplied by the native per-hour
-/// point-light scale each frame ([`AtmosphereState::point_light_factor`]). The base
-/// intensity (Bevy lumens) is the project's: built with `native_units::point_lumens`, i.e. in
-/// native colour units at 1 m, but the strength itself is a policy value (the native colour
-/// is also capped at 8 per channel and falls off with the light's radius, not decoded).
-#[derive(Component, Clone, Copy, Debug)]
-pub struct PointLightBase(pub f32);
-
-pub fn scale_point_lights(
-    state: Res<AtmosphereState>,
-    mut lights: Query<(&PointLightBase, &mut PointLight)>,
-) {
-    let k = state.point_light_factor();
-    for (base, mut light) in &mut lights {
-        let target = base.0 * k;
-        if light.intensity != target {
-            light.intensity = target;
-        }
     }
 }
 
@@ -200,38 +203,47 @@ mod tests {
     }
 
     #[test]
-    fn tagged_point_lights_follow_the_scale_and_untagged_ones_do_not() {
-        let mut app = App::new();
-        app.init_resource::<AtmosphereState>()
-            .add_systems(Update, scale_point_lights);
-        let tagged = app
-            .world_mut()
-            .spawn((PointLight::default(), PointLightBase(1000.0)))
-            .id();
-        let plain = app
-            .world_mut()
-            .spawn(PointLight {
-                intensity: 7.0,
-                ..default()
-            })
-            .id();
-        // no tables: the project's intensity stands
-        app.update();
-        assert_eq!(
-            app.world().get::<PointLight>(tagged).unwrap().intensity,
-            1000.0
-        );
-        // tables at noon (variant 0): 0.25 of night
-        let mut s = AtmosphereState::evaluate(None, 12.0, 0.0, 0.0);
-        s.loaded = true;
-        s.point_light_scale = 0.25;
-        app.insert_resource(s);
-        app.update();
-        assert_eq!(
-            app.world().get::<PointLight>(tagged).unwrap().intensity,
-            250.0
-        );
-        assert_eq!(app.world().get::<PointLight>(plain).unwrap().intensity, 7.0);
+    fn water_colour_rows_density_and_the_y_200_switch_match_the_brief_fixtures() {
+        // research/formats/water-inputs-next.md section 1 (probe fixtures, linear RGB)
+        let Some(t) = retail() else { return };
+        let at = |h: f32, rain: f32| AtmosphereState::evaluate(Some(&t), h, rain, 0.0);
+        let near = |a: Vec3, b: [f32; 3]| (a - Vec3::from(b)).length() < 1e-4;
+        assert!(near(at(0.0, 0.0).water_colour(250.0), [0.0, 0.0, 0.0]));
+        assert!(near(
+            at(0.0, 0.0).water_colour(150.0),
+            [0.0, 0.02655, 0.04455]
+        ));
+        assert!(near(
+            at(4.0, 0.0).water_colour(250.0),
+            [0.00259, 0.00370, 0.00226]
+        ));
+        assert!(near(
+            at(6.0, 0.0).water_colour(250.0),
+            [0.01040, 0.02655, 0.01607]
+        ));
+        assert!(near(
+            at(12.0, 0.0).water_colour(250.0),
+            [0.00837, 0.13035, 0.13035]
+        ));
+        assert!(near(
+            at(12.0, 0.0).water_colour(150.0),
+            [0.00837, 0.13035, 0.13035]
+        ));
+        assert!(near(
+            at(23.5, 0.0).water_colour(150.0),
+            [0.0, 0.02655, 0.04455]
+        ));
+        // the rain weight blends toward the flat grey-green variant 1
+        assert!(near(
+            at(12.0, 1.0).water_colour(250.0),
+            [0.01188, 0.01699, 0.01040]
+        ));
+        // y = 200.0 exactly is "above" (E, density 0.3); just below is F / 0.15
+        let s = at(0.0, 0.0);
+        assert_eq!(s.water_colour(200.0), s.haze_e);
+        assert_eq!(s.water_colour(199.999), s.haze_f);
+        assert_eq!(AtmosphereState::water_density(200.0), 0.3_f32);
+        assert_eq!(AtmosphereState::water_density(199.999), 0.15_f32);
     }
 
     #[test]

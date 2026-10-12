@@ -568,7 +568,15 @@ fn rico_dying_in_a_car_or_on_its_roof_gets_out() {
     };
     // get up again at the start
     let respawn = |app: &mut App| {
-        step(app, (crate::combat::RESPAWN_SECONDS * 64.0) as usize + 10);
+        // wait for the respawn itself (its timer runs on game time), then for him to be
+        // placed and standing: conditions, not a frame count that a loaded machine's
+        // asset loads and settling could outrun (JC2-162)
+        crate::fleet::testing::wait_until(app, "the respawn", |app| {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.bypass_change_detection().clear();
+            let (e, ..) = hero(app);
+            app.world().get::<crate::combat::Dead>(e).is_none()
+        });
         crate::fleet::testing::wait_for_hero(app);
         let (e, h, p, _) = hero(app);
         let w = app.world();
@@ -726,7 +734,8 @@ fn rico_rides_a_boat_bow() {
         .insert(crate::vehicle::AiDriven);
     let mut worst = 0.0f32;
     let (mut pitch_lo, mut pitch_hi) = (f32::MAX, f32::MIN);
-    let start = car_pose(&app, boat).0;
+    let mut last = car_pose(&app, boat).0;
+    let mut moved = 0.0f32;
     for _ in 0..64 * 12 {
         {
             let mut b = app.world_mut().get_mut::<Watercraft>(boat).unwrap();
@@ -734,6 +743,9 @@ fn rico_rides_a_boat_bow() {
             b.rudder = 0.4;
         }
         step(&mut app, 1);
+        let now = car_pose(&app, boat).0;
+        moved += (now - last).length();
+        last = now;
         worst = worst.max(off_spot(&mut app));
         let r = car_pose(&app, boat).1;
         let nose = crate::coords::forward_of(r);
@@ -746,7 +758,6 @@ fn rico_rides_a_boat_bow() {
         let btf = *app.world().get::<Transform>(boat).unwrap();
         worst = worst.max((tf - (btf.translation + btf.rotation * on.local)).length());
     }
-    let moved = (car_pose(&app, boat).0 - start).length();
     let speed = app.world().get::<LinearVelocity>(boat).unwrap().length();
     eprintln!(
         "boat bow: ran {moved:.0} m at up to {:.0} km/h, pitched {:.1}°..{:.1}°, Rico at most {worst:.3} m off the bow",
@@ -754,7 +765,7 @@ fn rico_rides_a_boat_bow() {
         pitch_lo.to_degrees(),
         pitch_hi.to_degrees()
     );
-    assert!(moved > 60.0, "the boat only went {moved:.1} m");
+    assert!(moved > 60.0, "the boat only travelled {moved:.1} m");
     assert!(
         pitch_hi - pitch_lo > 0.5f32.to_radians(),
         "no pitching to speak of"
@@ -983,7 +994,9 @@ fn rico_hangs_on_the_wire_then_lets_go() {
         *app.world().get::<CollisionLayers>(e).unwrap(),
         CollisionLayers::NONE
     );
-    // the chute
+    // the chute: the chord is taken in the skydive (JC2-238: `S_FALL_TO_SKYDIVE`, the first
+    // 0.7 s of the fall, has no `ACT_PULLCHORD` edge, so a press then is lost)
+    step(&mut app, 24);
     press(&mut app, KeyCode::Space);
     step(&mut app, 1);
     release(&mut app, KeyCode::Space);
@@ -1061,3 +1074,49 @@ fn the_wire_swings_bounded_under_a_turning_helicopter_and_damps_out() {
 }
 
 mod transitions;
+
+// ---- the tether's effect calls (board task 7bd60e82)
+
+/// Completing a tether plays slot 4 (215 `dual_hook_deployed`); each shot plays 212; the cut
+/// (here `X`) plays 213 at both ends, stops 215 and plays 410 (doc 3.2).
+#[test]
+fn tether_completion_and_cut_make_the_native_effect_calls() {
+    use crate::grapple::effects::{FxCall, GrappleFx, Slot};
+    let mut app = tether_app();
+    let a = crate_at(&mut app, Vec3::new(-5.0, 0.5, 0.0));
+    let b = crate_at(&mut app, Vec3::new(5.0, 0.5, 0.0));
+    run(&mut app, 5);
+    shoot_body(&mut app, a);
+    run(&mut app, 2);
+    let flush = |app: &mut App| app.world_mut().resource_mut::<GrappleFx>().flush(None);
+    flush(&mut app);
+    {
+        let log = &app.world().resource::<GrappleFx>().log;
+        assert_eq!(log.len(), 1, "the first shot only plays hook_impact: {log:?}");
+        assert!(matches!(log[0], FxCall::HookImpact { .. }));
+    }
+    shoot_body(&mut app, b);
+    run(&mut app, 3);
+    flush(&mut app);
+    {
+        let log = &app.world().resource::<GrappleFx>().log;
+        let deployed = log
+            .iter()
+            .filter(|c| matches!(c, FxCall::PlaySlot { slot: Slot::Deployed, .. }))
+            .count();
+        assert_eq!(deployed, 1, "{log:?}");
+        assert!(log.iter().all(|c| !matches!(c, FxCall::HookDetach { .. })));
+    }
+    app.world_mut().resource_mut::<GrappleFx>().log.clear();
+    app.world_mut().resource_mut::<TetherState>().clear = true;
+    run(&mut app, 4);
+    flush(&mut app);
+    let log = app.world().resource::<GrappleFx>().log.clone();
+    let count = |f: &dyn Fn(&FxCall) -> bool| log.iter().filter(|c| f(c)).count();
+    assert_eq!(count(&|c| matches!(c, FxCall::HookDetach { .. })), 2, "{log:?}");
+    assert_eq!(count(&|c| *c == FxCall::StopSlot(Slot::Deployed)), 1);
+    assert_eq!(
+        count(&|c| matches!(c, FxCall::PlaySlot { slot: Slot::DetachDual, .. })),
+        1
+    );
+}

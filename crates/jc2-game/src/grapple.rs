@@ -18,8 +18,15 @@ use crate::vehicle::{CameraMode, Enterable};
 use crate::world::FlyCamera;
 use avian3d::prelude::*;
 use bevy::prelude::*;
+use effects::{FxCall, GrappleFx, Slot};
 
+mod anim;
 mod class;
+pub mod effects;
+pub use anim::{
+    ArmState, ArrivalClass, BodyCtx, BodyState, Choice, GrappleAnim, GrappledCount, HookTarget,
+    VictimState, classify_arrival,
+};
 /// The classification API JC2-038 / JC2-039 consume.
 #[allow(unused_imports)]
 pub use class::{
@@ -32,11 +39,49 @@ pub use class::{
 /// Retracting after a miss or a release: the hook comes home this many times faster
 /// than it flew out.
 const RETRACT_FACTOR: f32 = 2.0;
-/// Reeling: the speed-up (m/s²) and the braking (m/s²) the controller may use. The first
-/// is the original's yank softened; the second sets the speed it carries into the anchor:
-/// `sqrt(2·BRAKE·distance)`, so he comes to rest on the spot.
-pub const REEL_ACCEL: f32 = 45.0;
-pub const REEL_BRAKE: f32 = 50.0;
+/// The device's speed ramp (JC2-246 section 1, tick `0x00515cb0`): each frame
+/// `v = min((REEL_RAMP * dt + 1) * v, reel_in_speed)`. `0x0106d8ac` = 3.5 per second.
+pub const REEL_RAMP: f32 = 3.5;
+/// Start speed (m/s) of the reel (`device+0x38`, copied by the reel init `0x008233c0`) and
+/// of the air pull (`device+0x3c`, pull init `0x005ea6e0`); constructor defaults `0x005fdbc0`.
+pub const REEL_START_SPEED: f32 = 11.0;
+pub const PULL_START_SPEED: f32 = 6.0;
+/// Frames shorter than this return "flying" and change nothing (`0x00eba07c`).
+const TICK_MIN_DT: f32 = 1e-6;
+
+/// The device tick's result (`device+0xc`, returned by `0x00515cb0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TickResult {
+    /// 1: still flying.
+    #[default]
+    Flying,
+    /// 2: arrived (overshoot of the hook, or a re-anchored contact: the sweep is a Gap).
+    Arrived,
+    /// 3: ended (the reel update then does `ACT_DETACH`). Not produced here: the wire-record
+    /// and dead-owner cases, the sweep and the stop-short flag are not modelled.
+    #[allow(dead_code)]
+    Ended,
+}
+
+/// One device tick on the speed alone (`0x00515cb0` steps 2, 4, 6, 8 and 9). `speed` is
+/// `device+0x18`, `dist` is `device+0x14` (distance to the hook before the move), `cap` is
+/// `device+0xe0`. Returns the speed along the wire to set as the velocity (`v * dir`, no
+/// braking) and the result. Overshoot (`dist - v*dt < 0`) lands exactly on the hook:
+/// the speed becomes `dist / dt` and the result is `Arrived`.
+/// Not modelled (Gaps in the research doc): the contact sweep `0x00722cc0`, the stop-short
+/// flag `controller+0x454`, and the moving-anchor term.
+pub fn reel_tick(speed: &mut f32, dist: f32, dt: f32, cap: f32) -> (f32, TickResult) {
+    if dt < TICK_MIN_DT {
+        return (*speed, TickResult::Flying);
+    }
+    *speed = ((REEL_RAMP * dt + 1.0) * *speed).min(cap);
+    let remaining = dist - *speed * dt;
+    if remaining < 0.0 {
+        (dist / dt, TickResult::Arrived)
+    } else {
+        (*speed, TickResult::Flying)
+    }
+}
 /// Within this (m) of the goal he has arrived.
 const ARRIVE_EPS: f32 = 0.12;
 /// The longest a reel takes (s) before the wire gives up.
@@ -69,13 +114,6 @@ const SOLDIER_LYING: f32 = 1.4;
 /// Lock-on magnetism: the cone (degrees) around the crosshair in which a vehicle, a
 /// soldier, a light prop or a ledge pulls the aim to it.
 pub const MAGNET_DEG: f32 = 4.0;
-/// The cable: segments, the sag a slack wire has (fraction of its length) and the
-/// thinnest radius (m); farther away it is drawn a little thicker so it keeps a pixel.
-const CABLE_SEGMENTS: usize = 14;
-const CABLE_SAG: f32 = 0.06;
-const CABLE_MIN_RADIUS: f32 = 0.006;
-const CABLE_PIXEL: f32 = 0.001;
-
 /// The numbers from `grapplingparams.bin` (with the fallbacks when it is not there).
 #[derive(Clone, Copy, Debug)]
 pub struct Tuning {
@@ -165,6 +203,9 @@ pub struct HookHit {
     pub kind: TargetKind,
     /// A soldier or a light prop: pulled to Rico instead of reeling him in.
     pub pull: bool,
+    /// What the device's selector (`0x007f3db0`) sees: no object, a character, or an
+    /// object with its `grappling_weight_category` (see [`anim::hook_target`]).
+    pub target: HookTarget,
 }
 
 /// The hook on its way out.
@@ -208,12 +249,25 @@ pub struct GrappleRig {
     pub pull: Option<PullInfo>,
     /// His speed along the wire (m/s).
     pub reel: f32,
+    /// The device's ramped speed (`device+0x18`): [`REEL_START_SPEED`] / [`PULL_START_SPEED`]
+    /// at the start, then [`reel_tick`].
+    speed: f32,
+    /// The tick overshot the goal: he flies the last `dist / dt` and lands next step.
+    landing: bool,
     stall: f32,
     /// How slack the wire is drawn: 0 taut, 1 hanging.
     pub slack: f32,
     /// Seconds he still presses into the wall while he climbs over a ledge, and which way.
     pub climb: f32,
     pub climb_dir: Vec3,
+    /// The animation graph of the hook: the action set and the body and left-arm layers
+    /// (`anim.rs`, JC2-250).
+    pub anim: GrappleAnim,
+    /// Effect calls made by the rig's functions, drained into the spawner each frame
+    /// (`effects.rs`).
+    pub fx: Vec<FxCall>,
+    /// Seconds since the shot while the `grapplefire` event is still to come.
+    pub fire_clock: Option<f32>,
 }
 
 impl GrappleRig {
@@ -223,11 +277,17 @@ impl GrappleRig {
     }
 
     fn retract(&mut self) {
+        // the cancel's and the device detach's effects (`0x005FBCB0`, `0x005A0530`)
+        self.fx_detach();
+        // the cancel: `ACT_DETACH` on both layers, the action flags reset
+        self.anim.detach();
         self.phase = Phase::Retract;
         self.flight = None;
         self.pull = None;
         self.track = None;
         self.reel = 0.0;
+        self.speed = 0.0;
+        self.landing = false;
         self.stall = 0.0;
         self.slack = 0.8;
     }
@@ -252,6 +312,10 @@ pub struct Hooked {
     pub down: f32,
     pub toward: Vec3,
     pub pulled: bool,
+    /// `char+0x9e8`: how many hooks hold him (`C_GRAPPLED_ATLEAST_ONCE` / `C_NOT_GRAPPLED`).
+    pub grappled: GrappledCount,
+    /// The NPC machine's grapple state (`S_GRAPPLED`, `S_REMOVE_GRAPPLINGHOOK`).
+    pub victim: VictimState,
 }
 
 // ---------------------------------------------------------------- the lock-on
@@ -586,12 +650,12 @@ pub fn try_fire(
     };
     let (target, hit) = match found {
         Some((point, normal, body, kind)) if point.distance(origin) <= tuning.range + 2.0 => {
-            let pull = body
+            let class = body
                 .and_then(|b| bodies.get(b).ok())
                 .and_then(|(_, _, rb, npc, stunt, enter, mass, w)| {
-                    body_kind(rb, npc, stunt, enter, mass, w)
-                })
-                .is_some_and(|(_, p)| p);
+                    body_class(rb, npc, stunt, enter, mass, w)
+                });
+            let pull = class.is_some_and(|c| c.pull);
             (
                 point,
                 Some(HookHit {
@@ -599,6 +663,7 @@ pub fn try_fire(
                     body,
                     kind,
                     pull,
+                    target: anim::hook_target(class),
                 }),
             )
         }
@@ -627,11 +692,28 @@ pub fn try_fire(
         track,
     });
     rig.phase = Phase::Flight;
+    // the left arm raises the gauntlet (`LA_ACT_FIRE_GRAPPLE` -> `LA_S_RAISE_GRAPPLE`)
+    rig.anim.fire();
+    // the `grapplefire` event of the fire clip plays effect 11 at 0.19 s (`anim_tick`)
+    rig.fire_clock = Some(0.0);
     rig.hook = origin;
     rig.hook_rot = Quat::from_rotation_arc(MODEL_FORWARD, to.normalize_or(Vec3::NEG_Z));
     rig.slack = 0.6;
     rig.pull = None;
     rig.track = None;
+}
+
+/// What Rico's body layer is doing when an action reaches it (`anim::body_accepts`).
+pub fn body_ctx(hero: &Hero) -> BodyCtx {
+    if hero.stunt.is_some() {
+        BodyCtx::Stunt
+    } else if hero.swimming {
+        BodyCtx::Swim
+    } else if hero.grounded {
+        BodyCtx::Ground
+    } else {
+        BodyCtx::Air
+    }
 }
 
 /// Let go of everything: the wire, a hooked soldier or prop. Rico keeps his velocity.
@@ -683,14 +765,49 @@ fn hook_flight(
             rig.hook = f.target;
             rig.flight = None;
             let Some(hit) = f.hit else {
-                // a miss: home again
+                // a miss: home again (`LA_ACT_HOOK_MISSED`); the retract plays the device
+                // detach (214 `hook_miss`, one-shot 213)
+                rig.anim.miss();
                 rig.retract();
                 return;
             };
-            if hit.pull
+            // the hook's hit: 212 `hook_impact` (surface id unknown in the port: default
+            // entry) and the attach impulse step's slot 1 (203; inferred to run for both the
+            // reel and the pull)
+            rig.fx.push(FxCall::HookImpact {
+                at: f.target,
+                normal: hit.normal,
+                surface: None,
+                water: false,
+            });
+            rig.fx.push(FxCall::PlaySlot {
+                slot: Slot::Attach,
+                at: f.target,
+            });
+            // the device decides once, at attach (`0x007f3db0`): reel or pull
+            let ctx = body_ctx(&hero);
+            let attach = rig.anim.attach(hit.target, false, ctx);
+            // (the lock-on's pull flag and the selector agree on every class of `class.rs`)
+            debug_assert_eq!(hit.pull, attach.choice == Choice::Pull);
+            if attach.choice == Choice::Pull
                 && let Some(body) = hit.body
             {
+                if attach.air_pull {
+                    rig.anim.air_pull = Some(anim::AirPull {
+                        end_length: (f.target.distance(tf.translation) - anim::PULL_WIRE_SHORTENING)
+                            .max(0.0),
+                    });
+                }
+                if hero.parachute {
+                    // the parachute controller's grapple pull plays slot 2 (204); the port
+                    // takes "pull with the canopy open" for it (inferred)
+                    rig.fx.push(FxCall::PlaySlot {
+                        slot: Slot::Parachute,
+                        at: f.target,
+                    });
+                }
                 rig.phase = Phase::Pull;
+                rig.speed = PULL_START_SPEED;
                 rig.pull = Some(PullInfo {
                     body,
                     local: f.track.map(|t| t.1).unwrap_or(Vec3::ZERO),
@@ -741,20 +858,29 @@ pub fn begin_reel(
     rig.pull = None;
     rig.track = track;
     rig.reel = 0.0;
+    rig.speed = REEL_START_SPEED;
+    rig.landing = false;
     rig.stall = 0.0;
     rig.ledge_top = None;
     rig.hook = anchor;
     rig.hook_rot = Quat::from_rotation_arc(MODEL_FORWARD, -n);
     rig.slack = 0.0;
+    // the reel start plays slot 0 (203, `0x008233C0`)
+    rig.fx.push(FxCall::PlaySlot {
+        slot: Slot::Reel,
+        at: anchor,
+    });
     if track.is_some() {
         rig.arrival = Arrival::Follow;
         rig.goal = anchor;
         return;
     }
-    if n.y > 0.7 {
+    // the device's own angles: a floor from `cos 50`, a ceiling up to `cos 140` (`0x00549490`)
+    let class = classify_arrival(n.y);
+    if class == ArrivalClass::Floor {
         rig.arrival = Arrival::Land;
         rig.goal = anchor + n * (HEIGHT / 2.0 + 0.12);
-    } else if n.y < -0.7 {
+    } else if class == ArrivalClass::Ceiling {
         rig.arrival = Arrival::Overhang;
         rig.goal = anchor + n * OVERHANG_BELOW;
     } else {
@@ -848,8 +974,16 @@ pub fn hang_inputs(
     }
     let normal = hero.grapple.map(|g| g.normal).unwrap_or(Vec3::Y);
     let flat = Vec3::new(normal.x, 0.0, normal.z).normalize_or_zero();
+    let ctx = BodyCtx::Air;
     if input.chute_toggle {
         input.chute_toggle = false;
+        // `CReeledInJumpAction` on a wall (`S_REELED_IN_JUMP`: the bounce), the release from
+        // a ceiling (`S_HANG_TO_FALL`)
+        if rig.arrival == Arrival::Cling {
+            rig.anim.reeled_in_jump(ctx);
+        } else {
+            rig.anim.reeled_in_release(ctx);
+        }
         match (rig.arrival, rig.ledge_top) {
             (Arrival::Cling, Some(top)) => {
                 // up and over the edge
@@ -867,13 +1001,15 @@ pub fn hang_inputs(
         return;
     }
     if input.drop {
+        // `CReeledInReleaseAction`: `S_REELED_IN_RELEASE_DROP` / `S_HANG_TO_FALL`
+        rig.anim.reeled_in_release(ctx);
         *v = Vec3::ZERO;
         release(hero, rig);
     }
 }
 
-/// One fixed step of the wire: wind him in with a speed that rises and brakes into the
-/// goal, then land, cling, hang or let go. `v` is his velocity going in and out.
+/// One fixed step of the wire: wind him in with the device's ramped speed straight at the
+/// goal ([`reel_tick`]), then land, cling, hang or let go. `v` is his velocity going in and out.
 #[allow(clippy::too_many_arguments)]
 pub fn drive_attached(
     hero: &mut Hero,
@@ -887,12 +1023,14 @@ pub fn drive_attached(
 ) {
     let Some(mut g) = hero.grapple else {
         hero.hanging = false;
+        drive_air_pull(hero, rig, pos, v, tuning, dt);
         return;
     };
     if !matches!(rig.phase, Phase::Reel | Phase::Hang) {
         // somebody set the wire without a flight (a test, a mission): take it as it is
         let track = rig.track;
         begin_reel(rig, g.anchor, g.normal, track, spatial, filter);
+        rig.anim.attach(HookTarget::Terrain, false, body_ctx(hero));
     }
     g.age += dt;
     rig.hook = g.anchor;
@@ -917,6 +1055,10 @@ pub fn drive_attached(
     }
     if rig.arrival == Arrival::Follow {
         if g.anchor.distance(pos) < VEHICLE_RELEASE {
+            // non-native stand-in for the arrival: the native tick has no braking, and the
+            // velocity he keeps after arriving is unknown (Gap); at rest he does not
+            // ram the thing he is hooked to
+            *v = Vec3::ZERO;
             release(hero, rig);
             return;
         }
@@ -928,33 +1070,49 @@ pub fn drive_attached(
         } else {
             rig.stall = 0.0;
         }
-        if dist < ARRIVE_EPS || rig.stall > 0.3 {
+        if rig.landing || dist < ARRIVE_EPS || rig.stall > 0.3 {
             arrive(hero, rig, pos, v);
             return;
         }
     }
     let dir = to / dist.max(1e-4);
-    let closing = v.dot(dir);
-    // a taut wire: the sideways motion dies off quickly so he flies straight at the hook
-    let sideways = *v - dir * closing;
-    *v -= sideways * (1.0 - (-dt / 0.15).exp());
-    // the speed he may have here: up to the reel speed, braking into the goal
-    let stop = if rig.arrival == Arrival::Follow {
-        VEHICLE_RELEASE
-    } else {
-        0.0
-    };
-    let cmd = tuning
-        .reel_speed
-        .min((2.0 * REEL_BRAKE * (dist - stop).max(0.0)).sqrt());
-    let step = ((cmd - closing).clamp(-REEL_BRAKE * dt, REEL_ACCEL * dt)).max(-closing.max(0.0));
-    *v += dir * step;
-    // never faster than the last step can use: no overshoot
-    let now = v.dot(dir);
-    if now > dist / dt * 0.6 && rig.arrival != Arrival::Follow {
-        *v -= dir * (now - dist / dt * 0.6);
+    // the native kinematic velocity: `speed * dir`, ramped, with no braking
+    let (along, result) = reel_tick(&mut rig.speed, dist, dt, tuning.reel_speed);
+    *v = dir * along;
+    rig.landing = result == TickResult::Arrived;
+    rig.reel = along;
+    // the step's gravity would bend the line: cancel it
+    v.y += 9.81 * dt;
+    hero.facing = heading(dir, hero.facing);
+}
+
+/// `CPullGrappledAction` sub-state 1 (`0x00510a60`): Rico pulled in the air flies along the
+/// wire at the hooked thing, with the reel flight clip (`S_PULL_IN_AIR_FLIGHT`), until the
+/// wire is [`anim::PULL_WIRE_SHORTENING`] shorter than at the start; then `ACT_FALL` and the
+/// hook is cancelled. The speed is the device tick's ramp from [`PULL_START_SPEED`]
+/// ([`reel_tick`]); the contact sweep is a Gap.
+fn drive_air_pull(
+    hero: &mut Hero,
+    rig: &mut GrappleRig,
+    pos: Vec3,
+    v: &mut Vec3,
+    tuning: &Tuning,
+    dt: f32,
+) {
+    let Some(air) = rig.anim.air_pull else { return };
+    let to = rig.hook - pos;
+    let dist = to.length();
+    if rig.phase != Phase::Pull || hero.grounded || dist <= air.end_length || dist < 1.0 {
+        rig.anim.end_air_pull(BodyCtx::Air);
+        if rig.phase == Phase::Pull {
+            rig.retract();
+        }
+        return;
     }
-    rig.reel = v.dot(dir).max(0.0);
+    let dir = to / dist;
+    // the same device tick (`0x00515cb0`), start speed 6; ends by the wire length, not arrival
+    let (along, _) = reel_tick(&mut rig.speed, dist, dt, tuning.reel_speed);
+    *v = dir * along;
     // the step's gravity would bend the line: cancel it
     v.y += 9.81 * dt;
     hero.facing = heading(dir, hero.facing);
@@ -962,6 +1120,15 @@ pub fn drive_attached(
 
 fn arrive(hero: &mut Hero, rig: &mut GrappleRig, pos: Vec3, v: &mut Vec3) {
     *v = Vec3::ZERO;
+    // the reel update's dispatch: `ACT_REEL_LAND` / `_IMPACT_VERTICAL` / `_IMPACT_HORIZONTAL`
+    let class = match rig.arrival {
+        Arrival::Land | Arrival::Follow => ArrivalClass::Floor,
+        Arrival::Cling => ArrivalClass::Wall,
+        Arrival::Overhang => ArrivalClass::Ceiling,
+    };
+    rig.anim.arrive(class, BodyCtx::Air);
+    // the end of the reel stops slot 0 (`0x006B8890`)
+    rig.fx.push(FxCall::StopSlot(Slot::Reel));
     match rig.arrival {
         Arrival::Cling | Arrival::Overhang => {
             rig.phase = Phase::Hang;
@@ -1010,12 +1177,17 @@ fn pull_things(
                 Ok((_, mut h, _)) => h.pulled = true,
                 Err(_) => {
                     if info.fresh {
+                        // `0x007513d0(4)`: the hook counter of the victim goes up
+                        let mut grappled = GrappledCount::default();
+                        grappled.hooked();
                         commands.entity(info.body).try_insert(Hooked {
                             speed: t.impulse_character / SOLDIER_MASS,
                             lean: 0.0,
                             down: 0.0,
                             toward: Vec3::NEG_Z,
                             pulled: true,
+                            grappled,
+                            victim: VictimState::Grappled,
                         });
                     } else {
                         ended = true;
@@ -1027,6 +1199,7 @@ fn pull_things(
                 Ok((mut v, p, r, mass)) => {
                     let m = mass.map(|m| m.value()).unwrap_or(0.0);
                     let at = p.0 + r.0 * info.local;
+                    rig.hook = at;
                     let to = me - at;
                     let d = to.length();
                     if m <= 0.0 || d < PROP_STOP || info.age > PROP_TIMEOUT {
@@ -1061,6 +1234,8 @@ fn pull_things(
             let d = flat.length();
             if d < SOLDIER_STOP {
                 h.pulled = false;
+                // the wire to him ends (`0x0069b380`): the counter goes down
+                h.grappled.unhooked();
                 h.down = SOLDIER_LYING;
                 h.speed = 0.0;
                 if rig.pull.is_some_and(|p| p.body == e) {
@@ -1079,6 +1254,9 @@ fn pull_things(
         } else {
             h.lean = (h.lean - dt / 0.4).max(0.0);
         }
+        // `S_GRAPPLED` / `S_REMOVE_GRAPPLINGHOOK` follow the counter; the removal ends with
+        // the upper-body clip, taken here (inferred) to be over once he lies no longer
+        h.victim = h.victim.update(h.grappled, h.down <= 0.0);
         follow_ground(&spatial, e, &mut stf);
         let lean = h.lean;
         stf.rotation = if lean > 0.0 {
@@ -1098,113 +1276,13 @@ fn pull_things(
 }
 
 // ---------------------------------------------------------------- the cable
+// (`grapple/cable.rs`)
 
-/// A thin cable between two points, drawn as a chain of short cylinders: it sags while
-/// `slack` is above zero and is straight when it is taut. Every wire in the game (the
-/// hook's, the helicopter's, the tethers') is one of these.
-#[derive(Component, Clone, Copy, Debug, Default)]
-#[require(Transform, Visibility)]
-pub struct Cable {
-    pub a: Vec3,
-    pub b: Vec3,
-    pub slack: f32,
-}
-
-#[derive(Component)]
-pub(crate) struct CableSegments(Vec<Entity>);
-
-/// The points of a cable: a parabola sagging `slack · 6 %` of the length.
-pub fn cable_points(c: &Cable) -> [Vec3; CABLE_SEGMENTS + 1] {
-    let len = c.a.distance(c.b);
-    let sag = c.slack.clamp(0.0, 1.0) * CABLE_SAG * len;
-    std::array::from_fn(|i| {
-        let t = i as f32 / CABLE_SEGMENTS as f32;
-        c.a.lerp(c.b, t) - Vec3::Y * sag * 4.0 * t * (1.0 - t)
-    })
-}
-
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn draw_cables(
-    mut commands: Commands,
-    meshes: Option<ResMut<Assets<Mesh>>>,
-    materials: Option<ResMut<Assets<StandardMaterial>>>,
-    mut assets: Local<Option<(Handle<Mesh>, Handle<StandardMaterial>)>>,
-    params: Option<Res<HeroParams>>,
-    cams: Query<&GlobalTransform, With<FlyCamera>>,
-    cables: Query<(Entity, &Cable, &GlobalTransform, Option<&CableSegments>)>,
-    mut segs: Query<
-        (&mut Transform, &mut GlobalTransform),
-        (Without<Cable>, Without<Hero>, Without<FlyCamera>),
-    >,
-) {
-    let (Some(mut meshes), Some(mut materials)) = (meshes, materials) else {
-        return;
-    };
-    let (mesh, material) = assets
-        .get_or_insert_with(|| {
-            (
-                meshes.add(Cylinder::new(1.0, 1.0)),
-                materials.add(StandardMaterial {
-                    // unlit: native scene unit from a display value (policy)
-                    base_color: crate::native_units::native_colour(
-                        Vec3::new(0.95, 0.95, 0.93),
-                        1.0,
-                    ),
-                    unlit: true,
-                    ..default()
-                }),
-            )
-        })
-        .clone();
-    let base = params
-        .map(|p| p.grapple.wire_width)
-        .unwrap_or(CABLE_MIN_RADIUS)
-        .max(CABLE_MIN_RADIUS);
-    let cam = cams.single().map(|c| c.translation()).ok();
-    for (e, cable, parent, have) in &cables {
-        let pts = cable_points(cable);
-        // thicker with distance, to stay about a pixel across
-        let mid = (cable.a + cable.b) * 0.5;
-        let radius = cam
-            .map(|c| base.max(c.distance(mid) * CABLE_PIXEL))
-            .unwrap_or(base.max(0.01));
-        match have {
-            Some(s) => {
-                for (i, id) in s.0.iter().enumerate() {
-                    if let Ok((mut t, mut global)) = segs.get_mut(*id) {
-                        let world = crate::character::segment_transform(pts[i], pts[i + 1], radius);
-                        *t = Transform::from_matrix(
-                            Mat4::from(parent.affine().inverse()) * world.to_matrix(),
-                        );
-                        // We run after propagation: publish the segment's world frame
-                        // now, so the rendered wire and final launcher share this frame.
-                        *global = GlobalTransform::from(world);
-                    }
-                }
-            }
-            None => {
-                let ids = (0..CABLE_SEGMENTS)
-                    .map(|i| {
-                        let world = crate::character::segment_transform(pts[i], pts[i + 1], radius);
-                        let local = Transform::from_matrix(
-                            Mat4::from(parent.affine().inverse()) * world.to_matrix(),
-                        );
-                        commands
-                            .spawn((
-                                Mesh3d(mesh.clone()),
-                                MeshMaterial3d(material.clone()),
-                                local,
-                                GlobalTransform::from(world),
-                                ChildOf(e),
-                            ))
-                            .id()
-                    })
-                    .collect();
-                commands.entity(e).insert(CableSegments(ids));
-            }
-        }
-    }
-}
+mod cable;
+pub use cable::{Cable, HookModel, spawn_cut};
+#[cfg(test)]
+use cable::{cable_points, cut_pieces, sag_polyline, tube_mesh};
+pub(crate) use cable::{draw_cables, step_retract_pieces};
 
 // ---------------------------------------------------------------- plumbing
 
@@ -1341,12 +1419,59 @@ fn grapple_demo(
     }
 }
 
+/// Advance the hook's animation graph: clips that have played out take their `ACT_UPDATE`
+/// exit, and states Rico has left by other means end.
+fn anim_tick(
+    time: Res<Time>,
+    rig: Option<Res<crate::rig::Rig>>,
+    mut heroes: Query<(&Hero, &Transform, &mut GrappleRig)>,
+) {
+    let dt = time.delta_secs();
+    let duration = |c: crate::rig::Clip| rig.as_ref().map_or(0.0, |r| r.duration(c));
+    for (hero, tf, mut g) in &mut heroes {
+        if let Some(t) = g.fire_clock {
+            // the animation event `grapplefire` (0.19 s of `grpl_fire`): effect 11 at the hand
+            let t = t + dt;
+            if t >= effects::GRAPPLEFIRE_AT {
+                let at = g.hand_or(tf.translation, hero.facing);
+                g.fx.push(FxCall::FlyingHook { at });
+                g.fire_clock = None;
+            } else {
+                g.fire_clock = Some(t);
+            }
+        }
+        let a = &mut g.anim;
+        if hero.downed || hero.in_vehicle.is_some() || hero.stunt.is_some() {
+            a.force_free("(downed, seated or on a stunt position)");
+        } else if hero.parachute
+            && matches!(
+                a.body,
+                BodyState::ReelStart | BodyState::ReelFlight | BodyState::PullInAirFlight
+            )
+        {
+            // the canopy opening mid-flight (`ACT_PULLCHORD`): the parachute takes over
+            a.force_free("ACT_PULLCHORD");
+        } else if (a.body == BodyState::ReelEndLand && hero.speed > anim::LAND_ENDS_AT_SPEED)
+            || (matches!(
+                a.body,
+                BodyState::ReeledInJump | BodyState::ReeledInReleaseDrop | BodyState::HangToFall
+            ) && hero.grounded
+                && a.body_time > 0.1)
+        {
+            // Gap: the native exits of these states are internal; these two are inferred
+            a.force_free("(running on / touched down)");
+        }
+        a.tick(dt, &duration);
+    }
+}
+
 pub struct GrapplePlugin;
 
 impl Plugin for GrapplePlugin {
     fn build(&self, app: &mut App) {
         use crate::character::{grapple_fire, hero_physics, hero_visuals};
         app.init_resource::<LockOn>()
+            .init_resource::<GrappleFx>()
             .add_observer(mark_launcher)
             .add_observer(give_rig)
             .add_systems(
@@ -1354,7 +1479,10 @@ impl Plugin for GrapplePlugin {
                 (
                     track_hand.before(hero_visuals),
                     update_lock_on.before(grapple_fire),
+                    anim_tick.before(crate::character::hero_animation),
                     grapple_demo.before(grapple_fire),
+                    step_retract_pieces,
+                    effects::apply_grapple_fx.after(anim_tick),
                 ),
             )
             .add_systems(

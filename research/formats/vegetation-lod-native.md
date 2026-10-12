@@ -97,3 +97,102 @@ the child count equals that model's blocks.
    (static objects, vehicles); `world.rs` still resolves one level once for those.
 7. **Visual captures.** No close full-detail/transition captures were taken; only the headless
    retail swap test and the formats fixtures.
+
+## Non-vegetation consumers, JC2-128 (closes Gap 6)
+
+The chain 00a4f4b0 / 00a89b90 is per model instance and does not depend on the model kind, so
+placed static objects and vehicle parts use the same `veglod::SlotPlan` as plants (selector
+proven by the JC2-086 evidence above; no separate selector was found). Runtime:
+`world::ModelIndex::resolve_plan` (placed `.lod`: each slot's model searched in the tile
+container, then the shared ones, as the single-level resolve did) and
+`vehicle::load_doll_parts` (each doll part's `.lod`, slot models from the vehicle's own
+container), both feeding the existing `plant_lod.rs` swap. `--object-lod 0` (new default) =
+native slots for placed objects and vehicles; `N >= 1` = one fixed level as before.
+`--lodfactor` feeds the distance unit.
+
+Project policy, not native: an object whose collider is its render mesh (no `.pfi` list and no
+own shape) keeps the single full-detail level (the swap replaces child meshes and would drop
+the collider); the far cull (`x > table[5]`) is not applied (the current model stays, as for
+plants); a placed object spawns on its far model and swaps near in the first frames; vehicle
+parts spawn on the full-detail model. A vehicle body's bounds and collider come from the
+full-detail model. Headless retail tests: tile 31,14 has placed objects with switchable slots
+(none at `object_lod` 1); the APC has parts with slots.
+
+Gaps: (1) camera zoom factor F is still 1 (Gap 3 above), which matters most for vehicles
+close to the chase camera; (2) the native cull of placed objects (500 x scale m, scale default
+10) is not reproduced; (3) mesh-collider objects stay single-level; (4) far metropolis batch
+models (`scenery.rs` `resolve` with `cfg.lod`) and debris keep one level.
+
+## Camera zoom factor F, vehicle parts (JC2-259, closes Gap 3 for dynamic models)
+
+`00920240` (called by the projection update, `00960000` line 5448, so `camera+0x620` follows the
+realised FOV every frame) returns `pow(camera+0x61c * R, E)` with `camera+0x61c = cot(fov/2)`
+(`0092c620`), `R = tan(0.40840706 rad = 23.4 deg)` (the exe's own sine/cosine polynomials give
+0.4327), the exponent `E` the float `0108c590` = 1.0 and the enabling byte `0108c58c` = 1 (both read
+from the shipped image; only reads of the byte exist in the export). Consumers clamp F up to 1, so F
+is above 1 only below a 46.8 degree vertical FOV: 1.1889 on foot (40 deg), 2.454 aiming (20 deg),
+exactly 1 in the vehicle cameras (50 to 85 deg). The writers of `+0x61c` at `007141e0` / `007fa6e0` /
+`0071f120` belong to character objects, not the camera.
+Dynamic model instances re-take F at every submission (`00a85a60` -> `00a42970`); plants and placed
+static objects take it once at owner creation (`00a4f4b0`).
+Runtime: `veglod::camera_zoom`, `SlotPlan::model_at_zoom`, and `PlantLod.camera_zoom` (vehicle parts
+only) in `plant_lod.rs`.
+
+Observed (vehicle `.lod` descriptors, retail): the sixth token of vehicle parts is small
+(`v062` helicopter body and rotors 0.2, APC body 0.4, motorboat and civilian helicopter bodies
+0.75, most car parts 1.0), so the native boundaries at F = 1 are `{10, 25, 50, 100} * s` m: the
+helicopter body is on its fourth slot beyond 10 m and the APC body leaves full detail at 4 m.
+A driving or flying camera sits 6 to 25 m behind, so these parts leave slot 0 there while the
+on-foot camera stands closer. Whether the original really renders its vehicles this way, or the
+vehicle owner scale is overridden somewhere (`owner+4`, `00a42970` first lines) is NOT resolved.
+
+Gaps: (1) the writer/override of owner `+4` for vehicle instances (the descriptor scale 0.2 would
+put a helicopter on LOD4 at 10 m); (2) F for plants and placed objects is read once at owner
+creation (when, with which FOV, is untraced), so they stay at F = 1; (3) the exact polynomial `tan`
+(last digits only).
+
+## Vehicle LOD level, closes the owner-scale Gap of JC2-259 (board 27da3660)
+
+The owner path above (`00a4f4b0` / `00a89b90`, owner `+4` = model scale) is NOT what vehicles use for
+their body. Findings:
+
+* Owner `+4` is only ever the model scale or the `-1.0` "none" sentinel; `00a42970` writes it only while the
+  distance-cull flag (bit 1) is set. No vehicle override exists. Camera distance only: nothing in the
+  selection or in the vehicle code reads the occupant (`008c9100`, callers `008d8c00`, `008e1cc0`: distance from
+  camera `+0x54..0x5c`).
+* The vehicle code clears the automatic-LOD and distance-cull bits (`&= ~4`, `&= ~2`, `|= 0x800 | 0x1000`) on
+  the models it loads by name (`006c5530`, wheel models; `00821c90`, generic named-model attach) so those
+  owners are not auto-selected.
+* The vehicle object's per-frame update `006a0e80` reads the model scale of its FIRST part
+  (`006e58d0(0)` = element 0 of the 0x84-byte part vector, `+0x80` model owner, `+0xc4` model, `+0x1c`
+  scale), calls a virtual (`vtable+0x12c`, takes `(scale, &position)`), clamps/splits the result into an
+  integer level and a 0..255 fraction and applies it with `vtable+0xb4(1, level, fraction)`.
+* The level function matching that signature is `0061bb00` (a twin with the same body, without the debug
+  override, is `00855fd0`, used by roads): `x = d^2 (g s)^2 / F^2` (`d` camera to position, `s` the scale,
+  `g` = `DAT_0107214c`, `F = max(1, camera+0x620)`), then linear in x between 196, 625, 4900 and 18225 for
+  levels 1..4 (slopes 0.0051020407, 0.0023310024, 0.00023391812, 7.5046904e-5), 4.0 beyond, no cull.
+  `g` is written by `006a07b0` from the graphics-setting handler (`00610000:1699`: 1, 0.6667, 0.5, 0.3333
+  for the same four lodfactor values that set the owner unit 1, 1.5, 2, 3), i.e. `g = 1 / unit`.
+* So the scale DIVIDES the distance for vehicles: breakpoints at `{14, 25, 70, 135} unit / s` m. Helicopter
+  body (s 0.2): 70, 125, 350, 675 m. APC (0.4): 35, 62, 175, 337 m. Boat/civilian helicopter (0.75): 19, 33,
+  93, 180 m. Cars (about 1): 14, 25, 70, 135 m. This explains the "implausible" tiny scales: a larger
+  vehicle keeps detail longer. The earlier reading (owner multiplier, `{10, 25, 50, 100} s` m) put the
+  helicopter body on its crudest model beyond 10 m.
+* Runtime: `veglod::vehicle_scaled_d2`, `vehicle_level`, `SlotPlan::model_at_vehicle_level` (slot
+  `trunc(level)`, forward scan to the first filled slot), `plant_lod::VehicleLod` (body scale from the first
+  doll part, distance unit from `--lodfactor`). One level per vehicle drives every part's own slot list.
+
+Captures (`--vehicle-capture DIR`, `vehicle_capture.rs`, with `--heli`/`--boat`/`--drive CONTAINER`): a
+fixed camera 14 m from the parked vehicle, Rico outside, then Rico teleported next to it and `E` pressed
+(the real `vehicle_entry`), the same frame again, plus `slots.txt` (model, multiplier, level, distance per
+part). Before the fix the heli body was `LOD4` and the APC body `LOD3` at 14.6 m both outside and inside; the
+visible drop on entering came from the chase camera standing further away (and F 1.19 on foot -> 1.0
+driving). After: both are `LOD1` (levels 0.03/0.04 heli, 0.12/0.17 APC).
+
+Gaps: (1) the vtable binding `006a0e80 +0x12c -> 0061bb00` and the application `+0xb4` (what the level and
+the 0..255 fraction do to the parts: slot per part vs a fade between two) are inferred, not traced; we hard
+switch. (2) Two state branches of `006a0e80` are not decoded: byte `+0xba6` != 0 skips the computation and
+applies level 0 (full detail), and a float ratio `[0x3a]/[0x39] <= 0` clamps the level to 0..1; their
+meaning (damage, occupant, cinematic?) is unknown, so neither is modelled. (3) The wheel models and the
+`+0x128..` variant models have auto-LOD off and their level source is not traced, they stay as before.
+(4) `006e58d0` element 0 is assumed to be the doll's first part (the body).

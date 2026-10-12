@@ -381,7 +381,7 @@ point; `globalmetaweights` and `globalslopes` BC1 1024^2, linear, 4th weight = 1
 (colour table only), displacement, normal bend, hollows, sun/AO/ambient and the haze fog kept. Corrections to
 the older text: the global layers are 1024^2 BC1 / A4R4G4B4 (not 512^2 16-bit); the colour table sampler `s1` is
 point/clamp; the Lod2 hollows term equals the Lod0 term (ambient only), so that "unknown" is closed. The
-forest canopy layer that makes the reference's far slopes dark green is not drawn yet (JC2-160).
+forest canopy layer that makes the reference's far slopes dark green is an opaque alpha-tested cutout, not alpha-blended (forest-canopy-next.md); implemented in forest_canopy.rs (JC2-160).
 
 ## Still unknown
 

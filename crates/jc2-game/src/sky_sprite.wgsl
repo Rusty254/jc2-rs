@@ -5,6 +5,7 @@
 // camera (a field of `range.x` metres repeats) so it never ends, and builds the card.
 // The fragment fades the cards out near the camera and applies the tint.
 
+#import jc2::haze_fog::haze_sky_card_factor
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::alpha_discard,
@@ -18,9 +19,25 @@ struct SkySprite {
     // x: the repeat of the field (m), y: fade-in start, z: fade-in end (m from the camera),
     // w: far fade start (m); the far end is 1.25 x that
     range: vec4<f32>,
+    // x: the native fog distance scale, y: 1 for the cumulus remap (0 cirrus)
+    fog: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> sprite: SkySprite;
+
+// The shared per-frame constants (sun_horizon.rs); the cards read only the haze fog fields
+// (haze.rs, haze_fog.wgsl), all zero = no fog. The native `clouds` / `cirrusclouds` shaders use
+// their own factor (`haze_sky_card_factor`, JC2-163); `sprite.fog.x` is the distance scale
+// (0.7 clouds, 0.25 cirrus) and `sprite.fog.y` is 1 for the cumulus remap.
+struct SunHorizon {
+    cb0: vec4<f32>,
+    sun: vec4<f32>,
+    tilt: vec4<f32>,
+    fog_a: vec4<f32>,
+    fog_b: vec4<f32>,
+    fog_colour: vec4<f32>,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> horizon: SunHorizon;
 
 @vertex
 fn vertex(v: Vertex) -> VertexOutput {
@@ -74,6 +91,11 @@ fn fragment(
     pbr_input.material.base_color.a = pbr_input.material.base_color.a * fade;
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
+    // native: rgb = lit * (1 - F) + fog * F, alpha untouched
+    let f = haze_sky_card_factor(
+        in.world_position.xyz, view.world_position, sprite.fog.x, sprite.fog.y > 0.5,
+        horizon.fog_a, horizon.fog_b);
+    out.color = vec4<f32>(mix(out.color.rgb, horizon.fog_colour.rgb, f), out.color.a);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
     return out;
 }

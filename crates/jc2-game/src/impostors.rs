@@ -34,6 +34,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{
     AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat,
 };
+use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
 use jc2_formats::dds::DdsImage;
@@ -67,6 +68,33 @@ pub type ImpostorMaterial = ExtendedMaterial<StandardMaterial, ImpostorExt>;
 pub struct ImpostorExt {
     #[uniform(100)]
     pub params: ImpostorParams,
+    /// The shared per-frame constants (`sun_horizon::SunHorizon`); the cards read only the haze
+    /// fog fields (JC2-163). Filled by the system `haze::add_haze_binding` registers.
+    #[storage(101, read_only)]
+    pub sun_horizon: Handle<ShaderBuffer>,
+    /// `t11`: `ambientocclusionmap.dds`, filled by `sun_horizon::add_ao_binding` (white = AO 1
+    /// until then): the ambient, the horizon shadow and the `(AO / 2 + 1/2)` factor of the Sun.
+    #[texture(102)]
+    #[sampler(103)]
+    pub ao_map: Handle<Image>,
+}
+
+impl crate::sun_horizon::AoBound for ImpostorMaterial {
+    fn ao_map(&self) -> &Handle<Image> {
+        &self.extension.ao_map
+    }
+    fn set_ao_map(&mut self, map: Handle<Image>) {
+        self.extension.ao_map = map;
+    }
+}
+
+impl crate::haze::HazeBound for ImpostorMaterial {
+    fn haze_buffer(&self) -> &Handle<ShaderBuffer> {
+        &self.extension.sun_horizon
+    }
+    fn set_haze_buffer(&mut self, buffer: Handle<ShaderBuffer>) {
+        self.extension.sun_horizon = buffer;
+    }
 }
 
 #[derive(ShaderType, Clone, Debug, Default)]
@@ -134,6 +162,10 @@ impl Plugin for ImpostorPlugin {
         }
         bevy::asset::embedded_asset!(app, "impostor.wgsl");
         let shader: Handle<Shader> = load_embedded_asset!(app, "impostor.wgsl");
+        crate::haze::ensure_shader(app);
+        crate::haze::add_haze_binding::<ImpostorMaterial>(app);
+        crate::sun_horizon::ensure_correction_shader(app);
+        crate::sun_horizon::add_ao_binding::<ImpostorMaterial>(app);
         app.insert_resource(ImpostorShader(shader))
             .add_plugins(MaterialPlugin::<ImpostorMaterial>::default())
             .add_systems(Startup, setup)
@@ -248,9 +280,13 @@ fn setup(
                 alpha_mode: AlphaMode::Mask(0.4),
                 cull_mode: None,
                 double_sided: false,
+                // the native fog is applied in `impostor.wgsl` (`haze_fog.wgsl`), not Bevy's
+                fog_enabled: false,
                 ..default()
             },
             extension: ImpostorExt {
+                sun_horizon: Handle::default(),
+                ao_map: Handle::default(),
                 params: ImpostorParams {
                     mode: Vec4::new(mode, 0.0, 0.0, 0.0),
                     fade: Vec4::ZERO,

@@ -174,6 +174,7 @@ The shader multiplies these directly (`sun = cb0[3] * sat(N.-L) * shadow * ...`,
   `cb0[0].z = -L.y / k * 30` horizon-shadow height. The probe prints the values at 0/6/12/18 (`cb0[0]` at hour 0 is (0, 30, 32.08, 1)).
 * Separately, `FUN_00a594e0` tints the sun/moon *billboards*: `f = max(0.9 - 1.5|L.y|, 0)`; sun (2, 2(1 - .75f), 2(1 - f), 1)
   (`DAT_0108b520` = 2), moon (0.4, 0.4(1 - .4f), 0.4(1 - f), 1) (`DAT_0108b51c` = 0.4). Cosmetic only.
+  **Correction (JC2-174, `sun-glow-next.md`):** the second block is not the moon but the sun *glow* quad (`sun_gradient_dif.dds`, block `S[0x31]`); the first is the sun disc quad (`sun_dif.dds`, `S[0]`).
 
 ## 6. `cb0[9]`, `cb0[12].w`, `cb0[13]`, `cb0[14]` summary
 
@@ -206,7 +207,7 @@ The shader multiplies these directly (`sun = cb0[3] * sat(N.-L) * shadow * ...`,
 * **G3. Weather zones.** Source of the 8 x 8 x 64 x 64 zone map (weather-zone `.nlz` files? `gamezone_gradients.bmp`?) and of the two per-type
   tables at `DAT_01191c48+0x1964..0x19a0`. Blocks: where rain/snow variants apply.
 * **G4. The `cb0[9]` owner** (device state object at vtable `+0x54`), its `+0x1f4` value, and the `0xc0`-byte block copied to `DAT_013db080`.
-* **G5. `CRenderEngine+0x830`** (point-light scale factor) and the exact fragment of `FUN_00928d30` / `FUN_009260f0` that reads `cb2[0].x` (confirm "facade lights").
+* **G5. `CRenderEngine+0x830`** (*closed by JC2-152, `point-light-model.md`: the object is `CLightManager`, constructor 0x00956a70 sets the factor to 1.0*) (point-light scale factor) and the exact fragment of `FUN_00928d30` / `FUN_009260f0` that reads `cb2[0].x` (confirm "facade lights").
 * **G6. Cloud-light consumers:** what `light+0x28` (the `x4` colour) is used by, if anything.
 * **G7.** The `FUN_004dcb70` noise (from `cloud-shadow-consumers-next.md`) still blocks the cloud-column to rain mapping.
 

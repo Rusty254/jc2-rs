@@ -108,7 +108,7 @@ impl Placement {
     }
 }
 
-fn node_transform(node: &Node) -> Option<Transform3> {
+pub(crate) fn node_transform(node: &Node) -> Option<Transform3> {
     match node.value("world")? {
         Variant::Mat4x3(m) => Some(Transform3::from_mat4x3(*m)),
         Variant::Mat4x4(m) => Some(Transform3::from_mat4x4(*m)),

@@ -58,7 +58,7 @@ What the fix will *not* give you: after the palette is replaced, far slopes read
 B), not the reference's dark green forest. The native game draws a second terrain layer, the forest
 canopy (`TerrainShaderForest` / `TerrainShaderForestFin`, `forest_dif.dds`, `forestfin_dif.dds`),
 that is not in jc2-rs at all (Gap 1). Its texture is olive green (alpha-weighted sRGB 0.208, 0.248,
-0.093, probe) and is alpha-blended over the far ground, so it is the most likely source of the
+0.093, probe) and is drawn as an opaque alpha-tested cutout (no blending, reference 0.5; forest-canopy-next.md, JC2-160) over the far ground, so it is the most likely source of the
 reference's green slopes. Far tree impostors and the fog/atmosphere colour add to that.
 
 ## Question 2

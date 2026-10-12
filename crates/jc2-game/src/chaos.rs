@@ -17,6 +17,7 @@ use crate::destruction::UnitDestroyed;
 use crate::explosion::Wreck;
 use crate::fleet::Container;
 use crate::heat::Heat;
+use crate::identity::{Books, Event, ObjectLedger, ObjectRef, Outcome, Reward, Table};
 use crate::npc::EnemyRoster;
 use crate::world::Streamer;
 use bevy::prelude::*;
@@ -42,8 +43,6 @@ pub struct Chaos {
     /// 0 … 4 (`chaos_00` … `chaos_04`).
     pub stage: usize,
     pub levels: ChaosLevels,
-    /// In-session units already paid for (canonical source, local index).
-    awarded: HashSet<(String, u32)>,
     /// Sabotage targets destroyed (activities with `sabotage`).
     pub sabotaged: u32,
 }
@@ -175,6 +174,9 @@ pub struct ChaosPlugin;
 
 impl Plugin for ChaosPlugin {
     fn build(&self, app: &mut App) {
+        if !app.is_plugin_added::<crate::identity::IdentityPlugin>() {
+            app.add_plugins(crate::identity::IdentityPlugin);
+        }
         app.init_resource::<Chaos>()
             .init_resource::<Wallet>()
             .init_resource::<Progress>()
@@ -191,7 +193,8 @@ impl Plugin for ChaosPlugin {
                     apply_stage,
                     tick_popup,
                 )
-                    .chain(),
+                    .chain()
+                    .after(crate::identity::IdentitySynced),
             );
     }
 }
@@ -262,7 +265,11 @@ pub fn award(
     Some(a)
 }
 
-/// Destroyed units pay their activity and count towards their settlement.
+/// Destroyed units pay their activity and count towards their settlement, once per
+/// durable object (`identity.rs`): the event names its unit by source generation and
+/// runtime index, the ledger resolves that to the full source identity and runs the
+/// ledger-plus-wallet/chaos/settlement transaction. Events of a released generation, of an
+/// unregistered unit or repeats of a destroyed one pay nothing.
 fn award_units(
     mut destroyed: MessageReader<UnitDestroyed>,
     tables: Res<ChaosTables>,
@@ -270,19 +277,40 @@ fn award_units(
     mut wallet: ResMut<Wallet>,
     mut popup: ResMut<ChaosPopup>,
     mut progress: ResMut<Progress>,
+    mut ledger: ResMut<ObjectLedger>,
 ) {
     for d in destroyed.read() {
-        if !chaos
-            .awarded
-            .insert((d.source_container.clone(), d.piece.unit))
-        {
+        let Some(source) = d.piece.source else {
+            continue;
+        };
+        let object = ObjectRef::new(source, Table::Unit, d.piece.unit);
+        let activity = d.activity.and_then(|k| tables.activities.get(k)).cloned();
+        let reward = Reward {
+            chaos: activity.as_ref().map_or(0, |a| a.chaos),
+            money: activity.as_ref().map_or(0, |a| a.money),
+            sabotage: activity.as_ref().is_some_and(|a| a.sabotage),
+            settlement: d.counter.clone(),
+            ..Default::default()
+        };
+        let mut books = Books {
+            chaos: Some(&mut chaos),
+            wallet: Some(&mut wallet),
+            progress: Some(&mut progress),
+        };
+        let outcome = ledger
+            .0
+            .commit(object, Event::Destroy, Some((&reward, &mut books)), || true);
+        if outcome != Outcome::Applied {
             continue;
         }
-        if let Some(kind) = d.activity {
-            award(kind, &tables, &mut chaos, &mut wallet, &mut popup);
-        }
-        if let Some(id) = &d.counter {
-            progress.count(id, format!("unit {} {}", d.source_container, d.piece.unit));
+        if let Some(a) = activity {
+            if a.chaos > 0 || a.money > 0 {
+                popup.push(&a);
+            }
+            info!(
+                "chaos: {} (+{} chaos, ${}) → {} chaos, stage {}, ${}",
+                a.title, a.chaos, a.money, chaos.total, chaos.stage, wallet.money
+            );
         }
     }
 }
@@ -500,6 +528,8 @@ mod tests {
         let pr = app.world().resource::<Progress>();
         assert_eq!(pr.totals.get("51x10"), Some(&11));
         let before = pr.done("51x10");
+        // overlapping, repeated events for the same unit (even claiming another source
+        // container): the durable object pays once, nothing more
         let event = UnitDestroyed {
             source_container: "locations/other/gas-pump-source.nlz".into(),
             piece,
@@ -512,19 +542,152 @@ mod tests {
         };
         let mut messages = app.world_mut().resource_mut::<Messages<UnitDestroyed>>();
         messages.write(event.clone());
-        messages.write(event);
+        messages.write(event.clone());
+        // a stale generation: its owner is gone, so it names no live object
+        let stale = Piece {
+            source: Some(crate::world::GameplaySourceKey(u64::MAX)),
+            ..piece
+        };
+        messages.write(UnitDestroyed {
+            piece: stale,
+            ..event
+        });
         app.update();
-        assert_eq!(
+        assert_eq!(app.world().resource::<Chaos>().total, 100);
+        assert_eq!(app.world().resource::<Wallet>().money, 500);
+        assert_eq!(app.world().resource::<Progress>().done("51x10"), before);
+    }
+
+    /// Headless, tile 31,14: a destructible unit that pays chaos is destroyed once; the tile
+    /// unloads and reloads (a new source generation): the unit is still destroyed, its
+    /// intact parts do not come back, and neither a repeated nor a stale-generation event
+    /// nor new damage pays again. Needs the tile's test data and `achievements.bin`.
+    #[test]
+    fn a_destroyed_unit_pays_once_across_unload_and_reload() {
+        use crate::world::FlyCamera;
+        use jc2_formats::terrain::TILE_SIZE;
+        let Some(mut app) = crate::world::tests::tile_app(|app| {
+            app.init_resource::<CameraMode>().add_plugins((
+                ExplosionPlugin,
+                DestructionPlugin,
+                ChaosPlugin,
+            ));
+        }) else {
+            return;
+        };
+        let (old_piece, unit) = {
+            let st = app.world().resource::<Streamer>();
+            let t = &st.loaded[&(31, 14)];
+            let unit = t
+                .units
+                .iter()
+                .position(|u| u.activity.is_some() && !u.explodes && u.mission_owner.is_none())
+                .expect("a unit that pays") as u32;
+            (
+                Piece {
+                    source: t.source_key,
+                    tile: (31, 14),
+                    unit,
+                },
+                unit,
+            )
+        };
+        app.world_mut()
+            .resource_mut::<StructureHits>()
+            .queue
+            .push((old_piece, 100_000.0));
+        for _ in 0..4 {
+            app.update();
+        }
+        let paid = (
             app.world().resource::<Chaos>().total,
-            200,
-            "same local unit in different archive pays once independently"
+            app.world().resource::<Wallet>().money,
         );
-        assert_eq!(app.world().resource::<Wallet>().money, 1000);
+        assert!(paid.0 > 0, "the unit paid chaos");
+        let done = |app: &App| {
+            let p = app.world().resource::<Progress>();
+            p.totals.keys().map(|k| p.done(k)).sum::<u32>()
+        };
+        let counted = done(&app);
+        // away and back: a new generation
+        let mut cams = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<FlyCamera>>();
+        cams.single_mut(app.world_mut()).unwrap().translation.x += 3.0 * TILE_SIZE;
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(
+            !app.world()
+                .resource::<Streamer>()
+                .loaded
+                .contains_key(&(31, 14))
+        );
+        cams.single_mut(app.world_mut()).unwrap().translation.x -= 3.0 * TILE_SIZE;
+        let started = std::time::Instant::now();
+        loop {
+            app.update();
+            let st = app.world().resource::<Streamer>();
+            if st.loaded.contains_key(&(31, 14)) && st.stat(|t| t.pending.len()) == 0 {
+                break;
+            }
+            assert!(started.elapsed().as_secs() < 60);
+        }
+        for _ in 0..3 {
+            app.update();
+        }
+        let new_source = {
+            let st = app.world().resource::<Streamer>();
+            let t = &st.loaded[&(31, 14)];
+            assert!(
+                t.units[unit as usize].destroyed,
+                "the ledger restored the destroyed state"
+            );
+            t.source_key
+        };
+        assert_ne!(new_source, old_piece.source);
+        let new_piece = Piece {
+            source: new_source,
+            ..old_piece
+        };
+        let mut q = app.world_mut().query::<&Piece>();
         assert_eq!(
-            app.world().resource::<Progress>().done("51x10"),
-            before + 1,
-            "new source counts once, duplicate events do not count twice"
+            q.iter(app.world()).filter(|p| **p == new_piece).count(),
+            0,
+            "no intact part of a destroyed unit comes back"
         );
+        // events and damage after the reload pay nothing
+        let event = UnitDestroyed {
+            source_container: String::new(),
+            piece: new_piece,
+            name: String::new(),
+            at: Vec3::ZERO,
+            activity: Some(11),
+            counter: None,
+            fires: Vec::new(),
+            mission_owner: None,
+        };
+        let mut messages = app.world_mut().resource_mut::<Messages<UnitDestroyed>>();
+        messages.write(event.clone());
+        messages.write(UnitDestroyed {
+            piece: old_piece,
+            ..event
+        });
+        app.world_mut()
+            .resource_mut::<StructureHits>()
+            .queue
+            .push((new_piece, 100_000.0));
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            (
+                app.world().resource::<Chaos>().total,
+                app.world().resource::<Wallet>().money
+            ),
+            paid
+        );
+        assert_eq!(done(&app), counted);
     }
 
     /// The chaos total crosses into the next stage (100 000): the roster rolls that

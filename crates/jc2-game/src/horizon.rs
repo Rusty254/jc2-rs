@@ -151,7 +151,7 @@ fn chunk_distance(c: (i32, i32), x: f32, z: f32) -> f32 {
     (dx * dx + dz * dz).sqrt()
 }
 
-fn stream_horizon(
+pub(crate) fn stream_horizon(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     horizon: Option<ResMut<Horizon>>,

@@ -378,11 +378,27 @@ fn hang_wire_uses_final_launcher_frame_and_ragdoll_owns_model_pose() {
         let (c, children) = wires.single(app.world()).unwrap();
         assert!(c.a.distance(launcher_position) < 1e-6);
         let first = children.iter().next().unwrap();
-        let global = app.world().get::<GlobalTransform>(first).unwrap();
-        let end = global.transform_point(Vec3::new(0., -0.5, 0.));
+        let global = *app.world().get::<GlobalTransform>(first).unwrap();
+        let mesh = app.world().get::<Mesh3d>(first).unwrap().0.clone();
+        let ring = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&mesh)
+            .unwrap()
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .unwrap()
+            .as_float3()
+            .unwrap()[..8]
+            .to_vec();
+        // the tube's first ring is centred on the launcher this frame
+        let centre = ring
+            .iter()
+            .map(|p| global.transform_point(Vec3::from(*p)))
+            .sum::<Vec3>()
+            / 8.0;
         assert!(
-            end.distance(c.a) < 1e-5,
-            "rendered segment trails launcher: {end:?} != {:?}",
+            centre.distance(c.a) < 1e-4,
+            "rendered tube trails launcher: {centre:?} != {:?}",
             c.a
         );
         app.world_mut()

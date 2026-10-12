@@ -251,14 +251,36 @@ pub struct AiDriven;
 pub struct HeroEnabled;
 
 #[derive(Component)]
-struct WheelVisual(usize);
+pub(crate) struct WheelVisual(pub(crate) usize);
 
 #[derive(Component)]
 struct DriveHud;
 
 pub struct PendingPart {
     pub part: VehiclePart,
+    /// The model at the requested `.lod` level (the body's bounds and collider come from it).
     pub handle: Handle<RbmAsset>,
+    /// The native five-slot selection (JC2-128) and the set index of `handle`'s model: only when
+    /// the descriptor has more than one distinct model and `lod` is 0.
+    pub lod: Option<(std::sync::Arc<crate::plant_lod::PlantLodSet>, usize)>,
+    /// The vehicle-wide LOD inputs (body LOD scale, distance unit) of the native vehicle level.
+    pub vehicle_lod: Option<crate::plant_lod::VehicleLod>,
+}
+
+impl PendingPart {
+    /// The component that swaps the part's meshes by camera distance (`plant_lod.rs`).
+    pub fn plant_lod(&self) -> Option<crate::plant_lod::PlantLod> {
+        self.lod
+            .as_ref()
+            .map(|(set, shown)| crate::plant_lod::PlantLod {
+                set: set.clone(),
+                shown: *shown,
+                vis_range: None,
+                byte: 255,
+                camera_zoom: true,
+                vehicle: self.vehicle_lod,
+            })
+    }
 }
 
 pub struct VehiclePlugin;
@@ -285,6 +307,7 @@ pub struct DollParts {
 }
 
 /// Ask for every part's model at `lod` and decode the body's collision shape.
+#[allow(clippy::too_many_arguments)]
 pub fn load_doll_parts(
     container: &str,
     sarc: &SmallArchive,
@@ -293,10 +316,12 @@ pub fn load_doll_parts(
     game: &Game,
     assets: &AssetServer,
     lod: usize,
+    lodfactor: u32,
 ) -> Option<DollParts> {
     let mut parts = Vec::new();
     let mut body: Option<Handle<RbmAsset>> = None;
     let mut body_collision: Option<CollisionBody> = None;
+    let mut body_scale: Option<f32> = None;
     for part in &doll.parts {
         if part.depth == 0 && body_collision.is_none() && !part.collision.is_empty() {
             let bytes = sarc
@@ -341,10 +366,41 @@ pub fn load_doll_parts(
         if part.depth == 0 && body.is_none() {
             body = Some(handle.clone());
         }
+        // native slot selection (`lod == 0`): the slots whose model the container holds
+        let lod = (lod == 0)
+            .then(|| {
+                let slots = d.slots().map(|s| s.filter(|n| sarc.get(n).is_some()));
+                let plan =
+                    jc2_formats::veglod::SlotPlan::with_lodfactor(d.lod_scale(), slots, lodfactor);
+                if !plan.switches() {
+                    return None;
+                }
+                let shown = plan.models.iter().position(|m| m == model)?;
+                let handles = plan
+                    .models
+                    .iter()
+                    .map(|m| assets.load(format!("jc2://{container}/{m}")))
+                    .collect();
+                let set = std::sync::Arc::new(crate::plant_lod::PlantLodSet { plan, handles });
+                Some((set, shown))
+            })
+            .flatten();
+        body_scale.get_or_insert(d.lod_scale());
         parts.push(PendingPart {
             part: part.clone(),
             handle,
+            lod,
+            vehicle_lod: None,
         });
+    }
+    // the native vehicle code takes its one LOD level from the first part's model scale
+    // (`006a0e80`, see `veglod::vehicle_level`)
+    let vehicle_lod = body_scale.map(|body_scale| crate::plant_lod::VehicleLod {
+        body_scale,
+        unit: jc2_formats::veglod::distance_unit(lodfactor),
+    });
+    for p in &mut parts {
+        p.vehicle_lod = vehicle_lod;
     }
     Some(DollParts {
         parts,
@@ -472,6 +528,9 @@ pub fn build_car(
                 parent.spawn((tf, Visibility::default(), Name::new(p.part.name.clone())));
             if let Some(i) = wheel_index {
                 part_entity.insert(WheelVisual(i));
+            }
+            if let Some(l) = p.plant_lod() {
+                part_entity.insert(l);
             }
             part_entity.with_children(|pp| {
                 for b in &rbm.blocks {

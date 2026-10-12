@@ -628,22 +628,709 @@ fn the_lock_on_picks_the_target_with_magnetism() {
     assert_ne!(app.world().resource::<LockOn>().tint(), Color::WHITE);
 }
 
-/// The cable sags while slack and is a straight line when taut.
+/// The native wire: an 11-point parabola dipping 1 percent of the length at the middle, the
+/// ends fixed, straight when it is not a completed wire (in flight, a pull).
 #[test]
-fn a_cable_sags_slack_and_is_straight_taut() {
+fn a_cable_sags_by_the_native_parabola_and_is_straight_otherwise() {
     let a = Vec3::new(0.0, 10.0, 0.0);
-    let b = Vec3::new(30.0, 10.0, 0.0);
-    let taut = cable_points(&Cable { a, b, slack: 0.0 });
-    for p in &taut {
-        assert!((p.y - 10.0).abs() < 1e-5);
+    let b = Vec3::new(100.0, 10.0, 0.0);
+    let flat = cable_points(&Cable { a, b, sag: false, hooks: false });
+    assert_eq!(flat, vec![a, b]);
+    let sag = cable_points(&Cable { a, b, sag: true, hooks: false });
+    assert_eq!(sag.len(), 11);
+    assert!(sag[0].distance(a) < 1e-4 && sag[10].distance(b) < 1e-4);
+    // ((2t-1)^2 - 1) * (0.02 * 100) * 0.5 = -1 m at t = 0.5, -0.64 m at t = 0.2
+    assert!((10.0 - sag[5].y - 1.0).abs() < 1e-4, "mid sag {}", 10.0 - sag[5].y);
+    assert!((10.0 - sag[2].y - 0.64).abs() < 1e-4);
+    // a pull's tension factor of 0 draws it straight
+    assert!(sag_polyline(a, b, 0.0).iter().all(|p| (p.y - 10.0).abs() < 1e-6));
+}
+
+/// The tube: eight sides on a circle of `wire_width * 1.4142`, rebuilt along any polyline.
+#[test]
+fn the_tube_is_an_octagon_of_the_native_radius() {
+    let w = 0.006;
+    let r = w * super::cable::TUBE_RADIUS_FACTOR;
+    let o = super::cable::octagon(w);
+    assert!((o[0] - Vec2::new(r, 0.0)).length() < 1e-6);
+    assert!((o[1] - Vec2::new(w, w)).length() < 1e-4, "{:?}", o[1]);
+    assert!((o[2] - Vec2::new(0.0, r)).length() < 1e-4);
+    assert!(o.iter().all(|p| (p.length() - r).abs() < 1e-6));
+    let pts = sag_polyline(Vec3::ZERO, Vec3::new(20.0, 5.0, 3.0), 1.0);
+    let mesh = tube_mesh(&pts, w);
+    let positions = mesh
+        .attribute(Mesh::ATTRIBUTE_POSITION)
+        .unwrap()
+        .as_float3()
+        .unwrap();
+    assert_eq!(positions.len(), pts.len() * 9);
+    // every ring vertex lies one radius from its polyline point
+    for (i, p) in pts.iter().enumerate() {
+        for v in &positions[i * 9..i * 9 + 8] {
+            assert!((Vec3::from(*v).distance(*p) - r).abs() < 1e-4);
+        }
     }
-    let slack = cable_points(&Cable { a, b, slack: 1.0 });
-    assert_eq!(slack[0], a);
-    assert!(slack[CABLE_SEGMENTS].distance(b) < 1e-4);
-    let mid = slack[CABLE_SEGMENTS / 2];
-    assert!(
-        (10.0 - mid.y - CABLE_SAG * 30.0).abs() < 0.05,
-        "sag {}",
-        10.0 - mid.y
+    assert_eq!(mesh.indices().unwrap().len(), (pts.len() - 1) * 8 * 6);
+}
+
+/// A cut leaves two pieces aimed at `T = A + normalize(B - A) * 0.5`, shrinking at 100 m/s
+/// (full length) rising to 300 m/s, gone at 0.001 m.
+#[test]
+fn a_cut_wire_snaps_back_in_two_pieces() {
+    let a = Vec3::new(1.0, 2.0, 3.0);
+    let b = a + Vec3::new(10.0, 0.0, 0.0);
+    let [pa, pb] = cut_pieces(a, b);
+    assert!((pa.total - 0.5).abs() < 1e-5 && (pb.total - 9.5).abs() < 1e-5);
+    assert!(pa.dir.distance(Vec3::X) < 1e-5 && pb.dir.distance(-Vec3::X) < 1e-5);
+    let mut p = pb;
+    let before = p.len;
+    assert!(p.step(0.01));
+    // full length: 100 m/s
+    assert!((before - p.len - 1.0).abs() < 1e-3, "{}", before - p.len);
+    let mut frames = 0;
+    while p.step(1.0 / 60.0) {
+        frames += 1;
+        assert!(frames < 600);
+    }
+    assert!(frames > 1 && frames < 20, "{frames} frames");
+}
+
+// ---------------------------------------------------------------- animation traces
+//
+// Headless runs of the whole hook (physics, the graph of `anim.rs`, the clips Rico's
+// animator ends up playing). Read them with `--nocapture`.
+
+use crate::rig::{Animator, Clip};
+
+fn record(app: &mut App) {
+    let mut q = app.world_mut().query::<&mut GrappleRig>();
+    q.single_mut(app.world_mut()).unwrap().anim.record = true;
+}
+
+/// The clips Rico's animator plays now: the base and the action layer (`None`: no
+/// animator in this headless app).
+fn playing(app: &mut App) -> Option<(Clip, Option<Clip>)> {
+    let mut q = app.world_mut().query_filtered::<&Animator, With<Hero>>();
+    q.single(app.world())
+        .ok()
+        .map(|a| (a.clip, a.layer(crate::rig::Slot::Action).clip))
+}
+
+/// Remember each new (base clip, action-layer clip) in order.
+fn note_clips(app: &mut App, seen: &mut Vec<(Clip, Option<Clip>)>) {
+    if let Some(c) = playing(app)
+        && seen.last() != Some(&c)
+    {
+        seen.push(c);
+    }
+}
+
+fn layer_states(app: &mut App, layer: u8) -> Vec<&'static str> {
+    let r = rig(app);
+    let mut out: Vec<&'static str> = Vec::new();
+    for s in r.anim.steps.iter().filter(|s| s.layer == layer && s.accepted) {
+        if out.last() != Some(&s.to) {
+            out.push(s.to);
+        }
+    }
+    out
+}
+
+fn body_states(app: &mut App) -> Vec<&'static str> {
+    layer_states(app, 0)
+}
+
+fn arm_states(app: &mut App) -> Vec<&'static str> {
+    layer_states(app, 2)
+}
+
+fn print_trace(name: &str, app: &mut App, clips: &[(Clip, Option<Clip>)]) {
+    println!("--- {name}\n{}", rig(app).anim.trace());
+    println!(
+        "    animator: {}\n",
+        clips
+            .iter()
+            .map(|(b, a)| match a {
+                Some(a) => format!("{}+{}", b.file(), a.file()),
+                None => b.file().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" > ")
     );
+}
+
+/// From 20 m up, onto the ground ahead: reel flight (from the air), then the floor landing.
+#[test]
+fn trace_a_reel_to_the_ground() {
+    let Some((mut app, ground, _)) = setup() else {
+        return;
+    };
+    let (_, _, p, _) = hero(&mut app);
+    put_hero(&mut app, Vec3::new(p.x, ground + 20.0, p.z));
+    step(&mut app, 2);
+    let (_, _, p, _) = hero(&mut app);
+    record(&mut app);
+    aim(&mut app, Vec3::new(p.x, ground, p.z - 25.0));
+    tap_f(&mut app);
+    let mut clips = Vec::new();
+    for _ in 0..64 * 8 {
+        step(&mut app, 1);
+        note_clips(&mut app, &mut clips);
+    }
+    print_trace("reel to the ground from the air", &mut app, &clips);
+    let states = body_states(&mut app);
+    assert_eq!(&states[..3], ["S_REEL_FLIGHT", "S_REEL_END_LAND", "(free)"]);
+    let arm = arm_states(&mut app);
+    assert_eq!(arm[0], "LA_S_RAISE_GRAPPLE");
+    assert!(arm.contains(&"LA_S_GRAPPLE") && arm.contains(&"LA_S_GRAPPLE_TO_IDLE"));
+    if !clips.is_empty() {
+        let base: Vec<Clip> = clips.iter().map(|c| c.0).collect();
+        assert!(base.contains(&Clip::Reel), "{base:?}");
+        assert!(base.contains(&Clip::ReelEndLand), "{base:?}");
+    }
+}
+
+/// From the ground: the take-off first.
+#[test]
+fn trace_a_reel_from_the_ground_to_a_wall() {
+    let Some((mut app, _ground, _)) = setup() else {
+        return;
+    };
+    let (_, _, p, _) = hero(&mut app);
+    wall(&mut app, p, 30.0, 80.0);
+    record(&mut app);
+    aim(&mut app, Vec3::new(p.x, p.y + 12.0, face_z(p, 30.0)));
+    tap_f(&mut app);
+    let mut clips = Vec::new();
+    for _ in 0..64 * 5 {
+        step(&mut app, 1);
+        note_clips(&mut app, &mut clips);
+        if rig(&mut app).phase == Phase::Hang {
+            break;
+        }
+    }
+    step(&mut app, 64);
+    note_clips(&mut app, &mut clips);
+    // Space: the bounce off the wall
+    press(&mut app, KeyCode::Space);
+    step(&mut app, 1);
+    release(&mut app, KeyCode::Space);
+    for _ in 0..64 * 2 {
+        step(&mut app, 1);
+        note_clips(&mut app, &mut clips);
+    }
+    print_trace("reel from the ground to a wall, then Space", &mut app, &clips);
+    let states = body_states(&mut app);
+    assert_eq!(
+        &states[..5],
+        [
+            "S_REEL_START",
+            "S_REEL_FLIGHT",
+            "S_REEL_IMPACT_VERTICAL",
+            "S_REELED_IN_IDLE",
+            "S_REELED_IN_JUMP"
+        ]
+    );
+    if !clips.is_empty() {
+        let base: Vec<Clip> = clips.iter().map(|c| c.0).collect();
+        for c in [
+            Clip::ReelStart,
+            Clip::Reel,
+            Clip::ReelImpactVertical,
+            Clip::ReeledInIdle,
+            Clip::GrappleClimb,
+        ] {
+            assert!(base.contains(&c), "{c:?} missing in {base:?}");
+        }
+    }
+}
+
+/// A ceiling: the horizontal impact, the transition into the hang, the hang; Ctrl lets go.
+#[test]
+fn trace_a_reel_to_a_ceiling() {
+    let Some((mut app, ground, _)) = setup() else {
+        return;
+    };
+    let (_, _, p, _) = hero(&mut app);
+    // a slab 14 m up, wide, 4 m thick
+    app.world_mut().spawn((
+        RigidBody::Static,
+        Collider::cuboid(60.0, 4.0, 60.0),
+        Transform::from_translation(Vec3::new(p.x, ground + 16.0, p.z)),
+    ));
+    step(&mut app, 3);
+    record(&mut app);
+    // straight up and a little ahead: the underside faces down
+    aim(&mut app, Vec3::new(p.x, ground + 14.0, p.z - 6.0));
+    tap_f(&mut app);
+    let mut clips = Vec::new();
+    for _ in 0..64 * 5 {
+        step(&mut app, 1);
+        note_clips(&mut app, &mut clips);
+        if rig(&mut app).phase == Phase::Hang {
+            break;
+        }
+    }
+    assert_eq!(rig(&mut app).phase, Phase::Hang, "never hung from the ceiling");
+    assert_eq!(rig(&mut app).arrival, Arrival::Overhang);
+    step(&mut app, 64 * 2);
+    note_clips(&mut app, &mut clips);
+    press(&mut app, KeyCode::ControlLeft);
+    step(&mut app, 1);
+    release(&mut app, KeyCode::ControlLeft);
+    for _ in 0..64 * 2 {
+        step(&mut app, 1);
+        note_clips(&mut app, &mut clips);
+    }
+    print_trace("reel to a ceiling, hang, Ctrl", &mut app, &clips);
+    let states = body_states(&mut app);
+    assert_eq!(
+        &states[..6],
+        [
+            "S_REEL_START",
+            "S_REEL_FLIGHT",
+            "S_REEL_IMPACT_HORIZONTAL",
+            "S_REELED_IN_TO_HANG",
+            "S_HANGSTUNT_IDLE",
+            "S_HANG_TO_FALL"
+        ]
+    );
+}
+
+/// A barrel on the ground: Rico's left arm pulls, his body is left alone.
+#[test]
+fn trace_a_pull_on_the_ground() {
+    let Some((mut app, ground, _)) = setup() else {
+        return;
+    };
+    let (_, _, p, _) = hero(&mut app);
+    let at = Vec3::new(p.x, ground + 0.4, p.z - 20.0);
+    let barrel = app
+        .world_mut()
+        .spawn((
+            RigidBody::Dynamic,
+            Collider::cuboid(0.6, 0.8, 0.6),
+            Mass(40.0),
+            Transform::from_translation(at),
+        ))
+        .id();
+    step(&mut app, 30);
+    record(&mut app);
+    let start = app.world().get::<Position>(barrel).unwrap().0;
+    aim(&mut app, start);
+    tap_f(&mut app);
+    let mut clips = Vec::new();
+    for _ in 0..64 * 6 {
+        step(&mut app, 1);
+        note_clips(&mut app, &mut clips);
+    }
+    print_trace("pull a barrel on the ground", &mut app, &clips);
+    assert!(body_states(&mut app).is_empty(), "the body must not be touched");
+    let arm = arm_states(&mut app);
+    assert!(arm.contains(&"LA_S_GRAPPLE_PULL"), "{arm:?}");
+    if !clips.is_empty() {
+        let acts: Vec<Clip> = clips.iter().filter_map(|c| c.1).collect();
+        assert!(acts.contains(&Clip::GrapplePull), "{acts:?}");
+    }
+}
+
+/// In the air: Rico flies at the barrel (`S_PULL_IN_AIR_FLIGHT`, the reel-flight clip) until
+/// the wire is 6 m shorter, then falls.
+#[test]
+fn trace_a_pull_in_the_air() {
+    let Some((mut app, ground, _)) = setup() else {
+        return;
+    };
+    let (_, _, p, _) = hero(&mut app);
+    let at = Vec3::new(p.x, ground + 0.4, p.z - 24.0);
+    let barrel = app
+        .world_mut()
+        .spawn((
+            RigidBody::Dynamic,
+            Collider::cuboid(0.6, 0.8, 0.6),
+            Mass(40.0),
+            Transform::from_translation(at),
+        ))
+        .id();
+    step(&mut app, 30);
+    put_hero(&mut app, Vec3::new(p.x, ground + 30.0, p.z));
+    step(&mut app, 2);
+    record(&mut app);
+    let (_, _, p0, _) = hero(&mut app);
+    let start = app.world().get::<Position>(barrel).unwrap().0;
+    aim(&mut app, start);
+    tap_f(&mut app);
+    let mut clips = Vec::new();
+    for _ in 0..64 * 4 {
+        step(&mut app, 1);
+        note_clips(&mut app, &mut clips);
+    }
+    print_trace("pull in the air", &mut app, &clips);
+    let states = body_states(&mut app);
+    assert_eq!(&states[..2], ["S_PULL_IN_AIR_FLIGHT", "(free)"]);
+    let (_, _, p1, _) = hero(&mut app);
+    // he flew towards it (horizontally) before falling
+    assert!(
+        Vec2::new(p1.x - p0.x, p1.z - p0.z).length() > 2.0,
+        "Rico was not pulled: {p0:?} -> {p1:?}"
+    );
+    if !clips.is_empty() {
+        let base: Vec<Clip> = clips.iter().map(|c| c.0).collect();
+        assert!(base.contains(&Clip::Reel), "{base:?}");
+    }
+}
+
+/// A soldier: the arm pulls, his hook counter and `S_GRAPPLED` follow.
+#[test]
+fn trace_a_soldier_on_the_hook() {
+    let Some((mut app, ground, _)) = setup() else {
+        return;
+    };
+    let (_, _, p, _) = hero(&mut app);
+    let at = Vec3::new(p.x, ground + HEIGHT / 2.0, p.z - 18.0);
+    let soldier = app
+        .world_mut()
+        .spawn((
+            RigidBody::Kinematic,
+            Collider::capsule(RADIUS, HEIGHT - 2.0 * RADIUS),
+            Transform::from_translation(at),
+            Npc::guard(at, 0.0),
+        ))
+        .id();
+    step(&mut app, 10);
+    record(&mut app);
+    aim(&mut app, at);
+    tap_f(&mut app);
+    let mut log: Vec<(&'static str, u32)> = Vec::new();
+    for _ in 0..64 * 8 {
+        step(&mut app, 1);
+        if let Some(h) = app.world().get::<Hooked>(soldier) {
+            let e = (h.victim.name(), h.grappled.0);
+            if log.last() != Some(&e) {
+                log.push(e);
+            }
+        }
+    }
+    println!(
+        "--- a soldier on the hook\n{}\nvictim: {log:?}\n",
+        rig(&mut app).anim.trace()
+    );
+    assert_eq!(
+        log,
+        [
+            ("S_GRAPPLED", 1),
+            ("S_REMOVE_GRAPPLINGHOOK", 0),
+            ("S_AI_BASIC_NAVIGATION", 0)
+        ]
+    );
+    let arm = arm_states(&mut app);
+    assert!(arm.contains(&"LA_S_GRAPPLE_PULL"), "{arm:?}");
+}
+
+// ---------------------------------------------------------------- JC2-269: the device tick
+
+#[test]
+fn the_reel_speed_ramps_from_eleven_to_the_cap() {
+    // `v = min((3.5 dt + 1) v, 40)` from 11 m/s: 23 frames at 60 Hz (JC2-246 section 1)
+    let dt = 1.0 / 60.0;
+    let mut v = REEL_START_SPEED;
+    let mut frames = 0;
+    while v < 40.0 {
+        let (along, r) = reel_tick(&mut v, 1.0e6, dt, 40.0);
+        assert_eq!(r, TickResult::Flying);
+        assert_eq!(along, v);
+        frames += 1;
+    }
+    assert_eq!(frames, 23);
+    assert_eq!(v, 40.0);
+    let (along, _) = reel_tick(&mut v, 1.0e6, dt, 40.0);
+    assert_eq!(along, 40.0, "no braking, no further change");
+}
+
+#[test]
+fn the_air_pull_starts_at_six_and_takes_34_frames() {
+    let dt = 1.0 / 60.0;
+    let mut v = PULL_START_SPEED;
+    let mut frames = 0;
+    while v < 40.0 {
+        reel_tick(&mut v, 1.0e6, dt, 40.0);
+        frames += 1;
+    }
+    assert_eq!(frames, 34);
+}
+
+#[test]
+fn the_tick_overshoot_lands_exactly_on_the_hook() {
+    let dt = 1.0 / 60.0;
+    let mut v = 40.0;
+    let (along, r) = reel_tick(&mut v, 0.5, dt, 40.0);
+    assert_eq!(r, TickResult::Arrived);
+    assert!((along * dt - 0.5).abs() < 1e-5);
+    // exactly out of range is not an overshoot (remaining == 0 is not < 0)
+    let mut v = 40.0;
+    let (_, r) = reel_tick(&mut v, 40.0 * dt, dt, 40.0);
+    assert_eq!(r, TickResult::Flying);
+}
+
+#[test]
+fn a_paused_frame_changes_nothing() {
+    let mut v = 11.0;
+    let (along, r) = reel_tick(&mut v, 10.0, 0.0, 40.0);
+    assert_eq!((along, r, v), (11.0, TickResult::Flying, 11.0));
+}
+
+#[test]
+fn can_reel_in_state_follows_the_state_flags() {
+    use anim::{ArmState, BodyState, GrappleAnim};
+    let mut a = GrappleAnim::default();
+    assert!(a.can_reel_in_state());
+    for (s, ok) in [
+        (BodyState::ReelFlight, true),
+        (BodyState::ReelEndLand, true),
+        (BodyState::ReelImpactHorizontal, false),
+        (BodyState::ReeledInToHang, false),
+        (BodyState::HangStuntIdle, false),
+        (BodyState::HangToFall, false),
+    ] {
+        a.body = s;
+        assert_eq!(a.can_reel_in_state(), ok, "{}", s.name());
+    }
+    a.body = BodyState::Free;
+    a.arm = ArmState::GrapplePull;
+    assert!(!a.can_reel_in_state());
+    assert!(
+        !a.reel_start(anim::BodyCtx::Air),
+        "no new reel during the ground pull"
+    );
+}
+
+// ---- effect calls (board task 7bd60e82)
+
+mod fx {
+    use super::*;
+    use crate::effects::component::AdapterSet;
+    use crate::effects::system::{EffectSystem, MemorySource, STATE_DEAD};
+    use effects::{FxCall, GrappleFx, Slot};
+    use jc2_formats::effect::{
+        ComponentDesc, EffectDescription, EffectSettings, InteractionMatrix, PairMap, Variation,
+    };
+    use jc2_formats::property::Node;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn log(app: &App) -> Vec<FxCall> {
+        app.world().resource::<GrappleFx>().log.clone()
+    }
+
+    fn count(log: &[FxCall], f: impl Fn(&FxCall) -> bool) -> usize {
+        log.iter().filter(|c| f(c)).count()
+    }
+
+    fn plays(slot: Slot) -> impl Fn(&FxCall) -> bool {
+        move |c| matches!(c, FxCall::PlaySlot { slot: s, .. } if *s == slot)
+    }
+
+    /// A looping effect with one component (a counted stub) for each id the grapple uses.
+    fn spawner() -> EffectSystem {
+        let mut descs: Vec<Option<Arc<EffectDescription>>> = vec![None; 420];
+        for id in [11usize, 203, 204, 212, 213, 214, 215, 410] {
+            let mut components = BTreeMap::new();
+            components.insert(
+                0,
+                ComponentDesc {
+                    uid: 0,
+                    role: 100,
+                    kind: 0,
+                    variations: BTreeMap::from([(
+                        1,
+                        Variation {
+                            uid: 1,
+                            node: Node::default(),
+                        },
+                    )]),
+                },
+            );
+            descs[id] = Some(Arc::new(EffectDescription {
+                id: id as u32,
+                settings: EffectSettings {
+                    looping: true,
+                    ..Default::default()
+                },
+                components,
+                matrix: InteractionMatrix {
+                    default: PairMap::from([(100, Some((0, 1)))]),
+                    flagged: None,
+                    materials: BTreeMap::new(),
+                },
+                inputs: BTreeMap::new(),
+            }));
+        }
+        EffectSystem::new(255, Box::new(MemorySource(descs)), AdapterSet::stubs())
+    }
+
+    /// `PlaySlot` plays only a controller that is not playing, `StopSlot` stops only one that
+    /// is (`0x00735700`, `0x005E9670`).
+    #[test]
+    fn play_slot_and_stop_slot_follow_the_native_rules() {
+        let mut fx = spawner();
+        let mut state = GrappleFx::default();
+        let at = Vec3::ZERO;
+        let slot = Slot::Reel;
+        // stopping a slot that was never played does nothing
+        state.push(FxCall::StopSlot(slot));
+        state.flush(Some(&mut fx));
+        assert_eq!(state.slot_state(&fx, slot), None);
+        // play: the controller runs; a second play is ignored
+        state.push(FxCall::PlaySlot { slot, at });
+        state.flush(Some(&mut fx));
+        fx.tick(0.1);
+        assert_ne!(state.slot_state(&fx, slot), Some(STATE_DEAD));
+        let live = fx.live();
+        state.push(FxCall::PlaySlot { slot, at });
+        state.flush(Some(&mut fx));
+        assert_eq!(fx.live(), live);
+        // slots 0 and 1 are separate controllers of the same effect 203
+        state.push(FxCall::PlaySlot {
+            slot: Slot::Attach,
+            at,
+        });
+        state.flush(Some(&mut fx));
+        assert_eq!(fx.live(), live + 1);
+        // stop: graceful, and the slot can play again afterwards
+        state.push(FxCall::StopSlot(slot));
+        state.flush(Some(&mut fx));
+        for _ in 0..5 {
+            fx.tick(0.1);
+        }
+        assert_eq!(state.slot_state(&fx, slot), Some(STATE_DEAD));
+        state.push(FxCall::PlaySlot { slot, at });
+        state.flush(Some(&mut fx));
+        fx.tick(0.1);
+        assert_ne!(state.slot_state(&fx, slot), Some(STATE_DEAD));
+        // the one-shots go through the interaction path
+        state.push(FxCall::HookDetach {
+            at,
+            surface: Some(8),
+        });
+        state.push(FxCall::HookImpact {
+            at,
+            normal: Vec3::Y,
+            surface: None,
+            water: true,
+        });
+        state.push(FxCall::FlyingHook { at });
+        let live = fx.live();
+        state.flush(Some(&mut fx));
+        fx.tick(0.1);
+        assert_eq!(fx.live(), live + 3);
+    }
+
+    #[test]
+    fn the_cancel_stops_slots_0_to_2_and_the_detach_plays_214_and_213() {
+        let hook = Vec3::new(1.0, 2.0, 3.0);
+        let mut rig = GrappleRig {
+            phase: Phase::Flight,
+            hook,
+            ..default()
+        };
+        rig.retract();
+        assert_eq!(
+            rig.fx,
+            vec![
+                FxCall::StopSlot(Slot::Reel),
+                FxCall::StopSlot(Slot::Attach),
+                FxCall::StopSlot(Slot::Parachute),
+                FxCall::PlaySlot {
+                    slot: Slot::Miss,
+                    at: hook
+                },
+                FxCall::HookDetach {
+                    at: hook,
+                    surface: None
+                },
+            ]
+        );
+        // already home: a second cancel makes no calls
+        rig.fx.clear();
+        rig.retract();
+        assert!(rig.fx.is_empty());
+    }
+
+    #[test]
+    fn the_cut_calls_are_213_twice_215_stop_410_once() {
+        let calls = effects::cut_calls(Vec3::ZERO, Vec3::X, [Some(8), None]);
+        assert_eq!(count(&calls, |c| matches!(c, FxCall::HookDetach { .. })), 2);
+        assert_eq!(count(&calls, |c| *c == FxCall::StopSlot(Slot::Deployed)), 1);
+        assert_eq!(count(&calls, plays(Slot::DetachDual)), 1);
+        assert_eq!(
+            calls[0],
+            FxCall::HookDetach {
+                at: Vec3::ZERO,
+                surface: Some(8)
+            }
+        );
+    }
+
+    /// Fire, fly, attach, reel, land: `grapplefire` first, 212 and slot 1 at the hit, slot 0
+    /// for the reel, its stop at the end, the detach after it.
+    #[test]
+    fn a_shot_at_a_wall_makes_the_native_calls_in_order() {
+        let Some((mut app, _ground, _)) = setup() else {
+            return;
+        };
+        let (_, _, p, _) = hero(&mut app);
+        // far enough that the hook is still in the air at 0.19 s
+        wall(&mut app, p, 50.0, 80.0);
+        aim(&mut app, Vec3::new(p.x, p.y + 10.0, face_z(p, 50.0)));
+        app.world_mut().resource_mut::<GrappleFx>().log.clear();
+        tap_f(&mut app);
+        let mut frames = 0;
+        while rig(&mut app).phase != Phase::Idle && frames < 1200 {
+            step(&mut app, 1);
+            frames += 1;
+            // a wall hang ends with a press of the jump key
+            if rig(&mut app).phase == Phase::Hang && frames % 200 == 0 {
+                press(&mut app, KeyCode::Space);
+                step(&mut app, 3);
+                release(&mut app, KeyCode::Space);
+            }
+        }
+        let l = log(&app);
+        let pos = |f: &dyn Fn(&FxCall) -> bool| l.iter().position(f);
+        let fire = pos(&|c| matches!(c, FxCall::FlyingHook { .. })).expect("grapplefire");
+        let impact = pos(&|c| matches!(c, FxCall::HookImpact { .. })).expect("hook_impact");
+        let reel = pos(&plays(Slot::Reel)).expect("reel start");
+        let stop = pos(&|c| *c == FxCall::StopSlot(Slot::Reel)).expect("reel end");
+        assert_eq!(count(&l, |c| matches!(c, FxCall::FlyingHook { .. })), 1);
+        assert_eq!(count(&l, |c| matches!(c, FxCall::HookImpact { .. })), 1);
+        assert_eq!(count(&l, plays(Slot::Attach)), 1);
+        assert!(fire < impact && impact <= reel && reel < stop, "{l:?}");
+        assert!(
+            l.iter().any(plays(Slot::Miss)),
+            "device detach after the reel: {l:?}"
+        );
+    }
+
+    #[test]
+    fn grapplefire_comes_at_0_19_s_of_the_fire_clip() {
+        let Some((mut app, _ground, _)) = setup() else {
+            return;
+        };
+        let (_, _, p, _) = hero(&mut app);
+        wall(&mut app, p, 60.0, 80.0);
+        aim(&mut app, Vec3::new(p.x, p.y + 10.0, face_z(p, 60.0)));
+        app.world_mut().resource_mut::<GrappleFx>().log.clear();
+        tap_f(&mut app);
+        let fired = |app: &App| count(&log(app), |c| matches!(c, FxCall::FlyingHook { .. }));
+        let mut frames = 1; // tap_f steps one frame
+        while fired(&app) == 0 && frames < 64 {
+            step(&mut app, 1);
+            frames += 1;
+        }
+        let t = frames as f32 / 64.0;
+        assert!(
+            (t - effects::GRAPPLEFIRE_AT).abs() < 3.0 / 64.0,
+            "event at {t} s"
+        );
+    }
 }

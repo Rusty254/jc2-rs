@@ -327,3 +327,16 @@ plane-intersection arithmetic and ankle rotation blend; value of `prior` after
 inactive frames; what the enabling states' `+0x1f0` target is; the state behind
 `0x7d00f6`; whether NPCs reach the same enables; meaning of CMCController; frame
 rate the blend gain assumed.
+
+## 10. Runtime (JC2-075)
+
+Implemented in `crates/jc2-game/src/ground_ik.rs` (tests in `ground_ik/tests.rs`). Native
+constructor defaults (0x004bb480), strict `fraction < 1`, up/down 1.0 rays, ramp, smoothing,
+ankle height limits, on/off gain blend and 13-call decay follow sections 4 and 5. The default
+mode (`--ground-ik native`) enables the solver only while Rico stands on a vehicle roof (the
+rooftop-stunt controller 0x00701f30), the one enabling state with a runtime counterpart; retail has
+no ground-IK enable for ordinary walking. `--ground-ik all` (walking slopes/stairs) is a non-native
+extension, `off` disables it. Inferred, labelled in the code: filter predicates 1/3 (all but Rico),
+second-ray plane arithmetic and ankle blend, ankle target formula, knee-limit widening, per-update
+blend gain, no support identity (moving-platform anchoring unproven). Stunt-jump, grappling-jump,
+cling-to-roof and rocket-baby enables have no runtime counterpart yet.

@@ -191,3 +191,35 @@ model instance**, uploaded with that instance's other constants, never part of t
 * `TREE_RANGE` / `BUSH_RANGE` no longer apply to foliage-material meshes; the other meshes keep them (Gap 6 census open).
   Foliage meshes are hidden on the CPU only beyond `foliage_fade_end_max` + 50 m (199.7 m + slack: the fade is 0 at any FOV
   there), a lossless project bound that keeps the vertex work of far plants down.
+
+## Runtime delivered (JC2-153: fade byte, shadow fade, vertex question)
+
+* **Gap 7 closed (MeshTag route, run-verified).** `foliage_alpha::instance_tag(byte)` = `MeshTag(255 - byte)` (project
+  encoding: an untagged entity reads 0 = the native initial byte 255, `009236d0`). The foliage shaders read
+  `mesh_functions::get_tag(instance_index)` and derive fraction `byte/255` and the alpha reference
+  `(round(fraction*128)*2-1)/510` per instance (native 009672a0 / 00949aa0). No private material per byte any more:
+  `FoliageInstance` writes the tag, and a private material copy is made only when the block flags differ. The
+  `foliage-check` fixture (`jc2 --foliage-check [--foliage-check-depth]`) shows the shared material with byte 255
+  discarded and the same material with byte 0 drawn and shadow-casting, so the tag reaches the main, depth prepass and
+  shadow passes (captures in `_extract/JC2-153/`).
+* **Per-frame writer.** `plant_lod.rs` computes `SlotPlan::fade_byte_at(d2)` (`veglod::instance_byte`, native `00a89b90`)
+  and writes the tag on the plant's foliage child meshes when it changes; plants get a `PlantLod` also when
+  `SlotPlan::fades_within(foliage_fade_end_max)` (the byte leaves 255 inside the foliage range, e.g. a bush with an empty
+  slot tail), not only when they switch models.
+* **Gap 2 closed (shadow fade).** `veg_fade::VegetationCamera` (shared storage buffer, binding 102 of the foliage
+  extension, written after transform propagation when the camera moves) gives orthographic views the main camera
+  position, so shadow casters use the same distance as the main view. Verified by shader compile in all three passes and
+  the naga test; the fixture has the fade inactive, so no distant shadow capture exists (Gap A).
+* **Gap 8 (per vertex) decided, not moved.** The native fade is interpolated per vertex; the per-fragment function differs
+  only where the saturate kinks inside a triangle: at most 5 % of the fade for a 5 m triangle (test in `veg_fade.rs`).
+  A vertex-stage override would mean re-implementing Bevy's mesh vertex shader (skin, morph, visibility range); not done.
+* **CPU cull slack kept.** `plant_visibility_range` still hides foliage meshes at `foliage_fade_end_max` + 50 m. It cannot
+  be made exact with `VisibilityRange`: the native fade uses the origin's x/z but the vertex y, which `VisibilityRange`
+  (3D distance to origin or AABB) does not model (Gap B).
+
+### Gaps (JC2-153)
+
+A. No capture of a distant foliage shadow fading (needs a world run with the fade active; the fixture disables it).
+B. Exact cull: an origin-horizontal-distance test (the vertex distance is never below it) instead of `VisibilityRange` +
+   50 m slack; affects only vertex work of far plants, not the picture.
+C. "No submission" (`instance_byte == None`, last slot at k = 255) is not applied: presence stays the project range.

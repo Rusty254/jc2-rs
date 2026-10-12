@@ -14,7 +14,8 @@
 //! Controls on foot: left mouse fires (with the cursor grabbed, `Tab`, or while
 //! holding the right button to aim); `1`–`5` pick the Beretta, the SMG, the shotgun,
 //! the assault rifle and the rocket launcher (`6`–`9` the guns picked up since); `R`
-//! reloads; `G` throws a grenade.
+//! reloads; `G` throws a grenade; `H` holsters the gun in hand (non-native key) or draws it
+//! again. Rico starts holstered; the equip keys, the trigger and aiming draw the gun.
 
 mod accuracy;
 use accuracy::{PlayerAccuracy, ShotRandom};
@@ -33,6 +34,8 @@ use crate::rbm_loader::RbmAsset;
 use crate::rig::{Animator, Clip};
 use crate::stunts::OnStunt;
 use crate::vehicle::{CameraMode, Enterable, Occupied};
+use crate::vehicle_damage::{MaxHealthSource, VehicleDamage, max_health};
+use crate::explosion::Wreck;
 use crate::weapon_attach::{WeaponAttachPlugin, WeaponMountTable, emission_point};
 use crate::world::{FlyCamera, Piece, SpawnPoint};
 use avian3d::prelude::*;
@@ -54,7 +57,6 @@ const ROSTER: [&str; 5] = [
 pub const MAX_GUNS: usize = 9;
 /// Time between shots when the upgrade table has none (s).
 const FALLBACK_INTERVAL: f32 = 0.2;
-const TRACER_SECONDS: f32 = 0.06;
 /// What a soldier without a class (spawned by a test) carries; the village's get theirs
 /// from `enemytypespawnsettings.bin`.
 const FALLBACK_SOLDIER_WEAPON: &str = "Assault";
@@ -165,6 +167,10 @@ pub struct SoldierGun {
 pub struct Arsenal {
     pub guns: Vec<Gun>,
     pub current: usize,
+    /// A gun is drawn: the native weapon holder's draw state (`holder+0x64`,
+    /// `research/formats/weapon-ownership-next.md` section 2) is non-zero. False: all guns
+    /// are stowed and the crosshair is the small plain cross. Rico starts holstered.
+    pub drawn: bool,
     pub grenade: Throwable,
     grenade_model: Option<Handle<RbmAsset>>,
     /// Grenades carried, and the most he can (`#7b655f19`, assumed).
@@ -188,9 +194,8 @@ pub struct Arsenal {
     player_accuracy: PlayerAccuracy,
     accuracy_recovery: f32,
     shot_random: ShotRandom,
-    tracer_mesh: Handle<Mesh>,
-    tracer_hot: Handle<StandardMaterial>,
-    tracer_enemy: Handle<StandardMaterial>,
+    /// The moving `CBulletTrail` sprites (`tracer_fx.rs`).
+    tracer_assets: crate::tracer_fx::TracerAssets,
     flash_mesh: Handle<Mesh>,
     flash_material: Handle<StandardMaterial>,
     /// The soldiers' gun models, by `soldier_guns` index (loaded on first use).
@@ -203,6 +208,12 @@ pub struct Arsenal {
     /// (`audio.rs`).
     pub shots: u32,
     pub enemy_shots: Vec<Vec3>,
+    /// Trigger pulls waiting for `muzzle_fx::drive_muzzle_effects` (native 0x006fae80).
+    pub muzzle_shots: Vec<crate::muzzle_fx::MuzzleShot>,
+    /// The effect system plays the muzzle effects, so the placeholder flash is off.
+    pub native_muzzle: bool,
+    /// Bullet hits waiting for `impact_fx::drive_impact_effects` (FX-GUN-2).
+    pub impact_shots: Vec<crate::impact_fx::ImpactShot>,
     /// Seconds since Rico was last hit; he heals once out of the fight.
     since_hurt: f32,
 }
@@ -400,10 +411,12 @@ impl Plugin for CombatPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
             ExplosionPlugin,
+            crate::vehicle_damage::VehicleDamagePlugin,
             crate::destruction::DestructionPlugin,
             crate::pickups::PickupPlugin,
         ))
         .add_plugins(WeaponAttachPlugin)
+        .init_resource::<crate::muzzle_fx::MuzzleControllers>()
         .add_systems(Startup, setup_arsenal)
         .add_systems(
             Update,
@@ -413,13 +426,17 @@ impl Plugin for CombatPlugin {
                 attach_guns,
                 arm_soldiers,
                 choose_gun,
+                holster_key,
                 reload,
                 fire,
                 hero_arms,
                 throw_grenade,
                 soldiers_fire,
+                crate::muzzle_fx::drive_muzzle_effects,
+                crate::impact_fx::drive_impact_effects,
                 deaths,
                 tracers,
+                crate::tracer_fx::fly_tracers,
                 combat_hud,
             )
                 .chain()
@@ -456,6 +473,11 @@ fn fallback_weapon(name: &str) -> Weapon {
         automatic: false,
         ai: None,
         hand: String::new(),
+        muzzle_effect: -1,
+        impact_effect: -1,
+        tracer_fire_velocity: 100.0,
+        tracer_scale_factor: 0.3,
+        tracer_every_shot: true,
     }
 }
 
@@ -583,20 +605,13 @@ fn setup_arsenal(
         hero_health,
         vehicle_health.len()
     );
-    // unlit: the material shows `base_color` only (Bevy ignores `emissive` on unlit
-    // materials), so the colour is a native scene colour; authored as a display value
-    // (policy, `native_units.rs`)
-    let unlit = |d: Vec3| StandardMaterial {
-        base_color: crate::native_units::native_colour(d, 1.0),
-        unlit: true,
-        ..default()
-    };
     info!(
         "accuracy: regular player recovery/loss and two-stage scatter; native AI, assisted-target and weapon-modifier overrides are not implemented by this path; grapple/parachute/stunt riding retain existing scatter"
     );
     commands.insert_resource(Arsenal {
         guns,
         current: 0,
+        drawn: false,
         grenade_model: general_model(&assets, &grenade.model),
         grenade,
         grenades: max_grenades,
@@ -621,9 +636,7 @@ fn setup_arsenal(
             .filter(|rate| rate.is_finite() && *rate >= 0.0)
             .unwrap_or(0.5),
         shot_random: ShotRandom::default(),
-        tracer_mesh: meshes.add(Cylinder::new(1.0, 1.0)),
-        tracer_hot: materials.add(unlit(Vec3::new(1.0, 0.85, 0.4))),
-        tracer_enemy: materials.add(unlit(Vec3::new(1.0, 0.45, 0.3))),
+        tracer_assets: crate::tracer_fx::TracerAssets::new(&assets, &mut meshes, &mut materials),
         flash_mesh: meshes.add(flash_mesh()),
         flash_material: materials.add(StandardMaterial {
             base_color: crate::native_units::native_colour(Vec3::new(1.0, 0.8, 0.45), 0.9),
@@ -639,6 +652,9 @@ fn setup_arsenal(
         down_for: None,
         shots: 0,
         enemy_shots: Vec::new(),
+        muzzle_shots: Vec::new(),
+        native_muzzle: false,
+        impact_shots: Vec::new(),
         since_hurt: 99.0,
     });
     commands.spawn((
@@ -667,7 +683,7 @@ fn give_health(
     arsenal: Option<Res<Arsenal>>,
     heroes: Query<Entity, (With<Hero>, Without<Health>)>,
     npcs: Query<(Entity, &Npc, Option<&Soldier>), Without<Health>>,
-    vehicles: Query<(Entity, &Container), Without<Health>>,
+    vehicles: Query<(Entity, &Container, Option<&VehicleDamage>), Without<Health>>,
 ) {
     let Some(a) = arsenal else { return };
     for e in &heroes {
@@ -693,8 +709,14 @@ fn give_health(
             },
         ));
     }
-    for (e, c) in &vehicles {
-        let hp = a.vehicle_health.get(&c.0).copied().unwrap_or(2000.0);
+    for (e, c, damage) in &vehicles {
+        let types = a.vehicle_health.get(&c.0).copied();
+        // the effective maximum is a labelled switch (research gap ada341f5): the doll module's
+        // value by default, see `MaxHealthSource`; without a damage block the old placeholder
+        let hp = match damage {
+            Some(d) => max_health(MaxHealthSource::current(), &d.module, types),
+            None => types.unwrap_or(2000.0),
+        };
         commands.entity(e).insert(Health::new(hp));
     }
 }
@@ -716,7 +738,7 @@ pub(crate) fn attach_guns(
     };
     let gait = arms.map_or(Gait::Idle, |a| a.gait);
     let classes: Vec<WeaponClass> = a.guns.iter().map(|g| g.class).collect();
-    let stows = stowage(&classes, a.current, gait);
+    let stows = stowage(&classes, a.current, gait, a.drawn);
     let skeleton = &an.rig.skeleton;
     // the native bone slot of a stow, only on a skeleton ordered like biped.bsk
     let mount = |stow: Stow, slot: usize| {
@@ -871,18 +893,23 @@ fn arm_soldiers(
 pub(crate) fn hero_arms(
     buttons: Res<ButtonInput<MouseButton>>,
     mode: Res<CameraMode>,
-    arsenal: Option<Res<Arsenal>>,
+    arsenal: Option<ResMut<Arsenal>>,
     spatial: SpatialQuery,
     mut heroes: Query<(Entity, &Hero, &Transform, &mut Arms), Without<Dead>>,
     cams: Query<&Transform, (With<FlyCamera>, Without<Hero>)>,
     mut was_reloading: Local<bool>,
 ) {
-    let Some(a) = arsenal else { return };
+    let Some(mut a) = arsenal else { return };
     let Ok((hero, h, tf, mut arms)) = heroes.single_mut() else {
         return;
     };
+    let on_foot = *mode == CameraMode::Hero && h.in_vehicle.is_none();
+    // aiming draws a holstered gun
+    if on_foot && buttons.pressed(MouseButton::Right) {
+        a.drawn = true;
+    }
     let g = a.gun();
-    arms.class = Some(g.class);
+    arms.class = a.drawn.then_some(g.class);
     arms.interval = g.interval;
     let reloading = g.ammo.reloading;
     if let Some(t) = reloading
@@ -892,7 +919,6 @@ pub(crate) fn hero_arms(
         arms.reload_time = t;
     }
     *was_reloading = reloading.is_some();
-    let on_foot = *mode == CameraMode::Hero && h.in_vehicle.is_none();
     if on_foot && buttons.pressed(MouseButton::Right) {
         arms.aim_for = arms.aim_for.max(0.2);
     }
@@ -957,7 +983,7 @@ fn flash_mesh() -> Mesh {
     .with_inserted_indices(Indices::U32(idx))
 }
 
-/// A flash at a muzzle, pointing along `dir`, with a brief light.
+/// A flash at a muzzle, pointing along `dir` (no light, see below).
 fn spawn_flash(
     commands: &mut Commands,
     a: &Arsenal,
@@ -985,17 +1011,6 @@ fn spawn_flash(
             bevy::light::NotShadowCaster,
             Name::new("muzzle flash"),
         ))
-        .with_child((
-            PointLight {
-                color: Color::srgb(1.0, 0.75, 0.4),
-                intensity: muzzle_flash_lumens(),
-                range: 8.0,
-                shadow_maps_enabled: false,
-                ..default()
-            },
-            // scaled each frame by the native per-hour point-light factor (atmosphere.rs)
-            crate::atmosphere::PointLightBase(muzzle_flash_lumens()),
-        ))
         .id();
     if let Some((gun, _)) = mount {
         commands.entity(flash).insert(ChildOf(gun));
@@ -1004,14 +1019,11 @@ fn spawn_flash(
 
 const FLASH_SECONDS: f32 = 0.05;
 
-/// Muzzle-flash light strength in native colour units at 1 m (`native_units::point_lumens`:
-/// 1.0 lights a white surface to 1.0 at 1 m before the per-hour scale `S`). **Policy value**
-/// (kept from the earlier 40,000 lm tuning, 1.015 units); the exe's flash colour and radius
-/// are not decoded (`light_info` files).
-const MUZZLE_FLASH_NATIVE: f32 = 1.0;
-fn muzzle_flash_lumens() -> f32 {
-    crate::native_units::point_lumens(MUZZLE_FLASH_NATIVE)
-}
+// No muzzle light (JC2-221): of the retail `muzzle_*` effects only `muzzle_bigcannon`,
+// `muzzle_flak` and `muzzle_rocketlauncher_large` carry a light component (model doc section 5;
+// smg, assault, shotgun, revolver, beretta, minigun, rocketlauncher, grenadelauncher and
+// airzooka have none). No weapon of the game is mapped to those three effects (Gap), so the
+// former policy PointLight is gone; `point_lights::NativeLightEffects` would spawn them.
 
 /// The muzzle of the gun in Rico's hand and the way its barrel points, when its model
 /// is there.
@@ -1045,14 +1057,51 @@ fn choose_gun(keys: Res<ButtonInput<KeyCode>>, arsenal: Option<ResMut<Arsenal>>)
         KeyCode::Digit9,
     ];
     for (i, k) in digits.iter().enumerate() {
-        if keys.just_pressed(*k) && i < a.guns.len() && a.current != i {
-            // a reload under way is dropped with the gun
-            let old = a.current;
-            a.guns[old].ammo.reloading = None;
-            a.current = i;
-            a.cooldown = a.cooldown.max(0.3);
-            info!("rico: {}", a.guns[i].weapon.name);
+        if keys.just_pressed(*k) && i < a.guns.len() {
+            if a.current != i {
+                // a reload under way is dropped with the gun
+                let old = a.current;
+                a.guns[old].ammo.reloading = None;
+                a.current = i;
+                a.cooldown = a.cooldown.max(0.3);
+                info!("rico: {}", a.guns[i].weapon.name);
+            }
+            // the equip keys draw the gun (native EQUIP_* actions, draw state non-zero)
+            a.drawn = true;
         }
+    }
+}
+
+/// The key that holsters the gun in hand (and draws it again when pressed holstered).
+/// NON-NATIVE binding: the retail PC binding table (`controls-next.md` section 6) has no
+/// unequip action, only EQUIP_RIGHT/LEFT/DUAL/TWOHANDED; the native chain it triggers is
+/// the stow-one at `0x005c0ba0`, which leaves holder+0x64 = 0.
+pub const HOLSTER_KEY: KeyCode = KeyCode::KeyH;
+
+fn holster_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<CameraMode>,
+    arsenal: Option<ResMut<Arsenal>>,
+    heroes: Query<&Hero, Without<Dead>>,
+) {
+    let Some(mut a) = arsenal else { return };
+    if a.down_for.is_some()
+        || *mode != CameraMode::Hero
+        || !keys.just_pressed(HOLSTER_KEY)
+        || heroes.single().is_ok_and(|h| h.in_vehicle.is_some())
+    {
+        return;
+    }
+    if a.drawn {
+        // a reload under way is dropped with the draw, as on a gun switch
+        let i = a.current;
+        a.guns[i].ammo.reloading = None;
+        a.drawn = false;
+        info!("rico: holstered");
+    } else {
+        a.drawn = true;
+        a.cooldown = a.cooldown.max(0.3);
+        info!("rico: {} drawn", a.gun().weapon.name);
     }
 }
 
@@ -1079,18 +1128,26 @@ fn reload(
     ammo.tick(time.delta_secs());
 }
 
-fn spawn_tracer(commands: &mut Commands, a: &Arsenal, from: Vec3, to: Vec3, enemy: bool) {
-    commands.spawn((
-        Mesh3d(a.tracer_mesh.clone()),
-        MeshMaterial3d(if enemy {
-            a.tracer_enemy.clone()
-        } else {
-            a.tracer_hot.clone()
-        }),
-        crate::character::segment_transform(from, to, 0.012),
-        Tracer(TRACER_SECONDS),
-    ));
+/// The `CBulletTrail` of a shot (native 0x004f9560): only weapons with a non-zero tracer period
+/// make one, and it flies at `tracer_fire_velocity` from the muzzle to where the shot ends.
+fn spawn_tracer(commands: &mut Commands, a: &Arsenal, w: &Weapon, from: Vec3, to: Vec3) {
+    if !w.tracer_every_shot {
+        return;
+    }
+    if let Some((bundle, flight_time)) =
+        crate::tracer_fx::tracer_bundle(&a.tracer_assets, from, to, w.tracer_fire_velocity)
+    {
+        commands.spawn((bundle, Tracer(flight_time)));
+    }
 }
+
+/// What a shot can damage: anything with health; vehicles also carry the damage block and may be wrecks.
+type Shootable<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Health, Option<&'static mut VehicleDamage>, Has<Wreck>),
+    Without<Dead>,
+>;
 
 /// Apply a hit: damage what has health, push what moves. True when it killed.
 fn hit(
@@ -1099,13 +1156,20 @@ fn hit(
     dir: Vec3,
     damage: f32,
     push: f32,
-    healths: &mut Query<&mut Health, Without<Dead>>,
+    healths: &mut Shootable,
     bodies: &mut Query<(&RigidBody, Forces)>,
 ) -> bool {
     let mut killed = false;
-    if let Ok(mut h) = healths.get_mut(entity) {
+    if let Ok((mut h, vehicle, exploded)) = healths.get_mut(entity) {
         let was = h.hp;
-        h.hp -= damage;
+        match vehicle {
+            // a shot at a vehicle (slot 9, 0x00626440): the type 2 table, then the 5 % pin. The
+            // player's own shots pass the pin's source check (inferred, 0x005b9880 not decoded).
+            Some(mut vd) => {
+                vd.shot(&mut h, damage, exploded, true);
+            }
+            None => h.hp -= damage,
+        }
         killed = was > 0.0 && h.hp <= 0.0;
     }
     // only what the physics moves (a kinematic soldier would fly off at the velocity)
@@ -1144,9 +1208,10 @@ pub(crate) fn fire(
     cams: Query<&Transform, (With<FlyCamera>, Without<Hero>)>,
     guns: Query<(Entity, &GunModel, &GlobalTransform)>,
     colliders: Query<&ColliderOf>,
-    mut healths: Query<&mut Health, Without<Dead>>,
+    mut healths: Shootable,
     mut bodies: Query<(&RigidBody, Forces)>,
     pieces: Query<&Piece>,
+    terrain: Query<(), With<crate::physics::TerrainBody>>,
     mut structures: ResMut<StructureHits>,
 ) {
     let Some(mut a) = arsenal else { return };
@@ -1175,6 +1240,9 @@ pub(crate) fn fire(
     if *mode != CameraMode::Hero || !trigger || a.cooldown > 0.0 {
         return;
     }
+    // the trigger draws a holstered gun (instantly: the native draw animation delay is
+    // not modelled)
+    a.drawn = true;
     // hanging from the hook (as in the original) or under the chute one hand is free:
     // one-handed guns only; reeling needs the hand
     let one_hand_free = h.grapple.is_some() || h.parachute;
@@ -1224,14 +1292,26 @@ pub(crate) fn fire(
         WeaponClass::Rpg => 2.2,
         _ => 1.4,
     };
-    spawn_flash(
-        &mut commands,
-        &a,
-        muzzle,
-        barrel,
-        size,
-        gun_origin.map(|(_, _, gun, local)| (gun, local)),
-    );
+    if a.native_muzzle {
+        // native 0x006fae80: the weapon's own muzzle effect, -1 = none
+        if let Ok(effect) = u32::try_from(w.muzzle_effect) {
+            a.muzzle_shots.push(crate::muzzle_fx::MuzzleShot {
+                owner: crate::muzzle_fx::MuzzleOwner::Player(i),
+                effect,
+                origin: muzzle,
+                direction: barrel,
+            });
+        }
+    } else {
+        spawn_flash(
+            &mut commands,
+            &a,
+            muzzle,
+            barrel,
+            size,
+            gun_origin.map(|(_, _, gun, local)| (gun, local)),
+        );
+    }
     let filter = SpatialQueryFilter::from_excluded_entities([hero]);
     let reach = w.range + cam.translation.distance(tf.translation);
     if w.projectile == ROCKET || w.projectile == LOBBED {
@@ -1271,6 +1351,7 @@ pub(crate) fn fire(
                     radius: a.grenade.range,
                     damage,
                     impulse: a.grenade.impulse,
+                    effect: Some(crate::explosion::effect_id::MISSILE),
                 },
                 owner: hero,
             },
@@ -1293,12 +1374,27 @@ pub(crate) fn fire(
             continue;
         };
         // from the camera, through what is in front of Rico
-        let end = match spatial.cast_ray(cam.translation, dir, reach, true, &filter) {
+        let cast = spatial.cast_ray(cam.translation, dir, reach, true, &filter);
+        let end = match cast {
             Some(hit_data) => {
                 let p = cam.translation + dir * hit_data.distance;
                 let target = body_of(hit_data.entity, &colliders);
                 if healths.contains(target) {
                     a.hits += 1;
+                }
+                if a.native_muzzle
+                    && w.impact_effect >= 0
+                    && !healths.contains(target)
+                    && crate::impact_fx::water_crossing(cam.translation, p).is_none()
+                {
+                    // a hit on a character plays `character_hit*` instead (research Gap 1: not traced)
+                    a.impact_shots.push(crate::impact_fx::ImpactShot {
+                        effect: w.impact_effect as u32,
+                        point: p,
+                        direction: dir.as_vec3(),
+                        terrain: terrain.contains(target) || terrain.contains(hit_data.entity),
+                        water: false,
+                    });
                 }
                 if let Ok(piece) = pieces.get(target) {
                     structures.queue.push((*piece, damage));
@@ -1318,7 +1414,20 @@ pub(crate) fn fire(
             }
             None => cam.translation + dir * reach,
         };
-        spawn_tracer(&mut commands, &a, muzzle, end, false);
+        // the water hit (native 0x0068fec0) always plays the impact with the water flag
+        if a.native_muzzle
+            && w.impact_effect >= 0
+            && let Some(at) = crate::impact_fx::water_crossing(cam.translation, end)
+        {
+            a.impact_shots.push(crate::impact_fx::ImpactShot {
+                effect: w.impact_effect as u32,
+                point: at,
+                direction: dir.as_vec3(),
+                terrain: false,
+                water: true,
+            });
+        }
+        spawn_tracer(&mut commands, &a, &w, muzzle, end);
     }
 }
 
@@ -1378,6 +1487,7 @@ fn throw_grenade(
                 radius: g.range,
                 damage: g.damage,
                 impulse: g.impulse,
+                effect: Some(crate::explosion::effect_id::GRENADE),
             },
         },
         Name::new("grenade"),
@@ -1419,7 +1529,7 @@ fn soldiers_fire(
     soldier_guns: Query<(&SoldierGunModel, &GlobalTransform)>,
     mut heroes: Query<(Entity, &Hero, &Transform, &mut Health), (Without<Npc>, Without<Container>)>,
     mut rides: Query<
-        (&GlobalTransform, &mut Health),
+        (&GlobalTransform, &mut Health, Option<&mut VehicleDamage>),
         (With<Container>, Without<Hero>, Without<Npc>),
     >,
 ) {
@@ -1432,7 +1542,7 @@ fn soldiers_fire(
     }
     let (target_e, target) = match hero.in_vehicle {
         Some(v) => match rides.get(v) {
-            Ok((t, _)) => (v, t.translation() + Vec3::Y * 0.5),
+            Ok((t, _, _)) => (v, t.translation() + Vec3::Y * 0.5),
             Err(_) => return,
         },
         None => (hero_e, htf.translation + Vec3::Y * 0.4),
@@ -1519,8 +1629,14 @@ fn soldiers_fire(
             if target_e == hero_e {
                 hh.hp -= damage * hits;
                 a.since_hurt = 0.0;
-            } else if let Ok((_, mut vh)) = rides.get_mut(target_e) {
-                vh.hp -= damage * hits;
+            } else if let Ok((_, mut vh, vd)) = rides.get_mut(target_e) {
+                match vd {
+                    // slot 9: type 2 table and the 5 % pin; the player sits in it (+0xba6)
+                    Some(mut vd) => {
+                        vd.shot(&mut vh, damage * hits, false, true);
+                    }
+                    None => vh.hp -= damage * hits,
+                }
             }
         }
         let gun_origin = gun_of.and_then(|g| {
@@ -1539,15 +1655,32 @@ fn soldiers_fire(
         if let Some(arms) = arms.as_mut() {
             arms.shots += 1;
         }
-        spawn_flash(
+        if a.native_muzzle {
+            if let Ok(effect) = u32::try_from(a.soldier_guns[gun.gun].weapon.muzzle_effect) {
+                a.muzzle_shots.push(crate::muzzle_fx::MuzzleShot {
+                    owner: crate::muzzle_fx::MuzzleOwner::Soldier(e),
+                    effect,
+                    origin: muzzle,
+                    direction: barrel,
+                });
+            }
+        } else {
+            spawn_flash(
+                &mut commands,
+                &a,
+                muzzle,
+                barrel,
+                1.2,
+                gun_origin.map(|(gun, model, _)| (gun, model.muzzle)),
+            );
+        }
+        spawn_tracer(
             &mut commands,
             &a,
+            &a.soldier_guns[gun.gun].weapon,
             muzzle,
-            barrel,
-            1.2,
-            gun_origin.map(|(gun, model, _)| (gun, model.muzzle)),
+            aim,
         );
-        spawn_tracer(&mut commands, &a, muzzle, aim, true);
         if a.enemy_shots.len() < 32 {
             a.enemy_shots.push(muzzle);
         }
@@ -1821,7 +1954,7 @@ fn combat_hud(
             };
             format!(
                 "health {:3.0}   {} {ammo}{}   [{}/{}]   grenades {}{heat}   {} hits, {} down\n\
-                 LMB fire   R reload   1-{} weapon   G grenade",
+                 LMB fire   R reload   1-{} weapon   H holster   G grenade",
                 health.hp,
                 g.weapon.label(),
                 if g.ammo.reloading.is_some() {
@@ -1844,14 +1977,6 @@ fn combat_hud(
 
 #[cfg(test)]
 mod tests {
-    /// The muzzle-flash light keeps the strength it was tuned to (40,000 lm) when expressed in
-    /// native colour units at 1 m (`native_units.rs`).
-    #[test]
-    fn the_muzzle_flash_light_is_one_native_unit_at_a_metre() {
-        let lm = muzzle_flash_lumens();
-        assert!((lm / 40_000.0 - 1.0).abs() < 0.03, "{lm}");
-    }
-
     use super::*;
 
     mod downed;
@@ -2007,7 +2132,7 @@ mod tests {
         app.add_plugins((MinimalPlugins, PhysicsPlugins::default()));
         let target = app.world_mut().spawn(Health::new(100.0)).id();
         let mut sys = bevy::ecs::system::SystemState::<(
-            Query<&mut Health, Without<Dead>>,
+            Query<(&mut Health, Option<&mut VehicleDamage>, Has<Wreck>), Without<Dead>>,
             Query<(&RigidBody, Forces)>,
         )>::new(app.world_mut());
         let mut killed = 0;
@@ -2152,6 +2277,9 @@ mod tests {
         if app.world().get_resource::<crate::rig::Rig>().is_none() {
             return;
         }
+        // he starts holstered: no gun in hand, and the equip key draws the pistol
+        assert!(!app.world().resource::<Arsenal>().drawn);
+        app.world_mut().resource_mut::<Arsenal>().drawn = true;
         // the guns' models load on other threads
         crate::fleet::testing::wait_until(&mut app, "the gun in his hand", |app| {
             let mut q = app.world_mut().query::<&GunModel>();
@@ -2267,6 +2395,27 @@ mod tests {
             q.single(app.world()).unwrap().class,
             Some(WeaponClass::Rifle)
         );
+        // the holster key stows the rifle on the harness and leaves his hands empty; pressed
+        // again it draws it
+        let press_h = |app: &mut App| {
+            let mut k = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            k.press(HOLSTER_KEY);
+            app.update();
+            let mut k = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            k.release(HOLSTER_KEY);
+            k.clear();
+        };
+        press_h(&mut app);
+        assert!(!app.world().resource::<Arsenal>().drawn);
+        buttons(&mut app, false, false);
+        buttons(&mut app, false, false);
+        assert_eq!(gun_global(&mut app, 3).0, Stow::Harness);
+        let mut q = app.world_mut().query::<&Arms>();
+        assert_eq!(q.single(app.world()).unwrap().class, None);
+        press_h(&mut app);
+        assert!(app.world().resource::<Arsenal>().drawn);
+        buttons(&mut app, false, false);
+        assert_eq!(gun_global(&mut app, 3).0, Stow::Hand);
     }
 
     /// Headless: a rocket flies into a parked helicopter and goes off; enough blasts burn
@@ -2344,6 +2493,7 @@ mod tests {
                     radius: 5.0,
                     damage: rocket.damage,
                     impulse: 1000.0,
+                    effect: None,
                 },
                 owner,
             },
@@ -2359,6 +2509,7 @@ mod tests {
                 radius: 5.0,
                 damage: 525.0,
                 impulse: 0.0,
+                effect: None,
             });
             step(&mut app, 2);
         }

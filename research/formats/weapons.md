@@ -124,7 +124,7 @@ String ids, a `_class`, and the explosion values per upgrade level in sub-nodes
 | `impulse` | 1000 … 1500 | 1500 | |
 | `range` | 5 … 6.25 | 6.25 | m, the blast radius (the flare has a plain `radius = 3`) |
 | `detonation_time` | 3.5 | 1 | s, the fuse |
-| `detonation_effect_id` | 64 | 20 | |
+| `detonation_effect_id` | 35 | 20 | (64 is `#14b862d2`, the fuse warning effect; 61 `#5a9b3b81`, the grenade trail; see `explosion-effects.md`) |
 | `speed` / `max_speed` | 40 / 25 | — / 25 | m/s, the throw |
 | `#7b655f19` | 10 … 20 | 10 | per level: taken as how many he carries (assumed) |
 

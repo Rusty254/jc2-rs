@@ -158,7 +158,7 @@ left-hand drive, and what each system does). Until then the world was drawn mirr
 World viewer: right-drag look, `WASD` move, `Space`/`C` up/down, `Shift` ×10, `Alt` ×0.1,
 wheel changes the speed, `R` back to the start, `B` throws a ball. The sun and moon
 follow a clock (`--time HH:MM`, default 10:00; one game minute per real second, `--day-speed`
-scales that, `--sun-shadows` casts shadows): `[` and `]` step it by 30 minutes, `T` stops and
+scales that; the sun casts cascade shadows unless `--no-sun-shadows`): `[` and `]` step it by 30 minutes, `T` stops and
 starts it (`weather.md`). Tiles stream around
 you as you fly or drive, one per frame: `--radius 1` keeps the 3 × 3 around you loaded
 (`--radius 2` → 5 × 5, with the pop-in further away), `--no-models` shows terrain only,

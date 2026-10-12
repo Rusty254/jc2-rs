@@ -35,6 +35,28 @@ fn haze_transmittance(e: f32) -> f32 {
     return min(exp2(-e), 1.0);
 }
 
+// The sky-card variant (JC2-163, shaders `cirrusclouds` and `clouds`, VS at 104892 / 106016 of
+// DX10_Shaders_F.shader_bundle; PS 4814356 / 4814844 are `out = tex * vcol * (1 - F) + fog * F`):
+// the same seven-instruction exponent, but the distance is the radial distance `len` from the
+// camera to the card vertex scaled by `scale` (0.25 cirrus, 0.7 clouds), the height is
+// `y' = (y - camY) * scale + camY`, and the exponent is saturated:
+//
+//   len = |scale * (p - cam)|
+//   e   = sat(len * cb0[12].z + (sat(len * cb0[13].w) * (1 - min(y' * cb0[13].z - cb0[13].x, cb0[13].y)) - cb0[12].x))
+//   cirrus: F = 1 - 2^-e        clouds: F = 1 - 2^-max(2 (e - 0.5), 0)
+//
+// Returns F, the fraction of the fog colour mixed in (alpha is untouched).
+fn haze_sky_card_factor(world: vec3<f32>, cam: vec3<f32>, scale: f32, is_cloud: bool, c12: vec4<f32>, c13: vec4<f32>) -> f32 {
+    let len = length((world - cam) * scale);
+    let y = (world.y - cam.y) * scale + cam.y;
+    let h = y * c13.z - c13.x;
+    var e = saturate(len * c12.z + (saturate(len * c13.w) * (1.0 - min(h, c13.y)) - c12.x));
+    if is_cloud {
+        e = max((e - 0.5) * 2.0, 0.0);
+    }
+    return 1.0 - exp2(-e);
+}
+
 fn haze_fog(lit: vec3<f32>, clip: vec4<f32>, world_y: f32, c12: vec4<f32>, c13: vec4<f32>, fog_colour: vec4<f32>) -> vec3<f32> {
     let t = haze_transmittance(haze_exponent(clip, world_y, c12, c13));
     return fog_colour.rgb + (lit - fog_colour.rgb) * t;

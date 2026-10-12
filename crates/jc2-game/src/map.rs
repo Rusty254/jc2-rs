@@ -726,6 +726,7 @@ fn fast_travel(
     data: Option<Res<MapData>>,
     game: Res<Game>,
     mut time: ResMut<Time<Virtual>>,
+    loadscreen: Option<ResMut<crate::loadscreen::LoadScreen>>,
     mode: Option<ResMut<CameraMode>>,
     mut heroes: Query<HeroItem, Without<Enterable>>,
     mut vehicles: VehicleQuery,
@@ -796,6 +797,9 @@ fn fast_travel(
         let offset = from.map_or(Vec3::ZERO, |f| cam.translation - f);
         cam.translation = arrived + offset;
     }
+    if let Some(mut ls) = loadscreen {
+        ls.request(crate::loadscreen::LoadReason::FastTravel);
+    }
     if let Some(tile) = tile_index(x, z) {
         state.arriving = Some((tile, 0));
         if !time.is_paused() {
@@ -812,12 +816,15 @@ fn fast_travel(
 fn arrive(
     mut state: ResMut<MapState>,
     streamer: Option<Res<Streamer>>,
+    loadscreen: Option<Res<crate::loadscreen::LoadScreen>>,
     mut time: ResMut<Time<Virtual>>,
 ) {
     let Some((tile, frames)) = state.arriving else {
         return;
     };
-    let ready = streamer.is_none_or(|s| s.loaded.contains_key(&tile));
+    // the loading screen (`loadscreen.rs`) holds the clock until the area around is in
+    let ready = streamer.is_none_or(|s| s.loaded.contains_key(&tile))
+        && loadscreen.is_none_or(|l| !l.active);
     if ready || frames >= ARRIVAL_TIMEOUT {
         if !ready {
             warn!("map: tile {tile:?} still not loaded, going on anyway");

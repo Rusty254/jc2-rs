@@ -19,6 +19,13 @@ struct PostPass {
     saturation: vec4<f32>,
     // x = S8 (weight of the darkest tap), y = S9 (strength), z = S10 (key), w = frame dt (s)
     meter: vec4<f32>,
+    // composite-only fields (post_effects.wgsl), kept so the struct matches `PostPass`
+    blend: vec4<f32>,
+    focus: vec4<f32>,
+    overlay: vec4<f32>,
+    view: vec4<f32>,
+    cam_pos: vec4<f32>,
+    world_from_clip: mat4x4<f32>,
 }
 
 struct Exposure {

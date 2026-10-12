@@ -12,6 +12,7 @@ use crate::Game;
 use crate::coords::{bevy_xyz, engine_xz, mat_to_bevy, to_bevy, to_engine};
 use crate::missions::{ActiveMission, MissionOwner};
 use crate::physics::{TerrainBody, colliders_from_body, static_mesh_collider, terrain_collider};
+use crate::plant_lod::PlantLodSet;
 use crate::rbm_loader::RbmAsset;
 use crate::terrain_material::{SplatContext, TerrainAssets, vertex_colour};
 use crate::vehicle::CameraMode;
@@ -34,6 +35,7 @@ use jc2_formats::terrain::{
     CELL_SIZE, TILE_CELLS, TILE_MARGIN, TILE_SIZE, TILES_PER_SIDE, TerrainTile,
     tile_container_name, tile_file_name, tile_origin,
 };
+use jc2_formats::veglod::SlotPlan;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -57,6 +59,11 @@ pub struct WorldConfig {
     /// Tiles kept loaded in every direction around the focus (1 → 3 × 3).
     pub radius: u32,
     pub lod: usize,
+    /// Placed static objects (`place_objects`): 0 = the native five-slot distance selection
+    /// (JC2-128, `plant_lod.rs`), N >= 1 = that single `.lod` level.
+    pub object_lod: usize,
+    /// Graphics setting `/lodfactor` (distance unit of the native selection).
+    pub lodfactor: u32,
     pub models: bool,
     /// Give the terrain and the placed models colliders.
     pub physics: bool,
@@ -96,6 +103,8 @@ pub(crate) struct PendingModel {
     pub(crate) mission_owner: Option<MissionOwner>,
     /// Native LOD slots of a plant (`plant_lod.rs`); `handle` is then the set's far model.
     pub(crate) lod: Option<std::sync::Arc<crate::plant_lod::PlantLodSet>>,
+    /// A model of a `.batchlod` (JC2-150): its tier decides each frame whether it shows.
+    pub(crate) batch: Option<crate::batch_lod::BatchNode>,
 }
 
 /// Part of a destructible unit of a tile: goes when the unit is destroyed.
@@ -132,6 +141,20 @@ pub(crate) struct UnitData {
     /// script listens (`missions.rs`).
     pub(crate) fires: Vec<String>,
     pub(crate) mission_owner: Option<MissionOwner>,
+    /// Source-record ordinal for durable identity (`identity.rs`): the unit's position among
+    /// its tile's own destructibles, or within its exported entity. Never a runtime index.
+    pub(crate) source_ordinal: u32,
+    /// The mission export that put it down (`world::place_entity`), `None` for a tile's own.
+    pub(crate) export: Option<ExportSet>,
+}
+
+/// Which placement of which exported entity a unit came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExportSet {
+    /// The entity container (lower case, no path).
+    pub(crate) entity: String,
+    /// Logical placement instance: the base transform it was put down at.
+    pub(crate) placement: String,
 }
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -189,11 +212,23 @@ pub(crate) struct LoadedTile {
     /// Its 64 x 64 game zone bytes (8 m cells, row = z), for the light set under the camera
     /// (`sky_light.rs`); empty when the terrain file did not load.
     pub(crate) gamezone: Vec<u8>,
+    /// Its 132 x 132 raw height grid (margin included), for the ground height under the
+    /// camera (`sky_light.rs`, JC2-183); empty when the terrain file did not load.
+    pub(crate) heights: Vec<u16>,
 }
+
+/// Marker resource (JC2-150): the `wc` tile containers are ordinary location records that
+/// the camera-driven activation (`location_activation.rs`) loads, not part of the terrain
+/// tile. Natively `0x7c4840` registers all 817 `wc` containers like any other location.
+/// Without it (tests, tools) a terrain tile still loads its own container with the tile.
+#[derive(Resource)]
+pub struct WcByActivation;
 
 /// The tile streamer: what is loaded, and the caches shared between tiles.
 #[derive(Resource)]
 pub(crate) struct Streamer {
+    /// [`WcByActivation`] is present: a terrain tile loads terrain and collision only.
+    pub(crate) wc_by_activation: bool,
     next_gameplay_generation: u64,
     pub(crate) loaded: HashMap<(u32, u32), LoadedTile>,
     pub(crate) mission_tiles: HashMap<MissionOwner, std::collections::HashSet<(u32, u32)>>,
@@ -206,8 +241,6 @@ pub(crate) struct Streamer {
     terrain_material: Handle<StandardMaterial>,
     /// The game's terrain materials and atlases; `None` without the climate tables.
     splat: Option<SplatContext>,
-    sea: Option<Entity>,
-    sea_centre: (u32, u32),
     pub(crate) focus: (u32, u32),
     start: Transform,
     spawn_point_set: bool,
@@ -537,6 +570,74 @@ impl ModelIndex {
         None
     }
 
+    /// The native five-slot plan of a placed `.lod` (JC2-128): each filled slot's model located
+    /// as `resolve` does (next to the descriptor, else any searched container), with the
+    /// `jc2://` path of every distinct model. `None` when `filename` is not a `.lod` found
+    /// in the searched containers or no slot resolves.
+    pub(crate) fn resolve_plan(
+        &mut self,
+        game: &Game,
+        local: &Arc<Container>,
+        tile: (u32, u32),
+        filename: &str,
+        lodfactor: u32,
+    ) -> Option<(SlotPlan, Vec<String>)> {
+        let bare = bare_name(filename);
+        if bare.to_ascii_lowercase().ends_with(".rbm") {
+            return None;
+        }
+        let mut searched: Vec<Arc<Container>> = vec![local.clone()];
+        let shared = self.shared_for(tile.0, tile.1);
+        let mut shared_iter = shared.iter();
+        let mut i = 0;
+        let (home, d) = loop {
+            let Some(c) = searched.get(i).cloned() else {
+                let next = shared_iter.next()?;
+                if let Some(c) = self.container(game, next) {
+                    searched.push(c);
+                }
+                continue;
+            };
+            i += 1;
+            if let Some(bytes) = c.member(bare) {
+                let d = LodDescriptor::parse(&String::from_utf8_lossy(bytes));
+                break (c, d);
+            }
+        };
+        // the container of each slot's model
+        let mut path_of: HashMap<String, String> = HashMap::new();
+        for name in d.slots().into_iter().flatten() {
+            if path_of.contains_key(name) {
+                continue;
+            }
+            let mut found = home.member(name).is_some().then(|| home.name.clone());
+            if found.is_none() {
+                found = searched
+                    .iter()
+                    .find(|o| o.member(name).is_some())
+                    .map(|o| o.name.clone());
+            }
+            if found.is_none() {
+                for n in shared.iter() {
+                    if let Some(o) = self.container(game, n)
+                        && o.member(name).is_some()
+                    {
+                        found = Some(o.name.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(h) = found {
+                path_of.insert(name.to_string(), format!("jc2://{h}/{name}"));
+            }
+        }
+        let slots = d.slots().map(|s| s.filter(|n| path_of.contains_key(*n)));
+        let plan = SlotPlan::with_lodfactor(d.lod_scale(), slots, lodfactor);
+        plan.far_model()?;
+        let paths = plan.models.iter().map(|m| path_of[m].clone()).collect();
+        Some((plan, paths))
+    }
+
     pub(crate) fn resolve(
         &mut self,
         game: &Game,
@@ -637,6 +738,7 @@ fn load_tile(
                 Mesh3d(meshes.add(mesh)),
                 Transform::IDENTITY,
                 Name::new(format!("terrain {x},{z}")),
+                crate::forest_canopy::TileTerrainMesh((x, z)),
             ));
             match splat {
                 Some(m) => {
@@ -663,10 +765,11 @@ fn load_tile(
             }
             tile.terrain_triangles = tris;
             tile.gamezone = terrain.gamezone.clone();
+            tile.heights = terrain.heights.clone();
         }
         Err(e) => warn!("{name}: {e}"),
     }
-    if !cfg.models {
+    if !cfg.models || st.wc_by_activation {
         return tile;
     }
     let container = tile_container_name(x, z);
@@ -814,10 +917,41 @@ pub(crate) fn place_objects(
             p.world = p.world.then(b);
         }
     }
+    // the placed `CDynamicLightObject` lamps (JC2-221): enabled ones become native point lights
+    // (lit all day, dimmed by the gradient scale only). Lamps that start disabled wait for an
+    // enable event that is not wired (Gap), so they are not created.
+    for d in jc2_formats::point_light::dynamic_lights(file) {
+        if !d.enabled {
+            continue;
+        }
+        let at = base.map_or(d.position, |b| b.transform_point(d.position));
+        let lamp = commands
+            .spawn((
+                crate::point_lights::LampLight::from_native(&d, to_bevy(at)),
+                Name::new("lamp light"),
+            ))
+            .id();
+        tile.entities.push(lamp);
+    }
+    // the placed `CParticleObject`s (FX-SMOKE-3): chimneys, damage smoke, steam. They belong to
+    // the tile, so unloading it drops them and stops their emitters (`world_particles.rs`).
+    for p in jc2_formats::placed_particle::placed_particles(file) {
+        let obj = crate::world_particles::WorldParticle::new(&p, base, xz);
+        let e = commands.spawn((obj, Name::new(format!("particle {}", p.leaf)))).id();
+        tile.entities.push(e);
+    }
     let mut piece_of: HashMap<usize, u32> = HashMap::new();
     let mut added = Vec::new();
+    let mut lod_sets: HashMap<String, Option<Arc<crate::plant_lod::PlantLodSet>>> = HashMap::new();
+    // ordinals count source records, not runtime slots: mission exports interleave
+    let own_before = tile.units.iter().filter(|u| u.export.is_none()).count() as u32;
     for d in jc2_formats::destruction::destructibles(file) {
         let unit = tile.units.len() as u32;
+        let source_ordinal = if base.is_some() {
+            added.len() as u32
+        } else {
+            own_before + added.len() as u32
+        };
         added.push(unit);
         for &i in &d.intact {
             piece_of.insert(i, unit);
@@ -854,6 +988,8 @@ pub(crate) fn place_objects(
             counter: d.counter,
             fires: d.fires,
             mission_owner: None,
+            source_ordinal,
+            export: None,
         });
     }
     for (index, p) in all.into_iter().enumerate() {
@@ -869,19 +1005,6 @@ pub(crate) fn place_objects(
                 .or_default() += 1;
             continue;
         };
-        let path = format!("jc2://{home}/{rbm}");
-        let handle = match st.handles.get_mut(&path) {
-            Some((h, n)) => {
-                *n += 1;
-                h.clone()
-            }
-            None => {
-                let h: Handle<RbmAsset> = assets.load(path.clone());
-                st.handles.insert(path.clone(), (h.clone(), 1));
-                h
-            }
-        };
-        tile.models.push(path);
         let transform = mat_to_bevy(&p.world);
         // …and every placed object carries its own shape (`collision` in the .blo)
         let own_shape = match &p.collision {
@@ -890,15 +1013,50 @@ pub(crate) fn place_objects(
             }
             _ => false,
         };
+        let mesh_colliders = cfg.physics && !has_pfi && !own_shape;
+        // native five-slot selection (JC2-128). An object whose collider is its render mesh
+        // keeps the single full-detail level: the swap replaces the child meshes.
+        let set = (cfg.object_lod == 0 && !mesh_colliders)
+            .then(|| {
+                lod_sets
+                    .entry(bare_name(model).to_ascii_lowercase())
+                    .or_insert_with(|| {
+                        let (plan, paths) =
+                            st.index
+                                .resolve_plan(game, local, (x, z), model, cfg.lodfactor)?;
+                        if !plan.switches() {
+                            return None;
+                        }
+                        let handles = paths
+                            .iter()
+                            .map(|p| {
+                                tile.models.push(p.clone());
+                                st.model_handle(assets, p)
+                            })
+                            .collect();
+                        Some(Arc::new(PlantLodSet { plan, handles }))
+                    })
+                    .clone()
+            })
+            .flatten();
+        let handle = match &set {
+            Some(set) => set.handles[set.plan.far_model().unwrap_or(0)].clone(),
+            None => {
+                let path = format!("jc2://{home}/{rbm}");
+                tile.models.push(path.clone());
+                st.model_handle(assets, &path)
+            }
+        };
         tile.pending.push(PendingModel {
             handle,
             transform,
             name: format!("{} ({})", p.name, rbm),
-            mesh_colliders: cfg.physics && !has_pfi && !own_shape,
+            mesh_colliders,
             piece,
             vis_range: None,
             mission_owner: None,
-            lod: None,
+            lod: set,
+            batch: None,
         });
         tile.objects_total += 1;
     }
@@ -963,8 +1121,14 @@ pub(crate) fn place_entity(
     for pending in &mut tile.pending[pending_before..] {
         pending.mission_owner = Some(owner);
     }
+    let export = ExportSet {
+        entity: bare_name(entity).to_ascii_lowercase(),
+        placement: format!("{:?}", base.m.map(f32::to_bits)),
+    };
     for &unit in &units {
-        tile.units[unit as usize].mission_owner = Some(owner);
+        let u = &mut tile.units[unit as usize];
+        u.mission_owner = Some(owner);
+        u.export = Some(export.clone());
     }
     tile.mission_models
         .entry(owner)
@@ -1067,11 +1231,11 @@ fn unload_tile(st: &mut Streamer, key: (u32, u32), commands: &mut Commands) {
 pub(crate) struct SplatStores<'w> {
     buffers: Option<ResMut<'w, Assets<bevy::render::storage::ShaderBuffer>>>,
     materials: ResMut<'w, Assets<crate::terrain_material::TerrainSplatMaterial>>,
+    canopy: Option<ResMut<'w, Assets<crate::forest_canopy::ForestCanopy>>>,
 }
 
 pub(crate) fn setup(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut stores: SplatStores,
@@ -1089,6 +1253,10 @@ pub(crate) fn setup(
         // the horizon chunks draw with the splat shader on the global layers (JC2-157)
         if let Some(material) = splat.global_material(&mut stores.materials) {
             commands.insert_resource(crate::terrain_material::GlobalTerrainMaterial(material));
+        }
+        // the forest canopy over the horizon chunks and the tiles (JC2-160)
+        if let Some(canopy) = stores.canopy.as_mut() {
+            crate::forest_canopy::setup_material(&mut commands, &game, splat, &mut images, canopy);
         }
     }
     let terrain_material = materials.add(StandardMaterial {
@@ -1111,26 +1279,7 @@ pub(crate) fn setup(
         .and_then(|t| t.sample_local(TILE_SIZE / 2.0, TILE_SIZE / 2.0));
     let ground = centre_height.unwrap_or(SEA_LEVEL).max(SEA_LEVEL);
 
-    // the sea: a plane out to beyond the fog, following the focus tile
-    let span = 2.0 * (crate::horizon::FAR + 2.0 * TILE_SIZE);
-    let sea = commands
-        .spawn((
-            Mesh3d(meshes.add(Plane3d::default().mesh().size(span, span))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgba(0.05, 0.25, 0.45, 0.75),
-                perceptual_roughness: 0.15,
-                metallic: 0.0,
-                alpha_mode: AlphaMode::Blend,
-                ..default()
-            })),
-            Transform::from_translation(bevy_xyz(
-                cx0 + TILE_SIZE / 2.0,
-                SEA_LEVEL,
-                cz0 + TILE_SIZE / 2.0,
-            )),
-            Name::new("sea"),
-        ))
-        .id();
+    // the sea is `sea.rs`: camera-centred clip-map patches (JC2-164)
 
     // camera: south of the start tile's middle and above it, looking north (−z, yaw 0),
     // so the map's north is up the screen and east (+x) to the right
@@ -1163,6 +1312,7 @@ pub(crate) fn setup(
     let mut tf = Transform::from_translation(eye);
     tf.rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
     commands.insert_resource(Streamer {
+        wc_by_activation: false,
         next_gameplay_generation: 0,
         loaded: HashMap::new(),
         location_tiles: HashMap::new(),
@@ -1172,8 +1322,6 @@ pub(crate) fn setup(
         colliders: HashMap::new(),
         terrain_material,
         splat,
-        sea: Some(sea),
-        sea_centre: (tx, tz),
         focus: (tx, tz),
         start: tf,
         spawn_point_set: false,
@@ -1197,6 +1345,8 @@ pub(crate) fn setup(
         DebandDither::Disabled,
         Exposure::BLENDER,
         crate::post_effects::PostPass::default(),
+        // the sea reads the scene depth behind the water from the depth prepass (`sea.rs`)
+        bevy::core_pipeline::prepass::DepthPrepass,
         AmbientLight {
             color: Color::srgb(0.70, 0.80, 1.0),
             brightness: 140.0,
@@ -1222,17 +1372,6 @@ pub(crate) fn setup(
     ));
 }
 
-type SeaQuery<'w, 's> = Query<
-    'w,
-    's,
-    &'static mut Transform,
-    (
-        Without<FlyCamera>,
-        Without<crate::vehicle::Occupied>,
-        Without<crate::character::Hero>,
-    ),
->;
-
 /// Keep the tiles around the focus (the driven vehicle, else the camera) loaded: drop
 /// what fell out of range, load the nearest missing tile — one per frame.
 #[allow(clippy::too_many_arguments)]
@@ -1247,10 +1386,11 @@ pub(crate) fn stream_tiles(
     heroes: Query<&Transform, With<crate::character::Hero>>,
     players: Query<&Transform, With<crate::vehicle::Occupied>>,
     cams: Query<&Transform, With<FlyCamera>>,
-    mut seas: SeaQuery,
     start_at: Option<Res<StartAt>>,
+    wc: Option<Res<WcByActivation>>,
 ) {
     let Some(mut st) = st else { return };
+    st.wc_by_activation = wc.is_some();
     // Rico (he rides along in the car), else the car, else the camera
     let focus_pos = heroes
         .single()
@@ -1343,15 +1483,6 @@ pub(crate) fn stream_tiles(
             st.spawn_point_set = true;
         }
     }
-    // the sea follows the focus
-    if st.sea_centre != st.focus
-        && let Some(sea) = st.sea
-        && let Ok(mut tf) = seas.get_mut(sea)
-    {
-        let (x0, z0) = tile_origin(fx, fz);
-        tf.translation = bevy_xyz(x0 + TILE_SIZE / 2.0, SEA_LEVEL, z0 + TILE_SIZE / 2.0);
-        st.sea_centre = st.focus;
-    }
 }
 
 /// `JC2_START_OFFSET=dx,dz`: metres from the start tile's middle (for smoke tests).
@@ -1433,11 +1564,17 @@ pub(crate) fn spawn_models(
             if let Some(owner) = p.mission_owner {
                 entity.insert(owner);
             }
+            if let Some(node) = p.batch {
+                entity.insert((node, Visibility::Hidden));
+            }
             if let Some(set) = &p.lod {
                 entity.insert(crate::plant_lod::PlantLod {
                     set: set.clone(),
                     shown: set.plan.far_model().unwrap_or(0),
                     vis_range: p.vis_range,
+                    byte: 255,
+                    camera_zoom: false,
+                    vehicle: None,
                 });
             }
             if p.mesh_colliders {
@@ -1455,13 +1592,11 @@ pub(crate) fn spawn_models(
                     }
                     // foliage-material meshes fade out natively (`veg_fade.rs`, JC2-140): no
                     // hand-over range, only a lossless cull; the others keep the project range
-                    if let Some(range) =
-                        crate::veg_fade::plant_visibility_range(
-                            b.foliage.is_some(),
-                            p.vis_range,
-                            lodfactor.0,
-                        )
-                    {
+                    if let Some(range) = crate::veg_fade::plant_visibility_range(
+                        b.foliage.is_some(),
+                        p.vis_range,
+                        lodfactor.0,
+                    ) {
                         child.insert(range);
                     }
                     tris += b.triangles;
@@ -1723,12 +1858,15 @@ pub(crate) mod tests {
         .init_asset::<RbmAsset>()
         .init_asset::<crate::foliage_alpha::FoliageMaterial>()
         .init_asset::<crate::general_material::GeneralMaterial>()
+        .init_asset::<crate::hemisphere_material::HemisphereMaterial>()
         .register_asset_loader(RbmLoader::default())
         .insert_resource(Game { fs })
         .insert_resource(WorldConfig {
             tile,
             radius: 0,
             lod: 1,
+            object_lod: 1,
+            lodfactor: 0,
             models: true,
             physics: true,
             flat_terrain: false,
@@ -1781,6 +1919,33 @@ pub(crate) mod tests {
     /// Headless: run the world setup on tile 31,14 of a test game folder and make sure
     /// terrain meshes and placed models come out. Needs JC2_TEST_DIR with the
     /// terrain tiles and `31x14.nlz` (+ `general.blz`) in its dropzone.
+    /// JC2-128: with the native selection placed static objects whose `.lod` has several
+    /// distinct slot models carry a `PlantLod` that starts on the far model; with
+    /// `object_lod` 1 none does.
+    #[test]
+    fn placed_objects_follow_the_native_slots() {
+        let count = |native: bool| {
+            let app = tile_app(|app| {
+                app.world_mut().resource_mut::<WorldConfig>().object_lod = usize::from(!native);
+            })?;
+            let mut app = app;
+            let mut q = app.world_mut().query::<&crate::plant_lod::PlantLod>();
+            let mut n = 0;
+            for l in q.iter(app.world()) {
+                assert!(l.set.plan.switches());
+                assert_eq!(Some(l.shown), l.set.plan.far_model());
+                n += 1;
+            }
+            Some(n)
+        };
+        let (Some(native), Some(single)) = (count(true), count(false)) else {
+            return;
+        };
+        eprintln!("tile 31,14: {native} placed objects with native LOD slots");
+        assert!(native > 0, "no placed object has switchable slots");
+        assert_eq!(single, 0);
+    }
+
     #[test]
     fn builds_a_tile_headless() {
         let Some(mut app) = tile_app(|_| {}) else {

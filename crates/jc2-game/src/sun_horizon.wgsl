@@ -20,7 +20,7 @@
 //   struct SunHorizon {
 //       cb0: vec4<f32>,   // cb0[0] = (a, b, c, 1)
 //       sun: vec4<f32>,   // xyz: unit vector towards the Sun (0: none), w: floor cb0[10].w
-//       tilt: vec4<f32>,  // xyz: (sky - ground) / 2 ambient (sky_light.rs); 0 = uniform
+//       tilt: vec4<f32>,  // xyz: (sky - ground) / 2 ambient (sky_light.rs); 0 = uniform; w: elapsed seconds
 //   }
 //   @group(MATERIAL_BIND_GROUP) @binding(N) var<storage, read> horizon: SunHorizon;
 //

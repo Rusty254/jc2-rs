@@ -115,8 +115,35 @@ const HEAT_GLASS_LIFE: f32 = 4.0;
 const AREA_BANNER_LIFE: f32 = 6.0;
 /// "In the last 60 seconds".
 const WINDOW: f32 = 60.0;
-/// Seconds in the air before "Open parachute" is offered.
-const FALL_PROMPT_AFTER: f32 = 0.35;
+/// The foot-machine states served by `CSkyDiveController` (native `0x0052a650`; table in
+/// `foot-conditions-next.md` section 4): in these "Open parachute" is offered. `S_JUMP_TO_SKYDIVE`
+/// is the base-jump controller and has no prompt.
+pub const SKYDIVE_CONTROLLER_STATES: [&str; 7] = [
+    "S_PULL_OPEN_PARACHUTE_VERTICAL",
+    "S_SKYDIVE",
+    "S_PARACHUTE_DETACH_TO_FREEFALL",
+    "S_TO_SKYDIVE_DASH",
+    "S_FROM_SKYDIVE_DASH",
+    "S_SKYDIVE_DASH",
+    "S_FALL_TO_SKYDIVE",
+];
+
+/// Whether the foot-machine state is a `CSkyDiveController` state.
+pub fn is_skydive_controller_state(state: &str) -> bool {
+    SKYDIVE_CONTROLLER_STATES.contains(&state)
+}
+
+/// `character+0x47c`, "parachute allowed" (native default true; `ply.parachute.disable` clears
+/// it, `ply.parachute.enable` sets it, handler `0x00706c30`). Nothing writes it yet: the
+/// script-event hook is not wired, so it stays at its default.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParachuteAllowed(pub bool);
+
+impl Default for ParachuteAllowed {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 /// Where a vehicle's marker shows, and a soldier's (m).
 const VEHICLE_MARKER_RANGE: f32 = 60.0;
 const FOE_MARKER_RANGE: f32 = 120.0;
@@ -324,6 +351,9 @@ pub struct HudView {
     pub active: bool,
     pub on_foot: bool,
     pub in_vehicle: bool,
+    /// A gun is drawn (`Arsenal::drawn`, native holder+0x64 != 0): the weapon crosshair
+    /// shows; holstered, the small plain cross does.
+    pub drawn: bool,
     pub slot: SlotView,
     pub grenade: GrenadeView,
     pub health_frac: f32,
@@ -384,15 +414,45 @@ pub struct PromptContext {
     pub in_vehicle: bool,
     pub vehicle_is_car: bool,
     pub on_roof: bool,
-    pub swimming: bool,
     pub on_wire: bool,
     /// Reeled in to a wall, ledge or overhang and hanging from the hook.
     pub hanging: bool,
     pub parachute: bool,
+    /// The canopy is `PCS_OPEN` (out and not unfolding or closing): the GUI parachute button
+    /// shows "close" (native `0x00792510`, event `gui.parachutebutton.close`).
+    pub canopy_open: bool,
+    /// In the air (hides the on-foot prompts).
     pub airborne: bool,
+    /// The foot machine is in a skydive-controller state and the parachute is allowed:
+    /// "Open parachute" (native `0x0052a650`).
+    pub skydive: bool,
     pub near_vehicle: bool,
     pub near_stunt: bool,
     pub near_pickup: bool,
+}
+
+/// The GUI parachute button state (native `0x00792510`: events `gui.parachutebutton.open` /
+/// `.close`), independent of the face-button prompt buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParachuteButton {
+    /// `gui.parachutebutton.open`: canopy `PCS_CLOSED` inside the canopy states, or a
+    /// skydive state.
+    Open,
+    /// `gui.parachutebutton.close`: canopy `PCS_OPEN`.
+    Close,
+}
+
+/// The GUI parachute button for this context. The native `PCS_CLOSED`-inside-the-canopy-states
+/// branch has no runtime counterpart (the canopy flag clears with the state), so only the
+/// open-canopy and skydive branches occur.
+pub fn parachute_button(c: &PromptContext) -> Option<ParachuteButton> {
+    if c.parachute {
+        c.canopy_open.then_some(ParachuteButton::Close)
+    } else if c.skydive {
+        Some(ParachuteButton::Open)
+    } else {
+        None
+    }
 }
 
 /// The prompts that apply now, in the order they are drawn.
@@ -430,9 +490,22 @@ pub fn prompts_for(c: &PromptContext, s: &HudStrings) -> Vec<Prompt> {
         return out;
     }
     if c.parachute {
-        add(s.get("hud_button_05", "Close parachute"), "SPACE");
-    } else if c.on_wire || (c.airborne && !c.swimming) {
-        // in the air, and on the wire (the slingshot)
+        if c.on_wire {
+            // the GUI parachute button (`gui.parachutebutton.close`) is a second producer next to
+            // the face-button buffer, so "Close parachute SPACE" and "Reel in E" are on screen
+            // together (research 4.1). INFERRED: the button's label/key are read from the
+            // reference shots; the GUI package is unparsed. Without a wire the buffer already
+            // posts the same text, so the duplicate is dropped.
+            if parachute_button(c) == Some(ParachuteButton::Close) {
+                add(s.get("hud_button_05", "Close parachute"), "SPACE");
+            }
+            // under the canopy with a wire attached (native: wire pointer non-zero)
+            add(s.get("hud_button_07", "Reel in"), "E");
+        } else {
+            add(s.get("hud_button_05", "Close parachute"), "SPACE");
+        }
+    } else if c.on_wire || c.skydive {
+        // a skydive-controller state, and on the wire (the reeled-flight entry)
         add(s.get("hud_button_04", "Open parachute"), "SPACE");
     }
     if c.on_wire {
@@ -949,6 +1022,7 @@ impl Plugin for HudPlugin {
             .init_resource::<HudView>()
             .init_resource::<MinimapView>()
             .init_resource::<PromptList>()
+            .init_resource::<ParachuteAllowed>()
             .init_resource::<Markers>()
             .init_resource::<ExtraMarkers>()
             .init_resource::<ExtraBlips>()
@@ -1063,6 +1137,8 @@ pub struct HudNodes {
     pub vignette: Entity,
     pub desat: Entity,
     pub crosshair: Entity,
+    /// The small plain cross shown with no gun drawn.
+    pub crosshair_plain: Entity,
     pub heat_big: Entity,
     pub heat_big_text: Entity,
     pub heat_big_level: Entity,
@@ -2030,6 +2106,57 @@ fn build_hud(
         );
     }
 
+    // ----- the holstered crosshair: a plain '+' -----
+    // The retail screenshots with no gun drawn (`_extract/crosshair/ref/6.webp`, `7.webp`)
+    // show four dark-outlined light bars round a dim centre dot. Measured at 1084 px high,
+    // each bar is 11 x 5.6 px, i.e. the 6 x 3 dash sprite of `hud_alpha_a_dif` (at
+    // (230, 18): white 4 x 1 inside a 1 px dark outline) at the HUD scale, and the dot is the
+    // 3 x 3 sprite at (240, 18). The 1 unit gaps are measured from the same pictures.
+    let plain = child(
+        &mut commands,
+        root,
+        (
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Percent(50.0),
+                top: r(548.0),
+                width: r(0.0),
+                height: r(0.0),
+                display: Display::None,
+                ..default()
+            },
+            Name::new("hud: crosshair (holstered)"),
+        ),
+    );
+    child(
+        &mut commands,
+        plain,
+        (
+            at(-1.5, -1.5, 3.0, 3.0),
+            atlas(&art.alpha, 240.0, 18.0, 3.0, 3.0),
+        ),
+    );
+    for (x, y, vertical) in [
+        (-8.5, -1.5, false),
+        (2.5, -1.5, false),
+        (-3.0, -7.0, true),
+        (-3.0, 4.0, true),
+    ] {
+        child(
+            &mut commands,
+            plain,
+            (
+                at(x, y, 6.0, 3.0),
+                atlas(&art.alpha, 230.0, 18.0, 6.0, 3.0),
+                if vertical {
+                    UiTransform::from_rotation(Rot2::degrees(90.0))
+                } else {
+                    UiTransform::IDENTITY
+                },
+            ),
+        );
+    }
+
     // "down" message in the middle
     let down_text = child(
         &mut commands,
@@ -2082,6 +2209,7 @@ fn build_hud(
         vignette,
         desat,
         crosshair,
+        crosshair_plain: plain,
         heat_big,
         heat_big_text,
         heat_big_level,
@@ -2385,6 +2513,7 @@ fn collect(
     view.active = true;
     view.in_vehicle = hero.in_vehicle.is_some();
     view.on_foot = !view.in_vehicle && *mode == CameraMode::Hero;
+    view.drawn = arsenal.as_ref().is_none_or(|a| a.drawn);
     view.heat_level = heat.as_ref().map_or(0, |h| h.level());
     let (hp, max) = health.map_or((1.0, 1.0), |h| (h.hp, h.max));
     view.health_frac = (hp / max.max(1.0)).clamp(0.0, 1.0);
@@ -2713,11 +2842,14 @@ fn compute_prompts(
         Has<crate::stunts::StuntTransfer>,
         Has<crate::ragdoll::PendingRagdoll>,
         Has<crate::ragdoll::PhysicsPose>,
+        Option<&crate::foot_machine::FootDriver>,
     )>,
     vehicles: Query<VehicleItem>,
     pickups: Query<&GlobalTransform, With<Pickup>>,
+    allowed: Option<Res<ParachuteAllowed>>,
 ) {
-    let Ok((hero, tf, on, current, transferring, pending, physics_pose)) = heroes.single() else {
+    let Ok((hero, tf, on, current, transferring, pending, physics_pose, foot)) = heroes.single()
+    else {
         list.0.clear();
         return;
     };
@@ -2727,15 +2859,24 @@ fn compute_prompts(
         free_camera: *mode == CameraMode::Free,
         in_vehicle: hero.in_vehicle.is_some(),
         on_roof: hero.stunt.is_some(),
-        swimming: hero.swimming,
         on_wire: hero.grapple.is_some(),
         hanging: hero.hanging && hero.grapple.is_some(),
         parachute: hero.parachute,
+        canopy_open: hero.parachute
+            && !foot.is_some_and(|f| {
+                matches!(
+                    f.state.as_str(),
+                    "S_UNFOLD_PARACHUTE_HORIZONTAL" | "S_UNFOLD_PARACHUTE_VERTICAL"
+                )
+            }),
         airborne: !hero.grounded
             && !hero.swimming
             && hero.stunt.is_none()
             && hero.in_vehicle.is_none()
-            && hero.air_time > FALL_PROMPT_AFTER,
+            && hero.in_vehicle.is_none(),
+        skydive: foot.is_some_and(|f| is_skydive_controller_state(&f.state))
+            && allowed.is_none_or(|a| a.0)
+            && !hero.parachute,
         ..default()
     };
     if !c.downed
@@ -2781,6 +2922,7 @@ fn compute_prompts(
             };
         } else if prompts_for(&c, &strings).is_empty() {
             c.airborne = true;
+            c.skydive = true;
         }
     }
     let next = prompts_for(&c, &strings);
@@ -3221,7 +3363,9 @@ fn apply_hud(
     }
 
     // ----- crosshair -----
-    set_display(&mut node_q, n.crosshair, live && view.on_foot && !view.down);
+    let cross = live && view.on_foot && !view.down;
+    set_display(&mut node_q, n.crosshair, cross && view.drawn);
+    set_display(&mut node_q, n.crosshair_plain, cross && !view.drawn);
     set_display(&mut node_q, n.down_text, live && view.down);
 
     // ----- damage -----
@@ -3614,14 +3758,16 @@ fn tint_crosshair(
         return;
     };
     let tint = lock.tint();
-    let Ok(children) = kids.get(n.crosshair) else {
-        return;
-    };
-    for c in children.iter() {
-        if let Ok(mut img) = images.get_mut(c) {
-            img.color = tint;
-        } else if let Ok(mut bg) = bars.get_mut(c) {
-            bg.0 = tint.with_alpha(0.85);
+    for cross in [n.crosshair, n.crosshair_plain] {
+        let Ok(children) = kids.get(cross) else {
+            continue;
+        };
+        for c in children.iter() {
+            if let Ok(mut img) = images.get_mut(c) {
+                img.color = tint;
+            } else if let Ok(mut bg) = bars.get_mut(c) {
+                bg.0 = tint.with_alpha(0.85);
+            }
         }
     }
 }
@@ -3720,6 +3866,23 @@ mod tests {
         p.iter().map(|p| format!("{} {}", p.label, p.key)).collect()
     }
 
+    /// The skydive-controller states (native `0x0052a650`); the base jump and the canopy are not.
+    #[test]
+    fn skydive_controller_states() {
+        for s in SKYDIVE_CONTROLLER_STATES {
+            assert!(is_skydive_controller_state(s), "{s}");
+        }
+        for s in [
+            "S_FALL",
+            "S_JUMP_TO_SKYDIVE",
+            "S_PARACHUTE",
+            "S_UNFOLD_PARACHUTE_VERTICAL",
+            "S_REEL_FLIGHT",
+        ] {
+            assert!(!is_skydive_controller_state(s), "{s}");
+        }
+    }
+
     #[test]
     fn prompts_follow_the_state() {
         let s = strings();
@@ -3736,11 +3899,64 @@ mod tests {
         let falling = prompts_for(
             &PromptContext {
                 airborne: true,
+                skydive: true,
                 ..default()
             },
             &s,
         );
         assert_eq!(labels(&falling), ["Open parachute SPACE"]);
+        // airborne without a skydive-controller state (a plain fall): no prompt
+        let plain = prompts_for(
+            &PromptContext {
+                airborne: true,
+                ..default()
+            },
+            &s,
+        );
+        assert!(plain.is_empty(), "{plain:?}");
+        // under the canopy with a wire: Reel in (E)
+        let reel = prompts_for(
+            &PromptContext {
+                airborne: true,
+                parachute: true,
+                on_wire: true,
+                ..default()
+            },
+            &s,
+        );
+        assert_eq!(labels(&reel), ["Reel in E", "Drop F"]);
+        // open canopy with a wire: the GUI button adds "Close parachute" beside "Reel in"
+        let both = PromptContext {
+            airborne: true,
+            parachute: true,
+            canopy_open: true,
+            on_wire: true,
+            ..default()
+        };
+        assert_eq!(
+            labels(&prompts_for(&both, &s)),
+            ["Close parachute SPACE", "Reel in E", "Drop F"]
+        );
+        // button state table
+        assert_eq!(parachute_button(&both), Some(ParachuteButton::Close));
+        let unfolding = PromptContext {
+            canopy_open: false,
+            ..both
+        };
+        assert_eq!(parachute_button(&unfolding), None);
+        let sky = PromptContext {
+            skydive: true,
+            ..default()
+        };
+        assert_eq!(parachute_button(&sky), Some(ParachuteButton::Open));
+        assert_eq!(parachute_button(&PromptContext::default()), None);
+        // no wire: the single face-button post, no duplicate
+        let open_no_wire = PromptContext {
+            canopy_open: true,
+            on_wire: false,
+            ..both
+        };
+        assert_eq!(labels(&prompts_for(&open_no_wire, &s)), ["Close parachute SPACE"]);
         let chute = prompts_for(
             &PromptContext {
                 airborne: true,
@@ -3809,6 +4025,7 @@ mod tests {
         let hop = prompts_for(
             &PromptContext {
                 airborne: true,
+                skydive: true,
                 near_vehicle: true,
                 ..default()
             },
@@ -4133,8 +4350,24 @@ mod headless {
             h.grounded = false;
             h.air_time = 1.0;
         }
+        // a plain fall (foot state S_FALL): no prompt yet
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(crate::foot_machine::FootDriver::new("S_FALL"));
+        run(&mut app, 2);
+        assert!(prompts(&app).is_empty(), "{:?}", prompts(&app));
+        // the skydive-controller state offers the chute
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(crate::foot_machine::FootDriver::new("S_FALL_TO_SKYDIVE"));
         run(&mut app, 2);
         assert_eq!(prompts(&app), ["Open parachute SPACE"]);
+        // the script disabled it
+        app.insert_resource(ParachuteAllowed(false));
+        run(&mut app, 2);
+        assert!(prompts(&app).is_empty(), "{:?}", prompts(&app));
+        app.insert_resource(ParachuteAllowed(true));
+        run(&mut app, 2);
         // the chute is open
         app.world_mut().get_mut::<Hero>(hero).unwrap().parachute = true;
         run(&mut app, 2);
@@ -4177,13 +4410,18 @@ mod headless {
         );
     }
 
-    /// Rico in the air long enough for the parachute prompt.
+    /// Rico in the skydive-controller state that offers the parachute prompt.
     fn falling_rico(app: &mut App) {
         let hero = rico(app, Vec3::new(0.0, 100.0, 0.0));
         camera(app, 0.0);
-        let mut h = app.world_mut().get_mut::<Hero>(hero).unwrap();
-        h.grounded = false;
-        h.air_time = 1.0;
+        {
+            let mut h = app.world_mut().get_mut::<Hero>(hero).unwrap();
+            h.grounded = false;
+            h.air_time = 1.0;
+        }
+        app.world_mut()
+            .entity_mut(hero)
+            .insert(crate::foot_machine::FootDriver::new("S_FALL_TO_SKYDIVE"));
     }
 
     /// With the game's fonts a prompt's text is bitmap glyphs: one node per visible
@@ -4445,6 +4683,20 @@ mod headless {
         }
         assert_eq!(number(&app), "12", "a full Beretta magazine");
         assert_eq!(name(&app), "Pistol");
+        // Rico starts holstered: the small plain cross shows, not the weapon bracket
+        let shown = |app: &App, e: Entity| {
+            app.world().get::<Node>(e).unwrap().display != Display::None
+        };
+        let (bracket, plain) = {
+            let n = app.world().resource::<HudNodes>();
+            (n.crosshair, n.crosshair_plain)
+        };
+        assert!(!shown(&app, bracket) && shown(&app, plain));
+        assert_eq!(app.world().get::<Children>(plain).unwrap().len(), 5);
+        app.world_mut().resource_mut::<Arsenal>().drawn = true;
+        run(&mut app, 2);
+        assert!(shown(&app, bracket) && !shown(&app, plain));
+        app.world_mut().resource_mut::<Arsenal>().drawn = false;
         assert_eq!(
             text_of(&app, app.world().resource::<HudNodes>().grenade_text),
             "Fragmentation Grenade"

@@ -1222,6 +1222,7 @@ mod tests {
                 vis_range: None,
                 mission_owner,
                 lod: None,
+                batch: None,
             };
             tile.entities.extend([shared, owned, retry]);
             tile.pending

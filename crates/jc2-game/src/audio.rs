@@ -46,6 +46,7 @@ use jc2_formats::soundmap::{
     EffectSound, SoundMap, SoundRef, VehicleSelector, VehicleSoundSelection,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// An event as the game asks for it: a name from `EVENTS` or an id key (`weapons.fev#1.5`).
@@ -81,17 +82,12 @@ const EVENTS: &[(&str, &str, &str)] = &[
     ("debris", "effects.fev", "PostEffects/Debris_Metal_Large"),
     ("step", "character.fev", "Foley/Footsteps_Dirt"),
     (
-        "grapple_fire",
-        "parachute.fev",
-        "grappling_hook/grappling_fire_wire",
-    ),
-    (
         "grapple_detach",
         "parachute.fev",
         "grappling_hook/grappling_detatch",
     ),
     ("chute_open", "parachute.fev", "Parachute/Parachute_Vert"),
-    ("chute_loop", "parachute.fev", "Parachute/Parachute_steer"),
+    ("chute_steer", "parachute.fev", "Parachute/Parachute_steer"),
     ("wind", "parachute.fev", "Parachute/Wind_skydive"),
     ("car_jeep", "vehicles.fev", "Engines/Jeep"),
     ("car_sedan", "vehicles.fev", "Engines/Small Sedan"),
@@ -163,7 +159,6 @@ const FALLBACK: &[(&str, &str, &str)] = &[
     ),
     ("debris", "effects_common.fsb", "Debris_Large_Metal_"),
     ("step", "character_foley.fsb", "Footstep_Dirt_Run_"),
-    ("grapple_fire", "parachute.fsb", "grappling_fire_02.wav"),
     (
         "grapple_detach",
         "parachute.fsb",
@@ -171,7 +166,7 @@ const FALLBACK: &[(&str, &str, &str)] = &[
     ),
     ("chute_open", "parachute.fsb", "Para_Flap_Open_05.wav"),
     (
-        "chute_loop",
+        "chute_steer",
         "parachute.fsb",
         "Para_FlappingSlow_exp 001.wav",
     ),
@@ -361,7 +356,6 @@ impl Sounds {
             ("explosion_missile", "missile_explosion"),
             ("debris", "destruction_default"),
             ("rocket_loop", "missile_fire"),
-            ("grapple_fire", "flying_hook"),
             ("grapple_detach", "hook_detach"),
         ] {
             if let Some(v) = self.read_effect(effect) {
@@ -378,6 +372,15 @@ impl Sounds {
             .and_then(|m| m.characters.sound("parachute_open_vertical", None));
         if let Some(k) = step_ref.and_then(|r| self.ref_key(r)) {
             self.alias.insert("chute_open", k);
+        }
+        // the player's sound slots (native `0x006f4930`, tables `0x00ec20a8`/`0x00ec20b8`):
+        // bank 14 sounds 1 (InFlight), 2 (Wind_skydive), 3 (steer)
+        // (sound 1, `Parachute_InFlight`, is an event with no layers in the retail
+        // `parachute.fev`: the canopy's own loop is silent, so it is not played)
+        for (logical, sound) in [("wind", 2), ("chute_steer", 3)] {
+            if let Some(k) = self.ref_key(SoundRef { bank: 14, sound }) {
+                self.alias.insert(logical, k);
+            }
         }
         // the shots of the weapons the soldiers and the rocket use
         let fire_of = |s: &Sounds, name: &str| s.weapon_keys(name, 0).map(|k| k.fire);
@@ -396,10 +399,9 @@ impl Sounds {
             "rocket_loop",
             "rocket_fire",
             "enemy_rifle",
-            "grapple_fire",
             "grapple_detach",
             "chute_open",
-            "chute_loop",
+            "chute_steer",
             "wind",
         ]
         .into_iter()
@@ -619,6 +621,22 @@ enum Ask {
         slot: &'static str,
         want: Option<(Key, f32, Params)>,
     },
+    /// A `Sound` effect component's start (`effects::sound`): owned by its token so the effect
+    /// can move and stop it; `alive` goes false when the instance is over.
+    Effect {
+        token: u64,
+        key: Key,
+        at: Vec3,
+        hold: bool,
+        alive: Arc<AtomicBool>,
+    },
+    EffectMove {
+        token: u64,
+        at: Vec3,
+    },
+    EffectStop {
+        token: u64,
+    },
 }
 
 /// One sample player owned by an Instance, including its entity lifetime.
@@ -671,6 +689,10 @@ struct Instance {
     finished: bool,
     /// No event: a sample picked by name, looped for held instances.
     fallback: Option<(Entity, Arc<Shared>)>,
+    /// The effect sound component that started it (`Ask::Effect`).
+    owner: Option<u64>,
+    /// Cleared when the instance is over, for the owning component's `IsAlive`.
+    alive: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Resource, Default)]
@@ -836,6 +858,7 @@ impl Plugin for JcAudioPlugin {
                         gunfire,
                         blasts.after(crate::explosion::detonate),
                         rockets,
+                        effect_sounds,
                         rico,
                         engines,
                         ambience,
@@ -1206,6 +1229,48 @@ fn run_instances(
                     playing.list.push(i);
                 }
             }
+            Ask::Effect {
+                token,
+                key,
+                at,
+                hold,
+                alive,
+            } => {
+                // a key the banks cannot play ends at once
+                let started = sounds.ensure(key)
+                    && match start_instance(
+                        sounds,
+                        playing,
+                        key,
+                        None,
+                        Place::At(at),
+                        1.0,
+                        &[],
+                        None,
+                    ) {
+                        Ok(mut i) => {
+                            i.owner = Some(token);
+                            i.alive = Some(alive.clone());
+                            i.loops_once = !hold;
+                            playing.list.push(i);
+                            true
+                        }
+                        Err(()) => false,
+                    };
+                if !started {
+                    alive.store(false, Ordering::Relaxed);
+                }
+            }
+            Ask::EffectMove { token, at } => {
+                for i in playing.list.iter_mut().filter(|i| i.owner == Some(token)) {
+                    i.at = Place::At(at);
+                }
+            }
+            Ask::EffectStop { token } => {
+                for i in playing.list.iter_mut().filter(|i| i.owner == Some(token)) {
+                    i.stop = true;
+                }
+            }
             Ask::Hold { slot, want } => {
                 let cur = playing
                     .list
@@ -1281,6 +1346,8 @@ fn run_instances(
                                     stopping: None,
                                     finished: false,
                                     fallback,
+                                    owner: None,
+                                    alive: None,
                                 });
                             }
                         }
@@ -1326,6 +1393,9 @@ fn run_instances(
         }
         if let Some((e, _)) = inst.fallback.take() {
             commands.entity(e).despawn();
+        }
+        if let Some(a) = &inst.alive {
+            a.store(false, Ordering::Relaxed);
         }
         false
     });
@@ -1419,6 +1489,8 @@ fn start_instance(
         stopping: None,
         finished: false,
         fallback: None,
+        owner: None,
+        alive: None,
     })
 }
 
@@ -1852,14 +1924,26 @@ fn blast_key(sounds: &Sounds, b: &crate::explosion::Blast) -> Key {
     }
 }
 
+/// Whether the blast's sound is the `Sound` component of its effect (played through the effect
+/// spawner, `effects::sound`) rather than the by-size placeholder below.
+fn blast_sounds_from_effect(b: &crate::explosion::Blast, spawner: bool) -> bool {
+    spawner && b.effect.is_some()
+}
+
 fn blasts(
     mut playing: ResMut<Playing>,
     sounds: Res<Sounds>,
     blasts: Res<Blasts>,
     hits: Option<Res<StructureHits>>,
+    spawner: Option<Res<crate::effects::EffectSystem>>,
     mut destroyed: Local<u32>,
 ) {
     for b in &blasts.fired {
+        // a blast that plays its native effect gets the sound from that effect; playing the
+        // placeholder too would sound twice
+        if blast_sounds_from_effect(b, spawner.is_some()) {
+            continue;
+        }
         playing.fire(blast_key(&sounds, b), Place::At(b.at), 1.0);
     }
     if let Some(h) = hits
@@ -1867,6 +1951,43 @@ fn blasts(
     {
         *destroyed = h.destroyed;
         playing.fire(sounds.key("debris"), Place::Ears, 1.0);
+    }
+}
+
+/// The sounds of the effect spawner: its `Sound` components (`effects::sound`) ask for an event by
+/// `(bank, sound)`; the instance is theirs (moved and stopped by the effect, alive for its
+/// `IsAlive`). Post effects are counted by the queue, not applied.
+fn effect_sounds(
+    mut playing: ResMut<Playing>,
+    sounds: Res<Sounds>,
+    host: Option<Res<crate::effects::EffectHost>>,
+) {
+    use crate::effects::sound::SoundOp;
+    let Some(host) = host else { return };
+    host.sounds.connect();
+    for op in host.sounds.drain() {
+        match op {
+            SoundOp::Start {
+                token,
+                bank,
+                sound,
+                at,
+                hold,
+                alive,
+            } => match sounds.ref_key(SoundRef { bank, sound }) {
+                Some(key) => playing.asks.push(Ask::Effect {
+                    token,
+                    key,
+                    at,
+                    hold,
+                    alive,
+                }),
+                None => alive.store(false, Ordering::Relaxed),
+            },
+            SoundOp::Move { token, at } => playing.asks.push(Ask::EffectMove { token, at }),
+            SoundOp::Stop { token, .. } => playing.asks.push(Ask::EffectStop { token }),
+            SoundOp::Post { .. } => {}
+        }
     }
 }
 
@@ -1887,6 +2008,62 @@ fn rockets(
     }
 }
 
+/// Foot-machine layer-0 states that play `Wind_skydive` at full gain (native `0x0065ff80`
+/// ten states, `0x0076fc30` three canopy states; the overlap is listed once).
+const WIND_STATES: [&str; 11] = [
+    "S_SKYDIVE",
+    "S_FALL_TO_SKYDIVE",
+    "S_JUMP_TO_SKYDIVE",
+    "S_TO_SKYDIVE_DASH",
+    "S_SKYDIVE_DASH",
+    "S_FROM_SKYDIVE_DASH",
+    "S_PULL_OPEN_PARACHUTE_VERTICAL",
+    "S_PARACHUTE_DETACH_TO_FREEFALL",
+    "S_UNFOLD_PARACHUTE_HORIZONTAL",
+    "S_UNFOLD_PARACHUTE_VERTICAL",
+    "S_PARACHUTE",
+];
+
+/// Gain factor of the wind while reeled in flight (native constant `0x00e2c350`).
+const REEL_WIND_GAIN: f32 = 0.6;
+
+/// The gain of `Wind_skydive` in a foot-machine state, `None` when it is silent (a plain
+/// `S_FALL` never plays it). Native `0x00568530`.
+fn wind_gain(state: &str) -> Option<f32> {
+    if WIND_STATES.contains(&state) {
+        Some(1.0)
+    } else if state == "S_REEL_FLIGHT" {
+        Some(REEL_WIND_GAIN)
+    } else {
+        None
+    }
+}
+
+/// The canopy state is `PCS_OPEN`: the chute is out and not still unfolding (native vtable
+/// slot `+0x24`; "opening" only updates parameters, it never starts the loop).
+fn canopy_open(parachute: bool, state: &str) -> bool {
+    parachute
+        && !matches!(
+            state,
+            "S_UNFOLD_PARACHUTE_HORIZONTAL" | "S_UNFOLD_PARACHUTE_VERTICAL"
+        )
+}
+
+/// The `steer` parameter of `Parachute_steer`: `min(1, |D+4| + |D+8|)` (native `0x00590c90`).
+/// `D+4`/`D+8` are the pitch and bank axes of the flight block (`CanopyPose::d4/d8`).
+fn steer_value(d4: f32, d8: f32) -> f32 {
+    (d4.abs() + d8.abs()).min(1.0)
+}
+
+/// The `speed` parameter of the parachute and wind events: the length of the velocity
+/// (`0x008a0bd0`), raised to 0.01 (`[0x00f66934]`) when it is in (0, 0.01]; zero stays zero
+/// (native `0x00671960` / `0x00568530`, research `parachute-effects-audio-hud.md` 3.5).
+/// The gain (`focus`) is the constant 1.0 and there is no software fade (curves are constant).
+fn native_speed(v: Vec3) -> f32 {
+    let s = v.length();
+    if s > 0.0 && s <= 0.01 { 0.01 } else { s }
+}
+
 #[derive(Default)]
 struct RicoState {
     chute: bool,
@@ -1904,39 +2081,48 @@ fn rico(
     mut playing: ResMut<Playing>,
     sounds: Res<Sounds>,
     ground: Res<Ground>,
-    heroes: Query<(&Hero, Option<&LinearVelocity>)>,
+    heroes: Query<(
+        &Hero,
+        Option<&LinearVelocity>,
+        Option<&crate::foot_machine::FootDriver>,
+    )>,
     mut st: Local<RicoState>,
 ) {
-    let Ok((h, vel)) = heroes.single() else {
+    let Ok((h, vel, foot)) = heroes.single() else {
         return;
     };
     let dt = time.delta_secs();
     let grapple = h.grapple.is_some();
     if grapple != st.grapple {
-        let key = if grapple {
-            sounds.key("grapple_fire")
-        } else {
-            sounds.key("grapple_detach")
-        };
-        playing.fire(key, Place::Ears, 1.0);
+        // the shot is the `Sound` component of effect 11 `flying_hook` (the rig's `grapplefire`
+        // event, through the effect spawner); only the release is still played from here, until
+        // the device detach reaches effect 213 (`grapple::effects::detach_calls` has no caller)
+        if !grapple {
+            playing.fire(sounds.key("grapple_detach"), Place::Ears, 1.0);
+        }
         st.grapple = grapple;
     }
     if h.parachute && !st.chute {
         playing.fire(sounds.key("chute_open"), Place::Ears, 1.0);
     }
     st.chute = h.parachute;
+    let state = foot.map_or("", |f| f.state.as_str());
+    // the canopy loops (native `0x00590c90`): `Parachute_InFlight` (14:1) is held while the
+    // canopy is open, but that event has no layers in the retail data (silent), so only the
+    // steer loop is heard, while the stick moves the canopy
+    let open = canopy_open(h.parachute, state);
+    let steer = steer_value(h.canopy.pose.d4, h.canopy.pose.d8);
+    let steer_params = [("steer", steer)];
     playing.hold(
-        "canopy",
-        h.parachute
-            .then_some((sounds.key("chute_loop"), 1.0, &[("steer", 0.0)][..])),
+        "canopy_steer",
+        (open && steer > 0.0).then_some((sounds.key("chute_steer"), 1.0, &steer_params[..])),
     );
-    // the wind of falling or gliding
+    // the wind of a skydive, the canopy or a reel (native `0x00568530`): by foot-machine state
     let v = vel.map_or(Vec3::ZERO, |v| v.0);
-    let airborne = !h.grounded && h.in_vehicle.is_none() && !h.swimming && h.air_time > 0.3;
-    let wind = [("speed", v.length()), ("speed vertical", v.y.abs())];
+    let wind = [("speed", native_speed(v)), ("speed vertical", (-v.y).max(0.0))];
     playing.hold(
         "wind",
-        airborne.then_some((sounds.key("wind"), 1.0, &wind[..])),
+        wind_gain(state).map(|g| (sounds.key("wind"), g, &wind[..])),
     );
     let material = ground.here.map(|s| s.material);
     // the jump and the landing
@@ -2823,14 +3009,12 @@ mod tests {
             ("explosion_big", "Effects/Explos/Lave Explosion"),
             ("rocket_loop", "Weapons/Single/Rocket Launcher Loop"),
             (
-                "grapple_fire",
-                "Parachute/grappling_hook/grappling_fire_wire",
-            ),
-            (
                 "grapple_detach",
                 "Parachute/grappling_hook/grappling_detatch",
             ),
             ("chute_open", "Parachute/Parachute/Parachute_Vert"),
+            ("wind", "Parachute/Parachute/Wind_skydive"),
+            ("chute_steer", "Parachute/Parachute/Parachute_steer"),
         ] {
             let k = s.key(logical);
             assert!(k.contains('#'), "{logical} still by name");
@@ -2840,6 +3024,29 @@ mod tests {
         let barrel = s.effect_key("explosion_barrel", None).unwrap();
         assert!(s.ensure(barrel));
         assert_eq!(event_path(&s, barrel), "Effects/Explos/Barrel Explode");
+    }
+
+    /// The wind plays by foot-machine state (never in a plain fall, 0.6 while reeled), the
+    /// canopy loop only when open, the steer value is capped at 1.
+    #[test]
+    fn parachute_sound_gates() {
+        for s in WIND_STATES {
+            assert_eq!(wind_gain(s), Some(1.0), "{s}");
+        }
+        assert_eq!(wind_gain("S_REEL_FLIGHT"), Some(0.6));
+        for s in ["S_FALL", "S_UPRIGHT_IDLE", ""] {
+            assert_eq!(wind_gain(s), None, "{s}");
+        }
+        assert_eq!(native_speed(Vec3::ZERO), 0.0);
+        assert_eq!(native_speed(Vec3::new(0.004, 0.0, 0.0)), 0.01);
+        assert_eq!(native_speed(Vec3::new(0.01, 0.0, 0.0)), 0.01);
+        assert_eq!(native_speed(Vec3::new(0.0, 3.0, 4.0)), 5.0);
+        assert!(canopy_open(true, "S_PARACHUTE"));
+        assert!(!canopy_open(true, "S_UNFOLD_PARACHUTE_VERTICAL"));
+        assert!(!canopy_open(false, "S_PARACHUTE"));
+        assert_eq!(steer_value(0.0, 0.0), 0.0);
+        assert_eq!(steer_value(0.25, -0.5), 0.75);
+        assert_eq!(steer_value(-1.0, 1.0), 1.0);
     }
 
     /// The max-playbacks rule: under the limit everything starts; over it the oldest, the
@@ -3289,4 +3496,126 @@ mod tests {
         let voices: usize = p.list.iter().map(|i| i.loops.len() + i.shots.len()).sum();
         assert!(voices <= MAX_VOICES, "{voices}");
     }
+
+    /// An effect `Sound` component plays its pair through the audio: owned, moved and stopped
+    /// by the component, alive until the instance is over.
+    #[test]
+    fn effect_sound_component_plays_and_ends() {
+        use crate::effects::EffectHost;
+        use crate::effects::component::EffectComponent;
+        use crate::effects::sound::SoundComponent;
+        let Some(fs) = test_fs() else { return };
+        let mut app = ownership_app(fs);
+        app.init_resource::<EffectHost>();
+        app.add_systems(Update, effect_sounds.before(run_instances));
+        app.update(); // connects the queue
+        let queue = app.world().resource::<EffectHost>().sounds.clone();
+        assert!(queue.is_connected());
+        // flying_hook (effect 11): bank 26 sound 0, Parachute/grappling_hook/grappling_fire_wire
+        let mut c = SoundComponent::new(Some(26), Some(0), false, queue);
+        c.set_transform(&Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0)));
+        assert!(c.start());
+        app.update();
+        {
+            let p = app.world().resource::<Playing>();
+            assert_eq!(p.list.len(), 1);
+            let i = &p.list[0];
+            assert!(i.owner.is_some() && !i.stop);
+            assert_eq!(i.at, Place::At(Vec3::new(3.0, 0.0, 0.0)));
+            assert!(i.loops_once, "a non-looping effect plays its event once");
+        }
+        assert!(c.is_alive());
+        c.set_transform(&Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0)));
+        app.update();
+        assert_eq!(
+            app.world().resource::<Playing>().list[0].at,
+            Place::At(Vec3::new(5.0, 0.0, 0.0))
+        );
+        // the effect stops it: the instance fades out and goes, and nothing is left alive
+        c.stop(false);
+        app.update();
+        // the test clock does not advance: end a fade-out by hand
+        if let Some(i) = app.world_mut().resource_mut::<Playing>().list.first_mut() {
+            assert!(i.stop);
+            i.stopping = Some(0.0);
+        }
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(app.world().resource::<Playing>().list.is_empty());
+        assert!(!c.is_alive());
+    }
+
+    /// A pair the banks do not know ends at once (the effect must not wait for it).
+    #[test]
+    fn effect_sound_unknown_pair_is_not_alive() {
+        use crate::effects::EffectHost;
+        use crate::effects::component::EffectComponent;
+        use crate::effects::sound::SoundComponent;
+        let Some(fs) = test_fs() else { return };
+        let mut app = ownership_app(fs);
+        app.init_resource::<EffectHost>();
+        app.add_systems(Update, effect_sounds.before(run_instances));
+        app.update();
+        let queue = app.world().resource::<EffectHost>().sounds.clone();
+        let mut c = SoundComponent::new(Some(9999), Some(9999), false, queue);
+        assert!(c.start());
+        app.update();
+        assert!(!c.is_alive());
+        assert!(app.world().resource::<Playing>().list.is_empty());
+    }
+
+    /// Blasts with a native effect take their sound from it (no doubled placeholder); the effect
+    /// ids the game spawns all carry a `Sound` whose pair resolves to an event.
+    #[test]
+    fn blast_effects_carry_their_sound() {
+        use crate::effects::{AdapterSet, EffectSystem};
+        use crate::explosion::{Blast, effect_id};
+        let b = |effect| Blast {
+            at: Vec3::ZERO,
+            radius: 5.0,
+            damage: 0.0,
+            impulse: 0.0,
+            effect,
+        };
+        assert!(blast_sounds_from_effect(&b(Some(effect_id::GRENADE)), true));
+        assert!(!blast_sounds_from_effect(&b(None), true), "no effect: placeholder");
+        assert!(!blast_sounds_from_effect(&b(Some(5)), false), "no spawner: placeholder");
+        let Some(fs) = test_fs() else { return };
+        let s = Sounds::new(fs.clone());
+        let mut fx = EffectSystem::from_retail(fs, AdapterSet::stubs()).unwrap();
+        for id in [
+            effect_id::GRENADE,
+            effect_id::MISSILE,
+            effect_id::VEHICLE_CAR,
+            effect_id::BARREL,
+        ] {
+            let d = fx.description(id).unwrap();
+            let sound = d
+                .components
+                .values()
+                .filter(|c| c.kind == 0)
+                .flat_map(|c| c.variations.values())
+                .any(|v| {
+                    let n = &v.node;
+                    matches!((n.int("bank_id"), n.int("sound_id")), (Some(bk), Some(sd))
+                        if s.ref_key(SoundRef { bank: bk as u32, sound: sd as u32 }).is_some())
+                });
+            assert!(sound, "effect {id} has no resolvable Sound");
+        }
+    }
+
+    /// The grapple's shot is the `Sound` of effect 11 now: the by-name placeholder is gone, the
+    /// release (effect 213, no caller yet) is still played from here.
+    #[test]
+    fn grapple_shot_placeholder_removed() {
+        assert!(!EVENTS.iter().any(|e| e.0 == "grapple_fire"));
+        assert!(!FALLBACK.iter().any(|e| e.0 == "grapple_fire"));
+        assert!(EVENTS.iter().any(|e| e.0 == "grapple_detach"));
+        let Some(fs) = test_fs() else { return };
+        let s = Sounds::new(fs);
+        assert_eq!(s.key("grapple_fire"), "grapple_fire", "no alias any more");
+        assert!(s.key("grapple_detach").contains('#'));
+    }
 }
+

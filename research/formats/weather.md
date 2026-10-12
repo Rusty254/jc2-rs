@@ -24,7 +24,7 @@ as ad-hoc thresholds.
 | `textures\atmosphere\skygradient_dif.dds` | 32 × 128 ARGB8888 with mips: the sky's colour | yes |
 | `textures\atmosphere\fog_gradient.dds` | 4 × 128: constant colour (255,246,255), alpha falls from 1 to 0 down the rows | read, not used |
 | `textures\atmosphere\moon_full_dif.dds` (128 × 128 DXT5: the moon's disc *and* its halo in one picture), `star_dif.dds` (64 × 64 DXT1, one star on black, drawn additively), `sun_dif.dds` (64 × 64 DXT5, the sun's glow) | the moon, the stars, the sun glow | yes (`clouds.rs`) |
-| `textures\atmosphere\sun_gradient_dif.dds`, `sunbeam_dif`, `lensflare_dif`, `lens5` | glow gradient, light shafts, flares | not yet |
+| `textures\atmosphere\sun_gradient_dif.dds`, `sunbeam_dif`, `lensflare_dif`, `lens5` | glow gradient, sun halo (shape), flares | not yet (decoded in `sun-glow-next.md`, JC2-174) |
 | `textures\weather\weather_dif.dds` (1024², DXT5: a 4 × 4 atlas of 15 cumulus pictures, the last cell a rain shaft; the alpha is the cloud) | the cumulus cards (`SoftClouds`) | yes |
 | `textures\weather\cirrus_clouds_dif.dds` (1024², DXT5: 2 × 2, three cirrus pictures and an empty cell) | the high cirrus (`CirrusClouds`) | yes |
 | `textures\atmosphere\precipitation.dds` | rain sprites | no |
@@ -75,6 +75,11 @@ filters that away with its bilinear lookup and we smooth it over about an hour.
 
 The table is not dimmed at night (the engine scales it by the sun elsewhere, in the
 shader), so the game crate multiplies by its own brightness curve.
+
+> **Correction (JC2-151, `sky-gradient-next.md`):** the sky colour is not read "with the hour across and the view's elevation down" only. The dome is a 32-triangle cone whose `u`
+> runs over one texel with the azimuth to the sun, so the **even columns are the sun-facing colours and the odd columns the opposite side** (the "alternating" columns are data, not noise);
+> the hour picks the even column `floor(hour / 1.5)` and the next, blended by the fraction; the texture is sampled **sRGB-decoded** and written unscaled (no dimming in the pass), so
+> the sky dimming described above is project policy, not native. `fog_gradient.dds` is used: it is the horizon band, coloured by the fog colour (`sky-gradient-next.md` section 4).
 
 ### The rest of the lighting: not found
 
@@ -164,7 +169,7 @@ base, 20 km radius, 555 mist particles) agree with the names.
   at 14.5–18 km. The cirrus is ~30 cards of 14–24 km at 9 km height. Both are alpha-blended in
   vertex order (no sorting) which is fine for the soft sprites.
 
-Not done: cloud shadows (`cloudshadows.bin`), light shafts (`sunbeam_dif`), lens flares,
+Not done: cloud shadows (`cloudshadows.bin`), the sun halo (`sunbeam_dif`) and lens flares (native recipe: `sun-glow-next.md`),
 rain (`precipitation.dds`), lightning, the cirrus' own orbit (`(0, 0.53, 0.85)`), the cloud
 lighting from the sun's side, the sun's light colour from the game's tables (not found).
 `--no-clouds`, `--cloud-cover`, `--no-stars`; `JC2_CAM_PITCH` / `JC2_CAM_YAW` aim the free

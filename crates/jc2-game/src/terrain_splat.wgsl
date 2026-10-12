@@ -27,6 +27,7 @@
     mesh_view_bindings::view,
 }
 #import jc2::haze_fog::haze_fog
+#import jc2::point_lights::point_light_irradiance
 #import jc2::sun_horizon::{ao_uv, sun_factor, is_sun, ambient_tilt}
 
 #ifdef PREPASS_PIPELINE
@@ -277,6 +278,9 @@ fn sun_correction(p: PbrInput, factor: f32) -> vec3<f32> {
         li.F0_metallic = base;
         li.F_ab = lighting::F_AB(p.material.perceptual_roughness, NdotV);
         var cascade = 1.0;
+        // the cascade term's native floor `0.1 + 0.9 c` (cb0[9].w = 0.1, INFERRED: general-terms-next.md
+        // section 4), which multiplies with the horizon / AO factor as in the General route
+        var floored = 1.0;
         if (p.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
             && ((*l).flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
             let view_z = dot(vec4<f32>(
@@ -284,9 +288,10 @@ fn sun_correction(p: PbrInput, factor: f32) -> vec3<f32> {
                 view.view_from_world[2].z, view.view_from_world[3].z), p.world_position);
             cascade = shadows::fetch_directional_shadow(
                 i, p.world_position, p.world_normal, view_z, p.frag_coord.xy);
+            floored = 0.1 + 0.9 * cascade;
         }
-        let sun = lighting::directional_light(i, &li, true) * cascade;
-        return view.exposure * sun * (factor - 1.0);
+        let unshadowed = lighting::directional_light(i, &li, true);
+        return view.exposure * unshadowed * (factor * floored - cascade);
     }
     return vec3<f32>(0.0);
 }
@@ -436,7 +441,9 @@ fn fragment(
         pbr_input.material.base_color.rgb, pbr_input.material.metallic,
         pbr_input.material.specular_transmission, pbr_input.material.diffuse_transmission);
     out.color = vec4<f32>(
-        out.color.rgb + ambient_tilt(diffuse, pbr_input.N, horizon.tilt, pbr_input.diffuse_occlusion, view.exposure),
+        out.color.rgb + ambient_tilt(diffuse, pbr_input.N, horizon.tilt, pbr_input.diffuse_occlusion, view.exposure)
+            // the native point-light loop (JC2-221): `E = sun + hemisphere * ao + L`, times albedo
+            + diffuse * point_light_irradiance(in.world_position.xyz, pbr_input.N),
         out.color.a);
     // the native atmospheric fog (haze_fog.wgsl); Bevy's own fog is off for this material
     let haze_clip = view.clip_from_view * (view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0));
